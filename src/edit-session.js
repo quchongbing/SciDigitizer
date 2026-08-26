@@ -161,7 +161,23 @@ export function createEditSession({
     }
   }
 
+  function clearDraft() {
+    const key = storageKey();
+    if (saveTimer !== null && clearTimer) clearTimer(saveTimer);
+    saveTimer = null;
+    if (!storage || !key) return false;
+    try {
+      storage.removeItem(key);
+      onSaveStatus("cleared");
+      return true;
+    } catch {
+      onSaveStatus("error");
+      return false;
+    }
+  }
+
   return {
+    clearDraft,
     commit,
     historyStatus,
     navigate,

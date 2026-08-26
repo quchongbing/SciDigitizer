@@ -31,9 +31,9 @@ await mkdir(outputRoot, { recursive: true });
 await Promise.all(runtimeItems.map(([source, destination]) => copyItem(source, destination)));
 
 const sourceIndex = await readFile(join(projectRoot, "index.html"), "utf8");
-const appScriptPattern = /(\s*<script type="module" src="src\/app\.js[^\"]*"><\/script>)/;
+const appScriptPattern = /(\s*<script data-scidigitizer-loader>)/;
 if (!appScriptPattern.test(sourceIndex)) {
-  throw new Error("Could not find the SciDigitizer application script in index.html.");
+  throw new Error("Could not find the SciDigitizer application loader in index.html.");
 }
 
 const nativeScripts = [

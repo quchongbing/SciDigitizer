@@ -206,73 +206,99 @@
             </div>
           </div>
 
-          <input id="series-label" class="metadata-input series-name-input" type="text" placeholder="曲线名称，例如 DFT-MD / Ti = 6 eV" />
-          <label class="field-label target-style-label" for="target-style">目标对象类型</label>
-          <select id="target-style" class="select-control target-style-select">
-            <option value="auto" selected>自动 / 普通曲线</option>
-            <option value="line">连续细线 / 实线</option>
-            <option value="dashed">虚线（学习划线长度和间隔）</option>
-            <option value="dashdot">点划线（长划线 + 短点）</option>
-            <option value="dotted">点线（短点组成的曲线）</option>
-            <option value="noisy">实验噪声线（保留局部波动）</option>
-            <option value="markers">圆点 / marker 中心</option>
-          </select>
-          <div class="button-row no-top-margin">
-            <button id="pick-seed" class="button button-secondary">选择目标曲线</button>
-            <button id="add-guide" class="button button-secondary" disabled>添加引导点</button>
-          </div>
-          <div class="button-row compact-row guide-action-row">
-            <button id="undo-guide" class="button button-ghost" disabled>撤销最后引导点</button>
-            <button id="exclude-trace" class="button button-ghost" disabled>框选遮挡 / 图例</button>
-          </div>
-          <div class="seed-summary">
-            <span id="seed-swatch" class="seed-swatch"></span>
-            <span id="seed-status">尚未选择曲线</span>
-          </div>
-          <p id="target-style-hint" class="guide-help">同色曲线：在分叉前后分别加点。每个引导点都会锁定为追踪基准并进入数据采样；悬停后可直接拖动。</p>
-          <details id="trace-assist-tools" class="trace-assist-tools">
-            <summary>重叠 / 遮挡辅助（可选）</summary>
-            <p class="trace-assist-hint">普通曲线无需设置；只有自动追踪出现串线、重叠或遮挡时再打开。</p>
-            <label class="strict-guide-toggle" for="strict-guide">
-              <input id="strict-guide" type="checkbox" disabled />
-              <span>
-                <strong>同色 / 遮挡强约束</strong>
-                <small id="strict-guide-help">拒绝偏离引导走廊的同色分支；普通曲线无需开启</small>
-              </span>
-            </label>
+          <label class="field-label series-name-label" for="series-label">曲线名称（可选）</label>
+          <input id="series-label" class="metadata-input series-name-input" type="text" placeholder="例如 DFT-MD / Ti = 6 eV" />
 
-            <div class="trace-corridor-control">
-              <div class="trace-corridor-heading">
-                <strong>Pen 曲线走廊</strong>
-                <span id="trace-corridor-status">未绘制 · 全绘图区搜索</span>
-              </div>
-              <p>用有宽度的笔涂过目标曲线的大致区域；只约束画过的横向区段，重合处可隔离其他曲线。</p>
-              <div class="button-row compact-row trace-corridor-actions">
-                <button id="draw-trace-corridor" class="button button-ghost" type="button" disabled>画走廊</button>
-                <button id="erase-trace-corridor" class="button button-ghost" type="button" disabled>擦除</button>
-                <button id="clear-trace-corridor" class="button button-ghost" type="button" disabled>清除</button>
-              </div>
-              <label class="range-label" for="trace-corridor-width">
-                <span>Pen 宽度 / px</span>
-                <output id="trace-corridor-width-output">24</output>
+          <details class="trace-option-details trace-type-options">
+            <summary>
+              <span>曲线类型</span>
+              <strong id="target-style-summary">自动 / 普通曲线</strong>
+            </summary>
+            <label class="field-label target-style-label" for="target-style">仅在自动识别不合适时修改</label>
+            <select id="target-style" class="select-control target-style-select">
+              <option value="auto" selected>自动 / 普通曲线</option>
+              <option value="line">连续细线 / 实线</option>
+              <option value="dashed">虚线（学习划线长度和间隔）</option>
+              <option value="dashdot">点划线（长划线 + 短点）</option>
+              <option value="dotted">点线（短点组成的曲线）</option>
+              <option value="noisy">实验噪声线（保留局部波动）</option>
+              <option value="markers">圆点 / marker 中心</option>
+            </select>
+          </details>
+
+          <div id="trace-primary-action" class="trace-primary-action">
+            <div class="trace-primary-copy">
+              <strong>在目标曲线的清晰位置点击一次</strong>
+              <small>程序会自动取色并立即追踪；普通曲线通常不需要其他设置。</small>
+            </div>
+            <button id="pick-seed" class="button button-primary button-full">选择目标曲线</button>
+            <div class="seed-summary">
+              <span id="seed-swatch" class="seed-swatch"></span>
+              <span id="seed-status">尚未选择曲线</span>
+            </div>
+          </div>
+
+          <div id="trace-refinement-tools" class="trace-refinement-tools" hidden>
+            <div class="trace-subsection-heading">
+              <strong>结果需要修正？</strong>
+              <span>只在分叉、重叠或遮挡时使用</span>
+            </div>
+            <div class="trace-refinement-actions">
+              <button id="add-guide" class="button button-secondary" disabled>添加引导点</button>
+              <button id="undo-guide" class="button button-ghost" disabled>撤销引导点</button>
+              <button id="exclude-trace" class="button button-ghost" disabled>框选遮挡 / 图例</button>
+            </div>
+            <p id="target-style-hint" class="guide-help">普通曲线只需选择目标即可；分叉、重叠或遮挡时再添加引导点并打开可选辅助工具。</p>
+            <details id="trace-assist-tools" class="trace-assist-tools">
+              <summary>重叠 / 遮挡辅助（可选）</summary>
+              <p class="trace-assist-hint">普通曲线无需设置；只有自动追踪出现串线、重叠或遮挡时再打开。</p>
+              <label class="strict-guide-toggle" for="strict-guide">
+                <input id="strict-guide" type="checkbox" disabled />
+                <span>
+                  <strong>同色 / 遮挡强约束</strong>
+                  <small id="strict-guide-help">拒绝偏离引导走廊的同色分支；普通曲线无需开启</small>
+                </span>
               </label>
-              <input id="trace-corridor-width" type="range" min="4" max="80" step="1" value="24" />
+
+              <div class="trace-corridor-control">
+                <div class="trace-corridor-heading">
+                  <strong>Pen 曲线走廊</strong>
+                  <span id="trace-corridor-status">未绘制 · 全绘图区搜索</span>
+                </div>
+                <p>用有宽度的笔涂过目标曲线的大致区域；只约束画过的横向区段，重合处可隔离其他曲线。</p>
+                <div class="button-row compact-row trace-corridor-actions">
+                  <button id="draw-trace-corridor" class="button button-ghost" type="button" disabled>画走廊</button>
+                  <button id="erase-trace-corridor" class="button button-ghost" type="button" disabled>擦除</button>
+                  <button id="clear-trace-corridor" class="button button-ghost" type="button" disabled>清除</button>
+                </div>
+                <label class="range-label" for="trace-corridor-width">
+                  <span>Pen 宽度 / px</span>
+                  <output id="trace-corridor-width-output">24</output>
+                </label>
+                <input id="trace-corridor-width" type="range" min="4" max="80" step="1" value="24" />
+              </div>
+            </details>
+          </div>
+
+          <details id="trace-output-options" class="trace-option-details trace-output-options" hidden>
+            <summary>
+              <span>输出点数量</span>
+              <strong id="trace-point-count-summary">100 点</strong>
+            </summary>
+            <div class="trace-point-count-control">
+              <label for="trace-point-count">
+                <strong>曲线数据点数量</strong>
+                <span id="trace-point-count-hint">自动追踪生成，可继续增删修改</span>
+              </label>
+              <div>
+                <input id="trace-point-count" type="number" min="2" max="2000" step="1" value="100" inputmode="numeric" />
+                <span>点</span>
+              </div>
             </div>
           </details>
 
-          <div class="trace-point-count-control">
-            <label for="trace-point-count">
-              <strong>曲线数据点数量</strong>
-              <span id="trace-point-count-hint">自动追踪生成，可继续增删修改</span>
-            </label>
-            <div>
-              <input id="trace-point-count" type="number" min="2" max="2000" step="1" value="100" inputmode="numeric" />
-              <span>点</span>
-            </div>
-          </div>
-
-          <details class="advanced-options">
-            <summary>高级追踪参数</summary>
+          <details class="advanced-options trace-option-details">
+            <summary><span>高级追踪参数</span></summary>
             <div class="advanced-color-option">
               <label class="range-label" for="color-threshold">
                 <span>颜色容差</span>
@@ -335,11 +361,11 @@
             <input id="max-gap" type="range" min="0" max="60" value="24" />
           </details>
 
-          <div class="button-row">
-            <button id="trace-curve" class="button button-accent" disabled>自动追踪</button>
+          <div id="trace-current-actions" class="button-row trace-current-actions" hidden>
+            <button id="trace-curve" class="button button-secondary" disabled>重新追踪</button>
             <button id="clear-curve" class="button button-ghost" disabled>重置当前曲线</button>
           </div>
-          <button id="save-series" class="button button-primary button-full save-series-button" disabled>保存当前曲线 · 准备下一条</button>
+          <button id="save-series" class="button button-primary button-full save-series-button" disabled hidden>保存当前曲线 · 准备下一条</button>
           <div id="series-list" class="series-list">
             <div class="series-empty">尚未保存曲线</div>
           </div>
@@ -408,6 +434,7 @@
               <button id="undo-action" class="icon-button" type="button" disabled title="撤销最近一次编辑（Ctrl+Z）">撤销</button>
               <button id="redo-action" class="icon-button" type="button" disabled title="重做最近一次编辑（Ctrl+Shift+Z）">重做</button>
               <span id="autosave-status">自动保存待命</span>
+              <button id="restart-session" class="icon-button restart-session-button" type="button" title="清除当前图片的自动保存草稿并重新开始">重新开始</button>
             </div>
             <div class="zoom-control">
               <button id="zoom-fit" class="icon-button">适应</button>
@@ -479,7 +506,29 @@
       </form>
     </dialog>
 
+    <dialog id="clear-draft-confirm" class="rotation-confirm-dialog clear-draft-confirm-dialog">
+      <form method="dialog">
+        <h3>清除草稿并重新开始？</h3>
+        <p>这会删除当前图片在此浏览器中的自动保存草稿，并清空绘图区、坐标标定和曲线数据。已经下载的项目、CSV 和图片文件不会受影响。</p>
+        <div class="dialog-actions">
+          <button id="clear-draft-cancel" value="cancel" class="button button-ghost">取消</button>
+          <button id="clear-draft-apply" value="default" class="button button-danger">清除并重新开始</button>
+        </div>
+      </form>
+    </dialog>
+
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
-    <script type="module" src="src/app.js?v=0.20.0-preview.3.1"></script>
+    <script data-scidigitizer-loader>
+      (() => {
+        const appScript = document.createElement("script");
+        if (window.location.protocol === "file:") {
+          appScript.src = "dist/app-file.js?v=0.20.0-preview.3.1";
+        } else {
+          appScript.type = "module";
+          appScript.src = "src/app.js?v=0.20.0-preview.3.1";
+        }
+        document.body.appendChild(appScript);
+      })();
+    </script>
   </body>
 </html>

@@ -1485,6 +1485,7 @@ test("edit sessions undo, redo, and restore an autosaved draft", () => {
   const storage = {
     getItem: (key) => stored.get(key) ?? null,
     setItem: (key, value) => stored.set(key, value),
+    removeItem: (key) => stored.delete(key),
   };
   let value = 0;
   const session = createEditSession({
@@ -1519,6 +1520,10 @@ test("edit sessions undo, redo, and restore an autosaved draft", () => {
     undoLabel: null,
     redoLabel: null,
   });
+  assert.equal(session.clearDraft(), true);
+  assert.equal(stored.has("test-draft"), false);
+  value = 0;
+  assert.equal(session.restoreDraft(), false);
 });
 
 test("skew estimation recovers a rotated rectangular frame", () => {

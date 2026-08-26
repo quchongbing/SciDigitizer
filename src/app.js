@@ -488,6 +488,7 @@ editSession = createEditSession({
       saved: "草稿已保存",
       error: "存储空间不足",
       restored: "已恢复草稿",
+      cleared: "草稿已清除",
     }[status] ?? element.textContent;
   },
 });
@@ -498,7 +499,7 @@ function syncModeControls() {
   }
   $("#select-plot").classList.toggle("button-primary", state.mode !== "plot");
   $("#select-plot").classList.toggle("button-accent", state.mode === "plot");
-  $("#pick-seed").classList.toggle("button-secondary", state.mode !== "seed");
+  $("#pick-seed").classList.toggle("button-primary", state.mode !== "seed");
   $("#pick-seed").classList.toggle("button-accent", state.mode === "seed");
   $("#add-guide").classList.toggle("button-secondary", state.mode !== "guide");
   $("#add-guide").classList.toggle("button-accent", state.mode === "guide");
@@ -2023,6 +2024,20 @@ function updateUi() {
   syncPointCursor();
 
   const markerMode = $("#target-style").value === "markers";
+  const hasTarget = Boolean(state.seedColor);
+  $("#trace-primary-action").classList.toggle("has-target", hasTarget);
+  $("#trace-refinement-tools").hidden = !hasTarget;
+  $("#trace-output-options").hidden = !hasTarget;
+  $("#trace-current-actions").hidden = !hasTarget && !state.editingSeriesId;
+  $("#save-series").hidden = !state.path.length && !state.series.length;
+  $("#restart-session").disabled = !state.image;
+  $("#pick-seed").textContent = state.mode === "seed"
+    ? "请在图中点击曲线"
+    : hasTarget
+      ? "重新选择目标"
+      : "选择目标曲线";
+  $("#target-style-summary").textContent = $("#target-style").selectedOptions[0]?.textContent ?? "自动 / 普通曲线";
+  $("#trace-point-count-summary").textContent = `${$("#trace-point-count").value} 点`;
   const minimumAnchors = markerMode ? 3 : 1;
   $("#trace-curve").disabled = !(state.imageData && state.plotRect && state.seedColor && state.anchors.length >= minimumAnchors);
   $("#add-guide").disabled = !(state.plotRect && state.seedColor);
@@ -2291,11 +2306,12 @@ function applyProject(project) {
 
 function loadImageSource(source, name, samplePath = null, project = null) {
   const loadId = ++imageLoadSequence;
-  const isObjectUrl = String(source).startsWith("blob:");
+  const resolvedSource = globalThis.__SCIDIGITIZER_EMBEDDED_ASSETS__?.[source] ?? source;
+  const isObjectUrl = String(resolvedSource).startsWith("blob:");
   let objectUrlReleased = false;
   const releaseObjectUrl = () => {
     if (!isObjectUrl || objectUrlReleased) return;
-    URL.revokeObjectURL(source);
+    URL.revokeObjectURL(resolvedSource);
     objectUrlReleased = true;
   };
   const image = new Image();
@@ -2364,6 +2380,11 @@ function loadImageSource(source, name, samplePath = null, project = null) {
     else {
       resetHistorySession();
       const freshStart = new URLSearchParams(window.location.search).has("fresh");
+      if (freshStart) {
+        const cleanUrl = new URL(window.location.href);
+        cleanUrl.searchParams.delete("fresh");
+        window.history.replaceState(null, "", cleanUrl);
+      }
       if (freshStart || !restoreAutosavedDraft()) {
         draw();
         suggestPlotRect({ automatic: true });
@@ -2373,9 +2394,9 @@ function loadImageSource(source, name, samplePath = null, project = null) {
   image.onerror = () => {
     releaseObjectUrl();
     if (loadId !== imageLoadSequence) return;
-    showToast(`无法载入 ${name}；请确认通过本地 HTTP 服务打开应用`);
+    showToast(`无法载入 ${name}；请确认应用文件完整，或重新打开图片`);
   };
-  image.src = source;
+  image.src = resolvedSource;
 }
 
 function traceCurrentCurve({ silent = false } = {}) {
@@ -3852,6 +3873,25 @@ $("#zoom-range").addEventListener("input", (event) => setZoom(event.target.value
 $("#zoom-fit").addEventListener("click", fitZoom);
 $("#undo-action").addEventListener("click", () => navigateHistory("undo"));
 $("#redo-action").addEventListener("click", () => navigateHistory("redo"));
+$("#restart-session").addEventListener("click", () => {
+  const dialog = $("#clear-draft-confirm");
+  if (dialog?.showModal) dialog.showModal();
+});
+$("#clear-draft-cancel").addEventListener("click", (event) => {
+  event.preventDefault();
+  $("#clear-draft-confirm")?.close("cancel");
+});
+$("#clear-draft-apply").addEventListener("click", (event) => {
+  event.preventDefault();
+  if (!editSession?.clearDraft()) {
+    showToast("无法清除当前草稿，请检查浏览器存储权限");
+    return;
+  }
+  $("#clear-draft-confirm")?.close("default");
+  const freshUrl = new URL(window.location.href);
+  freshUrl.searchParams.set("fresh", "1");
+  window.location.replace(freshUrl);
+});
 $("#export-density").addEventListener("change", () => commitHistory("更改导出采样密度"));
 window.addEventListener("keydown", (event) => {
   const editingText = Boolean(event.target.closest("input, textarea, [contenteditable='true']"));
@@ -4183,6 +4223,7 @@ var rotationLockSelectors = [
   "#add-exclusion", "#exclude-trace", "#undo-exclusion", "#trace-curve",
   "#clear-curve", "#clear-all-points", "#save-series", "#export-csv",
   "#export-txt", "#export-overlay", "#export-project", "#zoom-range", "#zoom-fit",
+  "#restart-session",
   ...Object.keys(pickButtonByMode).map((key) => `#pick-${key.replace(/[0-9]/g, "-$&")}`),
 ];
 

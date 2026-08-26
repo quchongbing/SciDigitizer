@@ -7,10 +7,11 @@
   "description": "Local-first scientific curve digitizer",
   "scripts": {
     "serve": "python tools/serve.py",
+    "build:file": "node tools/build-file-bundle.mjs",
     "test": "node tests/core.test.js && node tests/i18n.test.js && node tests/desktop-bridge.test.js",
-    "check": "node --check src/app.js && node --check src/core.js && node --check src/i18n.js && node --check src/image-geometry.js && node --check src/edit-session.js && node --check src/image-transform.js && node --check tools/package-desktop.mjs && node --check tools/sync-public.mjs",
+    "check": "node --check src/app.js && node --check src/core.js && node --check src/i18n.js && node --check src/image-geometry.js && node --check src/edit-session.js && node --check src/image-transform.js && node --check tools/build-file-bundle.mjs && node --check tools/package-desktop.mjs && node --check tools/sync-public.mjs && node tools/build-file-bundle.mjs --check",
     "public:sync": "node tools/sync-public.mjs",
-    "desktop:prepare": "node tools/prepare-desktop.mjs",
+    "desktop:prepare": "npm run build:file && node tools/prepare-desktop.mjs",
     "desktop:update": "node tools/update-neutralino.mjs",
     "desktop:build": "npm run desktop:prepare && neu build --embed-resources --clean && node tools/package-desktop.mjs",
     "desktop:run": "npm run desktop:prepare && neu run",

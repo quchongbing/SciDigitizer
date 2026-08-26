@@ -3,8 +3,9 @@ import { writeFileSync } from "node:fs";
 
 const debuggingPort = process.env.CHROME_DEBUG_PORT ?? "9222";
 const appOrigin = process.env.SCIDITIZER_ORIGIN ?? "http://127.0.0.1:8000";
+const appUrl = process.env.SCIDITIZER_URL ?? `${appOrigin}/?fresh=1`;
 const target = await fetch(
-  `http://127.0.0.1:${debuggingPort}/json/new?${encodeURIComponent(`${appOrigin}/?fresh=1`)}`,
+  `http://127.0.0.1:${debuggingPort}/json/new?${encodeURIComponent(appUrl)}`,
   { method: "PUT" },
 ).then((response) => response.json());
 const socket = new WebSocket(target.webSocketDebuggerUrl);
@@ -132,6 +133,10 @@ async function pressArrow(key, { shift = false } = {}) {
 }
 
 await command("Runtime.enable");
+// Keep the smoke run deterministic even when the shared test browser was used
+// manually or by a screenshot helper before this run.
+await evaluate("localStorage.removeItem('scidigitizer:language:v1')");
+await command("Page.navigate", { url: appUrl });
 await command("Emulation.setDeviceMetricsOverride", {
   width: 1440,
   height: 1000,
@@ -204,6 +209,10 @@ assert.equal(await evaluate("document.querySelector('[data-language=\"en\"]').ge
 assert.equal(await evaluate("document.querySelector('.privacy-pill').textContent.trim()"), "Local processing · images never leave your device");
 assert.equal(await evaluate("document.querySelector('.creator-credit').textContent.trim()"), "Created by Chongbing Qu（瞿崇兵）");
 assert.equal(await evaluate("document.querySelector('#pick-seed').textContent"), "Pick target curve");
+assert.equal(await evaluate("document.querySelector('#restart-session').textContent"), "Start fresh");
+assert.equal(await evaluate("document.querySelector('#trace-refinement-tools').hidden"), true);
+assert.equal(await evaluate("document.querySelector('#trace-output-options').hidden"), true);
+assert.equal(await evaluate("document.querySelector('#save-series').hidden"), true);
 assert.equal(await evaluate("localStorage.getItem('scidigitizer:language:v1')"), null);
 assert.deepEqual(await evaluate(`[...document.querySelectorAll('.panel-collapsible.is-expanded')]
   .map((section) => section.dataset.panelStep)`), ["image"]);
@@ -419,6 +428,9 @@ await pressArrow("ArrowDown", { shift: true });
 assert.ok(Math.abs(await evaluate("Number(document.querySelector('#calibration-pixel-position').value)") - 324) < 1e-8);
 await clickAtNaturalPoint("#pick-seed", 276, 85);
 assert.equal(await evaluate("document.querySelector('#add-guide').disabled"), false);
+assert.equal(await evaluate("document.querySelector('#trace-refinement-tools').hidden"), false);
+assert.equal(await evaluate("document.querySelector('#trace-output-options').hidden"), false);
+assert.equal(await evaluate("document.querySelector('#save-series').hidden"), false);
 assert.equal(await evaluate("document.querySelector('#exclude-trace').disabled"), false);
 assert.equal(await evaluate("document.querySelector('#strict-guide').disabled"), false);
 assert.match(await evaluate("document.querySelector('#seed-status').textContent"), /1 个引导基准点/);
@@ -882,6 +894,18 @@ await evaluate(`(() => {
 })()`);
 await waitFor("document.querySelector('#trace-corridor-status').textContent.includes('已约束') && document.querySelectorAll('.data-point-row').length === 100");
 assert.match(await evaluate("document.querySelector('#trace-corridor-status').textContent"), /已约束/);
+await evaluate("document.querySelector('#restart-session').click()");
+assert.equal(await evaluate("document.querySelector('#clear-draft-confirm').open"), true);
+await evaluate("document.querySelector('#clear-draft-cancel').click()");
+assert.equal(await evaluate("document.querySelector('#clear-draft-confirm').open"), false);
+assert.equal(await evaluate("document.querySelectorAll('.data-point-row').length"), 100);
+await evaluate("document.querySelector('#restart-session').click()");
+await evaluate("document.querySelector('#clear-draft-apply').click()");
+await waitFor("document.readyState === 'complete' && document.querySelector('#source-meta').textContent.includes('578 × 450') && document.querySelector('#metric-series').textContent === '0'");
+assert.equal(await evaluate("location.search"), "");
+assert.equal(await evaluate("document.querySelectorAll('.data-point-row').length"), 0);
+assert.equal(await evaluate("document.querySelector('#trace-refinement-tools').hidden"), true);
+assert.notEqual(await evaluate("document.querySelector('#autosave-status').textContent"), "已恢复草稿");
 assert.deepEqual(consoleErrors, []);
 
 process.stdout.write(`${JSON.stringify({ beforeSave, afterSave, consoleErrors }, null, 2)}\n`);

@@ -41,6 +41,7 @@ SciDigitizer is a personal open-source project created by Chongbing Qu (瞿崇�
 
 - 无需安装：直接打开[在线版](https://quchongbing.github.io/SciDigitizer/)。
 - 桌面使用：从 [Releases](https://github.com/quchongbing/SciDigitizer/releases) 下载约 1–1.3 MiB 的对应系统版本，并按照[安装指南](docs/installation.md)操作。
+- 源码离线使用：保留下载或克隆目录的完整结构，直接双击根目录中的 `index.html`；无需启动服务器。
 
 ### 最短使用流程
 
@@ -74,6 +75,7 @@ SciDigitizer is a personal open-source project created by Chongbing Qu (瞿崇�
 
 - No installation: open the [browser edition](https://quchongbing.github.io/SciDigitizer/).
 - Desktop: download the approximately 1–1.3 MiB package for your system from [Releases](https://github.com/quchongbing/SciDigitizer/releases), then follow the [installation guide](docs/installation.md).
+- Offline source copy: keep the downloaded or cloned directory intact and double-click the root `index.html`; no server is required.
 
 ### Short workflow
 

@@ -20,6 +20,7 @@ test("static interface labels translate to concise English", () => {
     translateMessage("重叠 / 遮挡辅助（可选）", "en"),
     "Overlap / occlusion assistance (optional)",
   );
+  assert.equal(translateMessage("清除并重新开始", "en"), "Clear and start fresh");
   assert.equal(translateMessage("选择图像", "zh"), "选择图像");
 });
 
