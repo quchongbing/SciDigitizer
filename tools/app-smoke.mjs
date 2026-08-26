@@ -118,6 +118,65 @@ await command("Emulation.setDeviceMetricsOverride", {
   mobile: false,
 });
 await waitFor("document.querySelector('#source-meta').textContent.includes('578 × 450')");
+const canvasLayers = await evaluate(`(() => {
+  const imageCanvas = document.querySelector('#plot-image-canvas');
+  const overlayCanvas = document.querySelector('#plot-canvas');
+  const surface = document.querySelector('#plot-surface');
+  return {
+    sameDimensions: imageCanvas.width === overlayCanvas.width
+      && imageCanvas.height === overlayCanvas.height,
+    overlayPosition: getComputedStyle(overlayCanvas).position,
+    imagePointerEvents: getComputedStyle(imageCanvas).pointerEvents,
+    surfaceContainsBoth: surface.contains(imageCanvas) && surface.contains(overlayCanvas),
+  };
+})()`);
+assert.equal(canvasLayers.sameDimensions, true);
+assert.equal(canvasLayers.overlayPosition, "absolute");
+assert.equal(canvasLayers.imagePointerEvents, "none");
+assert.equal(canvasLayers.surfaceContainsBoth, true);
+const interactiveRenderAudit = await evaluate(`new Promise((resolve) => {
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    const imageCanvas = document.querySelector('#plot-image-canvas');
+    const overlayCanvas = document.querySelector('#plot-canvas');
+    const imageContext = imageCanvas.getContext('2d');
+    const overlayContext = overlayCanvas.getContext('2d');
+    const originalImageDraw = imageContext.drawImage;
+    const originalOverlayDraw = overlayContext.drawImage;
+    const originalOverlayClear = overlayContext.clearRect;
+    let imageDraws = 0;
+    let overlayImageDraws = 0;
+    let overlayClears = 0;
+    imageContext.drawImage = function (...args) {
+      imageDraws += 1;
+      return originalImageDraw.apply(this, args);
+    };
+    overlayContext.drawImage = function (...args) {
+      overlayImageDraws += 1;
+      return originalOverlayDraw.apply(this, args);
+    };
+    overlayContext.clearRect = function (...args) {
+      overlayClears += 1;
+      return originalOverlayClear.apply(this, args);
+    };
+    const bounds = overlayCanvas.getBoundingClientRect();
+    for (let index = 0; index < 40; index += 1) {
+      overlayCanvas.dispatchEvent(new PointerEvent('pointermove', {
+        bubbles: true,
+        clientX: bounds.left + 30 + index,
+        clientY: bounds.top + 80,
+      }));
+    }
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      imageContext.drawImage = originalImageDraw;
+      overlayContext.drawImage = originalOverlayDraw;
+      overlayContext.clearRect = originalOverlayClear;
+      resolve({ imageDraws, overlayImageDraws, overlayClears });
+    }));
+  }));
+})`);
+assert.equal(interactiveRenderAudit.imageDraws, 0, "pointer movement must not redraw the source image");
+assert.equal(interactiveRenderAudit.overlayImageDraws, 0, "the overlay must remain transparent over the stable image layer");
+assert.equal(interactiveRenderAudit.overlayClears, 1, "pointer movement should be coalesced into one animation-frame draw");
 assert.equal(await evaluate("document.querySelectorAll('[data-language]').length"), 2);
 await waitFor("document.documentElement.lang === 'en' && document.querySelector('.panel-section h2').textContent === 'Choose image'");
 assert.equal(await evaluate("document.querySelector('[data-language=\"en\"]').getAttribute('aria-pressed')"), "true");
@@ -429,6 +488,43 @@ assert.equal(curveNameHeader, "Ti = 0.4 eV,");
 assert.equal(coordinateHeader, "k [1/angstrom],W(k)");
 assert.equal(firstDataRow.split(",").length, 2);
 assert.doesNotMatch(exportedCsv, /pixel_x|confidence|candidate_count|^series,/m);
+const exportedOverlay = await evaluate(`new Promise((resolve, reject) => {
+  const originalCreateObjectURL = URL.createObjectURL;
+  const originalRevokeObjectURL = URL.revokeObjectURL;
+  const originalAnchorClick = HTMLAnchorElement.prototype.click;
+  const timeout = setTimeout(() => reject(new Error('Overlay PNG export timed out')), 5000);
+  URL.createObjectURL = (blob) => {
+    (async () => {
+      try {
+        const bitmap = await createImageBitmap(blob);
+        const sampleCanvas = document.createElement('canvas');
+        sampleCanvas.width = bitmap.width;
+        sampleCanvas.height = bitmap.height;
+        const sampleContext = sampleCanvas.getContext('2d');
+        sampleContext.drawImage(bitmap, 0, 0);
+        const corner = [...sampleContext.getImageData(10, 10, 1, 1).data];
+        clearTimeout(timeout);
+        resolve({ type: blob.type, size: blob.size, width: bitmap.width, height: bitmap.height, corner });
+      } catch (error) {
+        clearTimeout(timeout);
+        reject(error);
+      } finally {
+        URL.createObjectURL = originalCreateObjectURL;
+        URL.revokeObjectURL = originalRevokeObjectURL;
+        HTMLAnchorElement.prototype.click = originalAnchorClick;
+      }
+    })();
+    return 'blob:scidigitizer-overlay-smoke';
+  };
+  URL.revokeObjectURL = () => {};
+  HTMLAnchorElement.prototype.click = () => {};
+  document.querySelector('#export-overlay').click();
+})`);
+assert.equal(exportedOverlay.type, "image/png");
+assert.equal(exportedOverlay.width, 578);
+assert.equal(exportedOverlay.height, 450);
+assert.equal(exportedOverlay.corner[3], 255, "overlay export must include the opaque source image");
+assert.ok(exportedOverlay.size > 10_000, `overlay PNG is unexpectedly small: ${exportedOverlay.size}`);
 const exportedProject = await evaluate(`(async () => {
   let exportedBlob = null;
   const originalCreateObjectURL = URL.createObjectURL;

@@ -395,7 +395,10 @@
         </div>
         <div id="canvas-scroller" class="canvas-scroller">
           <div class="canvas-stage">
-            <canvas id="plot-canvas" aria-label="待提取的科学图像"></canvas>
+            <div id="plot-surface" class="plot-surface">
+              <canvas id="plot-image-canvas" aria-hidden="true"></canvas>
+              <canvas id="plot-canvas" aria-label="待提取的科学图像"></canvas>
+            </div>
             <div id="empty-state" class="empty-state">正在载入样例…</div>
           </div>
         </div>

@@ -1304,11 +1304,27 @@ input[type="range"] {
   text-align: center;
 }
 
-#plot-canvas {
+.plot-surface {
+  position: relative;
   display: inline-block;
+  overflow: hidden;
   border-radius: 2px;
   background: white;
   box-shadow: var(--shadow), 0 0 0 1px rgb(65 80 100 / 12%);
+  contain: paint;
+  vertical-align: top;
+}
+
+#plot-image-canvas {
+  display: block;
+  pointer-events: none;
+}
+
+#plot-canvas {
+  position: absolute;
+  inset: 0;
+  display: block;
+  background: transparent;
   touch-action: none;
 }
 

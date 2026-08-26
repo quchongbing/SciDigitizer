@@ -62,7 +62,10 @@ initializeI18n();
 
 const $ = (selector) => document.querySelector(selector);
 const canvas = $("#plot-canvas");
-const context = canvas.getContext("2d", { willReadFrequently: true });
+const context = canvas.getContext("2d");
+const imageCanvas = $("#plot-image-canvas");
+const imageContext = imageCanvas.getContext("2d", { willReadFrequently: true });
+const plotSurface = $("#plot-surface");
 const scroller = $("#canvas-scroller");
 const magnifierCanvas = $("#magnifier-canvas");
 const magnifierContext = magnifierCanvas.getContext("2d");
@@ -939,7 +942,6 @@ function draw({ includeAllSaved = false, includeGuides = true } = {}) {
   const displayImage = currentDisplayImage();
   if (!displayImage) return;
   context.clearRect(0, 0, canvas.width, canvas.height);
-  context.drawImage(displayImage, 0, 0);
   if (state.rotationPreviewActive) {
     drawRotationAssist();
     drawMagnifier(state.cursor ?? state.magnifierPoint, { includeAllSaved });
@@ -989,6 +991,16 @@ function draw({ includeAllSaved = false, includeGuides = true } = {}) {
     ? state.calibrationPoints[state.draggedCalibrationKey]
     : null;
   drawMagnifier(calibrationFocus ?? state.cursor ?? state.magnifierPoint, { includeAllSaved });
+}
+
+let interactiveDrawFrame = null;
+
+function scheduleInteractiveDraw() {
+  if (interactiveDrawFrame !== null) return;
+  interactiveDrawFrame = window.requestAnimationFrame(() => {
+    interactiveDrawFrame = null;
+    draw();
+  });
 }
 
 function xCalibration() {
@@ -1615,8 +1627,8 @@ function syncReviewAssistant() {
 function revealPointOnCanvas(point) {
   const scroller = $("#canvas-scroller");
   if (!scroller || !point) return;
-  const left = canvas.offsetLeft + point.x * state.zoom - scroller.clientWidth / 2;
-  const top = canvas.offsetTop + point.y * state.zoom - scroller.clientHeight / 2;
+  const left = plotSurface.offsetLeft + point.x * state.zoom - scroller.clientWidth / 2;
+  const top = plotSurface.offsetTop + point.y * state.zoom - scroller.clientHeight / 2;
   scroller.scrollTo({
     left: Math.max(0, left),
     top: Math.max(0, top),
@@ -1824,8 +1836,12 @@ function updateUi() {
 function setZoom(percent) {
   const value = clamp(Number(percent), 20, 200);
   state.zoom = value / 100;
-  canvas.style.width = `${canvas.width * state.zoom}px`;
-  canvas.style.height = `${canvas.height * state.zoom}px`;
+  const displayWidth = `${canvas.width * state.zoom}px`;
+  const displayHeight = `${canvas.height * state.zoom}px`;
+  canvas.style.width = displayWidth;
+  canvas.style.height = displayHeight;
+  imageCanvas.style.width = displayWidth;
+  imageCanvas.style.height = displayHeight;
   $("#zoom-range").value = String(value);
   $("#zoom-output").value = `${Math.round(value)}%`;
   draw();
@@ -2351,7 +2367,7 @@ canvas.addEventListener("pointermove", (event) => {
   state.magnifierPoint = point;
   updateCursorReadout(point);
   if (state.rotationPreviewActive && !state.mode?.startsWith("align-")) {
-    draw();
+    scheduleInteractiveDraw();
     return;
   }
   if (state.draggedCalibrationKey !== null) {
@@ -2364,7 +2380,7 @@ canvas.addEventListener("pointermove", (event) => {
       state.magnifierPoint = { ...calibrationPoint };
     }
     updateUi();
-    draw();
+    scheduleInteractiveDraw();
     return;
   }
   if (state.draggedAnchorIndex !== null) {
@@ -2382,7 +2398,7 @@ canvas.addEventListener("pointermove", (event) => {
       if (anchor.anchorId === state.seed?.anchorId) state.seed = anchor;
     }
     syncPointCursor();
-    draw();
+    scheduleInteractiveDraw();
     return;
   }
   if (state.draggedPointId !== null) {
@@ -2402,7 +2418,7 @@ canvas.addEventListener("pointermove", (event) => {
       updatePointListRow(current);
     }
     syncPointCursor();
-    draw();
+    scheduleInteractiveDraw();
     return;
   }
   const hoveredAnchor = state.mode ? null : guideAnchorAt(point);
@@ -2423,7 +2439,7 @@ canvas.addEventListener("pointermove", (event) => {
     if (state.mode === "plot") state.draftRect = draft;
     else state.draftExclusion = draft;
   }
-  draw();
+  scheduleInteractiveDraw();
 });
 
 canvas.addEventListener("pointerleave", () => {
@@ -3396,8 +3412,14 @@ $("#export-txt").addEventListener("click", () => {
 
 $("#export-overlay").addEventListener("click", () => {
   draw({ includeAllSaved: true, includeGuides: false });
-  canvas.toBlob(async (blob) => {
-    draw();
+  const exportCanvas = document.createElement("canvas");
+  exportCanvas.width = canvas.width;
+  exportCanvas.height = canvas.height;
+  const exportContext = exportCanvas.getContext("2d");
+  exportContext.drawImage(currentDisplayImage(), 0, 0);
+  exportContext.drawImage(canvas, 0, 0);
+  draw();
+  exportCanvas.toBlob(async (blob) => {
     if (!blob) {
       showToast("Overlay PNG 生成失败");
       return;
@@ -3503,11 +3525,14 @@ function workingImageDimensions(image = state.image) {
 function updateWorkingCanvas(image, { preview = false } = {}) {
   if (!image) return;
   const dimensions = workingImageDimensions(image);
+  imageCanvas.width = dimensions.width;
+  imageCanvas.height = dimensions.height;
   canvas.width = dimensions.width;
   canvas.height = dimensions.height;
+  imageContext.clearRect(0, 0, imageCanvas.width, imageCanvas.height);
+  imageContext.drawImage(image, 0, 0);
   context.clearRect(0, 0, canvas.width, canvas.height);
-  context.drawImage(image, 0, 0);
-  if (!preview) state.imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+  if (!preview) state.imageData = imageContext.getImageData(0, 0, imageCanvas.width, imageCanvas.height);
 }
 
 function updateSourceMeta() {

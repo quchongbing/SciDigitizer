@@ -5,7 +5,7 @@
 
 [中文说明](#中文) · [English](#english)
 
-**[Open SciDigitizer online / 在线使用](https://quchongbing.github.io/SciDigitizer/)**
+**[Open SciDigitizer online / 在线使用](https://quchongbing.github.io/SciDigitizer/)** · **[Desktop downloads / 桌面版下载](https://github.com/quchongbing/SciDigitizer/releases)** · **[Installation guide / 安装指南](docs/installation.md)**
 
 ![Version](https://img.shields.io/badge/version-0.20.0-1666d8)
 ![Local](https://img.shields.io/badge/data-local--only-00a9a5)
@@ -37,11 +37,8 @@ SciDigitizer is a personal open-source project created by Chongbing Qu (瞿崇�
 
 ### 快速开始
 
-```bash
-npm run serve
-```
-
-打开终端显示的地址（默认 <http://localhost:8000/>）。不要直接双击 `index.html`。
+- 无需安装：直接打开[在线版](https://quchongbing.github.io/SciDigitizer/)。
+- 桌面使用：从 [Releases](https://github.com/quchongbing/SciDigitizer/releases) 下载约 1–1.3 MiB 的对应系统版本，并按照[安装指南](docs/installation.md)操作。
 
 ### 最短使用流程
 
@@ -71,11 +68,8 @@ npm run serve
 
 ### Quick start
 
-```bash
-npm run serve
-```
-
-Open the printed address (default: <http://localhost:8000/>). Do not open `index.html` directly.
+- No installation: open the [browser edition](https://quchongbing.github.io/SciDigitizer/).
+- Desktop: download the approximately 1–1.3 MiB package for your system from [Releases](https://github.com/quchongbing/SciDigitizer/releases), then follow the [installation guide](docs/installation.md).
 
 ### Short workflow
 
@@ -93,6 +87,7 @@ Smart review means low confidence, occlusion inference, or model disagreement me
 ## Development
 
 ```bash
+npm run serve
 npm run check
 npm test
 npm run smoke:real
@@ -103,7 +98,9 @@ npm run benchmark
 
 SciDigitizer 也可以通过 Neutralinojs 打包成数 MB 的 Windows、macOS 或 Linux 桌面应用，复用系统 WebView 而不内置 Chromium。
 
-SciDigitizer can also be wrapped as a few-megabyte Windows, macOS, or Linux desktop application with Neutralinojs. It reuses the system WebView instead of bundling Chromium. See [desktop packaging](docs/desktop-packaging.md) for the size budget and build commands.
+普通用户请参阅简明的 [Windows、Linux 与 macOS 安装指南](docs/installation.md)。
+
+SciDigitizer can also be wrapped as a few-megabyte Windows, macOS, or Linux desktop application with Neutralinojs. It reuses the system WebView instead of bundling Chromium. See the concise [Windows, Linux, and macOS installation guide](docs/installation.md). Developers can find the size budget and build commands in [desktop packaging](docs/desktop-packaging.md).
 
 The application has no runtime npm dependencies and requires no backend. Project schema v6 stores per-series calibration, guides, editable points, confidence, occlusion-model weights, uncertainty, and preprocessing records. Older project files remain supported. Uploaded image pixels are not embedded in project JSON.
 
