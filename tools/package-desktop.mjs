@@ -1,5 +1,6 @@
 import { chmod, copyFile, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import zipLib from "zip-lib";
@@ -126,7 +127,24 @@ releases.push(await packageMac("arm64", "scidigitizer-mac_arm64"));
 const debian = await packageDebianX64();
 if (debian) releases.push(debian);
 
-await writeFile(join(releaseRoot, "sizes.json"), `${JSON.stringify({ version, budgetBytes: sizeBudget, releases }, null, 2)}\n`);
+const releaseManifest = [];
 for (const release of releases) {
+  const contents = await readFile(join(releaseRoot, release.file));
+  releaseManifest.push({
+    ...release,
+    sha256: createHash("sha256").update(contents).digest("hex"),
+  });
+}
+
+await writeFile(
+  join(releaseRoot, "sizes.json"),
+  `${JSON.stringify({ version, budgetBytes: sizeBudget, releases: releaseManifest }, null, 2)}\n`,
+);
+await writeFile(
+  join(releaseRoot, "SHA256SUMS.txt"),
+  `${releaseManifest.map((release) => `${release.sha256}  ${release.file}`).join("\n")}\n`,
+);
+for (const release of releaseManifest) {
   console.log(`${release.file}: ${(release.bytes / 1024 / 1024).toFixed(2)} MiB`);
 }
+console.log("SHA-256 checksums: SHA256SUMS.txt");

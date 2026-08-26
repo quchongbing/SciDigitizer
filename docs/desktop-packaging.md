@@ -25,4 +25,6 @@ An already downloaded official archive can be reused with `node tools/update-neu
 
 Per-platform release files are written to `dist-desktop/releases/`. The build fails if any compressed release exceeds 8 MiB. End users only open the packaged application; Node.js, npm, and a terminal are build-time tools and are not included or required at runtime.
 
+Every build also writes `SHA256SUMS.txt` and a machine-readable `sizes.json`. Publish the checksum file with all release packages so users can verify that downloads are complete and unchanged.
+
 The generated desktop page adds a narrowly scoped native bridge for Save As. It only permits the native save dialog and binary file writing. Image and project import continue to use the operating system WebView's local file picker.
