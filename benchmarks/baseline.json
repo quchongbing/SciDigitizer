@@ -1,0 +1,27 @@
+{
+  "extractorVersion": "0.12.0",
+  "generatedSeed": 20260719,
+  "charts": 30,
+  "series": 72,
+  "colorThreshold": "adaptive-9-to-15",
+  "pathRefinement": "normal-centerline-and-robust-local-cubic",
+  "meanPlotIoU": 1.0,
+  "oneAnchor": {
+    "meanNRMSE": 0.041305295980580706,
+    "medianNRMSE": 0.006761290061316053,
+    "fullSpanRate": 0.875,
+    "belowTwoPercent": 0.7361111111111112
+  },
+  "twoAnchors": {
+    "meanNRMSE": 0.023618846063295222,
+    "medianNRMSE": 0.006075641584202311,
+    "fullSpanRate": 0.9583333333333334,
+    "belowTwoPercent": 0.7916666666666666
+  },
+  "fourAnchors": {
+    "meanNRMSE": 0.01807372607397113,
+    "medianNRMSE": 0.006233882536555107,
+    "fullSpanRate": 1.0,
+    "belowTwoPercent": 0.8194444444444444
+  }
+}

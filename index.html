@@ -1,0 +1,459 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="SciDigitizer — 面向科学论文曲线的本地半自动数值提取工具"
+    />
+    <title>SciDigitizer</title>
+    <link rel="stylesheet" href="styles.css?v=0.20.0" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand-block">
+        <div class="brand-mark" aria-hidden="true">S</div>
+        <div class="brand-copy">
+          <h1>SciDigitizer</h1>
+          <p class="brand-subline">
+            <span>科学曲线提取工作台</span>
+            <span class="brand-divider" aria-hidden="true">·</span>
+            <span class="creator-credit"><span>作者</span> Chongbing Qu（瞿崇兵）</span>
+          </p>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <div class="language-switcher" role="group" aria-label="语言">
+          <span class="language-switcher-icon" aria-hidden="true">🌐</span>
+          <button type="button" data-language="zh" aria-pressed="false">中文</button>
+          <button type="button" data-language="en" aria-pressed="true">EN</button>
+        </div>
+        <div class="privacy-pill">
+          <span class="privacy-dot"></span>
+          本地处理 · 图片不会上传
+        </div>
+      </div>
+    </header>
+
+    <main class="app-shell">
+      <aside class="control-panel" aria-label="提取控制面板">
+        <section class="panel-section">
+          <div class="section-heading">
+            <span class="step-number">1</span>
+            <div>
+              <h2>选择图像</h2>
+              <p>使用内置示例，或打开本地截图</p>
+            </div>
+          </div>
+          <label class="field-label" for="sample-select">内置示例</label>
+          <select id="sample-select" class="select-control">
+            <option value="images/fig1.png">fig1 · 彩色多曲线</option>
+          </select>
+          <div class="button-row">
+            <label class="button button-secondary file-button">
+              打开图片
+              <input id="image-upload" type="file" accept="image/png,image/jpeg,image/webp" />
+            </label>
+            <label class="button button-ghost file-button">
+              载入项目
+              <input id="project-upload" type="file" accept="application/json,.json" />
+            </label>
+          </div>
+          <div id="source-meta" class="source-meta">等待图像载入…</div>
+          <details id="rotation-details" class="rotation-panel">
+            <summary>方向与校直</summary>
+            <div class="rotation-content">
+              <p class="rotation-help">先旋转照片到水平/垂直，再框选绘图区。预览不会改变原图；应用后会重新生成工作图并清除已有提取几何。</p>
+              <div class="button-row compact-row">
+                <button id="rotation-left" type="button" class="button button-ghost">↺ 左转 90°</button>
+                <button id="rotation-right" type="button" class="button button-ghost">↻ 右转 90°</button>
+                <button id="rotation-reset" type="button" class="button button-ghost">恢复 0°</button>
+              </div>
+              <label class="field-label" for="rotation-range">微调角度（拖动或精确输入）</label>
+              <div class="range-row rotation-range-row">
+                <input id="rotation-range" type="range" min="-45" max="45" step="0.01" value="0" />
+                <label class="rotation-number-field" for="rotation-fine" title="直接输入 -45° 到 45° 的微调角度">
+                  <span>输入</span>
+                  <input id="rotation-fine" class="rotation-fine-input" type="number" inputmode="decimal" min="-45" max="45" step="0.01" value="0" />
+                  <span aria-hidden="true">°</span>
+                </label>
+              </div>
+              <div class="rotation-total-row">
+                <span>当前总旋转</span>
+                <output id="rotation-angle-output">0°</output>
+              </div>
+              <div class="button-row compact-row">
+                <button id="rotation-align-horizontal" type="button" class="button button-ghost" aria-pressed="false">两点校水平</button>
+                <button id="rotation-align-vertical" type="button" class="button button-ghost" aria-pressed="false">两点校垂直</button>
+              </div>
+              <label class="checkbox-row rotation-grid-row"><input id="rotation-grid" type="checkbox" checked /> 显示校直网格</label>
+              <div id="geometry-diagnosis" class="geometry-diagnosis waiting">导入后自动检查水平、垂直与透视畸变</div>
+              <div id="rotation-status" class="status-line">未旋转 · 可先导入图片再校直</div>
+              <div class="button-row compact-row rotation-actions">
+                <button id="rotation-cancel" type="button" class="button button-ghost" disabled>取消预览</button>
+                <button id="rotation-apply" type="button" class="button button-accent" disabled>应用旋转</button>
+              </div>
+            </div>
+          </details>
+        </section>
+
+        <section class="panel-section">
+          <div class="section-heading">
+            <span class="step-number">2</span>
+            <div>
+              <h2>绘图区</h2>
+              <p>导入后自动选择最可信 panel，必要时再调整</p>
+            </div>
+          </div>
+          <div class="button-row no-top-margin">
+            <button id="auto-plot" class="button button-secondary">自动建议</button>
+            <button id="select-plot" class="button button-primary">手动框选</button>
+          </div>
+          <div class="button-row compact-row">
+            <button id="add-exclusion" class="button button-ghost" disabled>屏蔽遮挡/图例</button>
+            <button id="undo-exclusion" class="button button-ghost" disabled>撤销屏蔽</button>
+          </div>
+          <div id="plot-status" class="status-line">尚未框选</div>
+        </section>
+
+        <section class="panel-section">
+          <div class="section-heading">
+            <span class="step-number">3</span>
+            <div>
+              <h2>坐标标定</h2>
+              <p>人工输入刻度值，并点击图中对应刻度</p>
+            </div>
+          </div>
+
+          <div class="axis-card">
+            <div class="axis-card-title">
+              <strong>X 轴</strong>
+              <select id="x-scale" class="compact-select" aria-label="X 轴类型">
+                <option value="linear">Linear</option>
+                <option value="log">Log10</option>
+                <option value="piecewise">Piecewise</option>
+              </select>
+            </div>
+            <div class="calibration-row">
+              <input id="x-value-1" type="number" step="any" value="" placeholder="端点值" aria-label="X 第一个刻度值" />
+              <button id="pick-x-1" class="pick-button" data-pick="x1">点击刻度 1</button>
+            </div>
+            <div class="calibration-row">
+              <input id="x-value-2" type="number" step="any" value="" placeholder="端点值" aria-label="X 第二个刻度值" />
+              <button id="pick-x-2" class="pick-button" data-pick="x2">点击刻度 2</button>
+            </div>
+            <div id="x-piecewise-row" class="calibration-row piecewise-row" hidden>
+              <input id="x-value-3" type="number" step="any" value="" placeholder="第三点值" aria-label="X 第三个刻度值" />
+              <button id="pick-x-3" class="pick-button" data-pick="x3">点击刻度 3</button>
+            </div>
+            <input id="x-label" class="metadata-input" type="text" placeholder="X 轴名称/单位，例如 k [Å⁻¹]" />
+          </div>
+
+          <div class="axis-card">
+            <div class="axis-card-title">
+              <strong>Y 轴</strong>
+              <select id="y-scale" class="compact-select" aria-label="Y 轴类型">
+                <option value="linear">Linear</option>
+                <option value="log">Log10</option>
+                <option value="piecewise">Piecewise</option>
+              </select>
+            </div>
+            <div class="calibration-row">
+              <input id="y-value-1" type="number" step="any" value="" placeholder="端点值" aria-label="Y 第一个刻度值" />
+              <button id="pick-y-1" class="pick-button" data-pick="y1">点击刻度 1</button>
+            </div>
+            <div class="calibration-row">
+              <input id="y-value-2" type="number" step="any" value="" placeholder="端点值" aria-label="Y 第二个刻度值" />
+              <button id="pick-y-2" class="pick-button" data-pick="y2">点击刻度 2</button>
+            </div>
+            <div id="y-piecewise-row" class="calibration-row piecewise-row" hidden>
+              <input id="y-value-3" type="number" step="any" value="" placeholder="第三点值" aria-label="Y 第三个刻度值" />
+              <button id="pick-y-3" class="pick-button" data-pick="y3">点击刻度 3</button>
+            </div>
+            <input id="y-label" class="metadata-input" type="text" placeholder="Y 轴名称/单位，例如 Sii(k)" />
+          </div>
+          <div id="calibration-refine" class="calibration-refine" hidden>
+            <div class="calibration-refine-heading">
+              <strong id="calibration-refine-title">微调标定点</strong>
+              <span id="calibration-refine-axis">—</span>
+            </div>
+            <div class="calibration-refine-controls">
+              <button type="button" data-calibration-nudge="-1" aria-label="标定点减小 1 像素">−1</button>
+              <button type="button" data-calibration-nudge="-0.1" aria-label="标定点减小 0.1 像素">−0.1</button>
+              <label>
+                <span>像素位置</span>
+                <input id="calibration-pixel-position" type="number" inputmode="decimal" step="0.1" />
+              </label>
+              <button type="button" data-calibration-nudge="0.1" aria-label="标定点增加 0.1 像素">+0.1</button>
+              <button type="button" data-calibration-nudge="1" aria-label="标定点增加 1 像素">+1</button>
+            </div>
+            <p id="calibration-refine-hint">可拖动图中十字，或用方向键进行 0.1 px 微调。</p>
+          </div>
+          <div id="calibration-status" class="status-line">需要 4 个刻度点</div>
+          <div id="calibration-quality" class="calibration-quality waiting">
+            <div id="x-calibration-quality">X：等待人工标定</div>
+            <div id="y-calibration-quality">Y：等待人工标定</div>
+          </div>
+        </section>
+
+        <section class="panel-section">
+          <div class="section-heading">
+            <span class="step-number">4</span>
+            <div>
+              <h2>追踪曲线</h2>
+              <p>点击目标后立即智能追踪，歧义处再补引导点</p>
+            </div>
+          </div>
+
+          <input id="series-label" class="metadata-input series-name-input" type="text" placeholder="曲线名称，例如 DFT-MD / Ti = 6 eV" />
+          <label class="field-label target-style-label" for="target-style">目标对象类型</label>
+          <select id="target-style" class="select-control target-style-select">
+            <option value="auto" selected>自动 / 普通曲线</option>
+            <option value="line">连续细线 / 实线</option>
+            <option value="dashed">虚线（学习划线长度和间隔）</option>
+            <option value="dashdot">点划线（长划线 + 短点）</option>
+            <option value="dotted">点线（短点组成的曲线）</option>
+            <option value="noisy">实验噪声线（保留局部波动）</option>
+            <option value="markers">圆点 / marker 中心</option>
+          </select>
+          <div class="button-row no-top-margin">
+            <button id="pick-seed" class="button button-secondary">选择目标曲线</button>
+            <button id="add-guide" class="button button-secondary" disabled>添加引导点</button>
+          </div>
+          <div class="button-row compact-row guide-action-row">
+            <button id="undo-guide" class="button button-ghost" disabled>撤销最后引导点</button>
+            <button id="exclude-trace" class="button button-ghost" disabled>框选遮挡 / 图例</button>
+          </div>
+          <div class="seed-summary">
+            <span id="seed-swatch" class="seed-swatch"></span>
+            <span id="seed-status">尚未选择曲线</span>
+          </div>
+          <p id="target-style-hint" class="guide-help">同色曲线：在分叉前后分别加点。每个引导点都会锁定为追踪基准并进入数据采样；悬停后可直接拖动。</p>
+          <label class="strict-guide-toggle" for="strict-guide">
+            <input id="strict-guide" type="checkbox" disabled />
+            <span>
+              <strong>同色 / 遮挡强约束</strong>
+              <small id="strict-guide-help">拒绝偏离引导走廊的同色分支；普通曲线无需开启</small>
+            </span>
+          </label>
+
+          <label class="range-label" for="color-threshold">
+            <span>颜色容差</span>
+            <output id="color-threshold-output">15</output>
+          </label>
+          <input id="color-threshold" type="range" min="4" max="80" value="15" />
+
+          <div class="trace-point-count-control">
+            <label for="trace-point-count">
+              <strong>曲线数据点数量</strong>
+              <span id="trace-point-count-hint">自动追踪生成，可继续增删修改</span>
+            </label>
+            <div>
+              <input id="trace-point-count" type="number" min="2" max="2000" step="1" value="100" inputmode="numeric" />
+              <span>点</span>
+            </div>
+          </div>
+
+          <details class="advanced-options">
+            <summary>高级追踪参数</summary>
+            <div class="adaptive-sampling-options">
+              <label class="field-label" for="sampling-mode">数据点分布</label>
+              <select id="sampling-mode" class="select-control">
+                <option value="geometry" selected>几何自适应（推荐）</option>
+                <option value="uniform">X 等间距</option>
+                <option value="peak">峰值自适应加密</option>
+                <option value="noise">实验波动自适应</option>
+              </select>
+              <p id="sampling-mode-hint">推荐：按平滑后的屏幕弧长和转折自动分配；高斜率和急转弯处更密。</p>
+              <div id="peak-sampling-options" hidden>
+                <label class="range-label" for="peak-density">
+                  <span>峰中心相对密度</span>
+                  <output id="peak-density-output">4×</output>
+                </label>
+                <input id="peak-density" type="range" min="1" max="12" step="0.5" value="4" />
+                <label class="range-label" for="peak-width">
+                  <span>峰值加密范围 / 图宽</span>
+                  <output id="peak-width-output">8%</output>
+                </label>
+                <input id="peak-width" type="range" min="1" max="30" step="1" value="8" />
+              </div>
+              <div id="noise-sampling-options" hidden>
+                <label class="range-label" for="noise-density">
+                  <span>波动区相对密度</span>
+                  <output id="noise-density-output">4×</output>
+                </label>
+                <input id="noise-density" type="range" min="1" max="12" step="0.5" value="4" />
+                <label class="range-label" for="noise-window">
+                  <span>局部趋势窗口 / 图宽</span>
+                  <output id="noise-window-output">3%</output>
+                </label>
+                <input id="noise-window" type="range" min="1" max="15" step="1" value="3" />
+              </div>
+            </div>
+            <div class="path-refinement-options">
+              <label class="field-label" for="path-refinement">路径精细化</label>
+              <select id="path-refinement" class="select-control">
+                <option value="full" selected>线宽中心 + 多模型遮挡恢复</option>
+                <option value="center">仅做线宽中心校正</option>
+                <option value="off">关闭（保留原始追踪）</option>
+              </select>
+              <p>默认沿局部法线寻找抗锯齿像素带的亚像素中心；遮挡段自动比较直线、Hermite 与二次趋势并传播模型分歧。手工引导点始终固定；落在无目标像素处时自动启用局部强约束。</p>
+            </div>
+            <label class="range-label" for="max-jump">
+              <span>每列最大跳跃 / px</span>
+              <output id="max-jump-output">14</output>
+            </label>
+            <input id="max-jump" type="range" min="2" max="40" value="14" />
+            <label class="range-label" for="max-gap">
+              <span>允许虚线间隔 / px</span>
+              <output id="max-gap-output">24</output>
+            </label>
+            <input id="max-gap" type="range" min="0" max="60" value="24" />
+          </details>
+
+          <div class="button-row">
+            <button id="trace-curve" class="button button-accent" disabled>自动追踪</button>
+            <button id="clear-curve" class="button button-ghost" disabled>重置当前曲线</button>
+          </div>
+          <button id="save-series" class="button button-primary button-full save-series-button" disabled>保存当前曲线 · 准备下一条</button>
+          <div id="series-list" class="series-list">
+            <div class="series-empty">尚未保存曲线</div>
+          </div>
+          <p class="multi-series-hint">保存后数据点默认隐藏；提取下一条同色曲线时会自动避让已存轨迹。点“显示”可叠加查看，点“编辑”可载入右侧坐标表。CSV/TXT 会合并全部曲线。</p>
+        </section>
+
+        <section class="panel-section export-section">
+          <div class="section-heading">
+            <span class="step-number">5</span>
+            <div>
+              <h2>检查与导出</h2>
+              <p>导出数据及完整提取记录</p>
+            </div>
+          </div>
+          <div class="metric-grid">
+            <div><span>数据点</span><strong id="metric-points">—</strong></div>
+            <div><span>观测覆盖</span><strong id="metric-coverage">—</strong></div>
+            <div><span>低置信度</span><strong id="metric-low-confidence">—</strong></div>
+            <div><span>已存曲线</span><strong id="metric-series">0</strong></div>
+            <div><span>X 范围</span><strong id="metric-x-range">—</strong></div>
+            <div><span>Y 范围</span><strong id="metric-y-range">—</strong></div>
+          </div>
+          <div id="quality-status" class="quality-status empty">等待曲线路径</div>
+          <div id="review-assistant" class="review-assistant waiting">
+            <div class="review-assistant-heading">
+              <div>
+                <strong>智能复核</strong>
+                <span>低置信度、遮挡推断或多模型分歧，建议人工检查</span>
+              </div>
+              <span id="review-region-count">0 处</span>
+            </div>
+            <p id="review-region-status">追踪后自动标出最需要检查的位置</p>
+            <div class="review-assistant-actions">
+              <button id="review-focus" type="button" class="button button-secondary" disabled>定位当前</button>
+              <button id="review-next" type="button" class="button button-ghost" disabled>下一处</button>
+            </div>
+          </div>
+          <div id="export-status" class="export-status waiting" role="status">完成至少一条曲线后可导出数据</div>
+          <label class="field-label export-density-label" for="export-density">CSV / TXT 采样密度</label>
+          <select id="export-density" class="select-control">
+            <option value="curve" selected>使用每条曲线的数据点数量</option>
+            <option value="100">100 点</option>
+            <option value="200">200 点</option>
+            <option value="500">500 点</option>
+            <option value="1000">1000 点</option>
+          </select>
+          <div class="button-row">
+            <button id="export-csv" class="button button-primary" disabled>导出 CSV</button>
+            <button id="export-txt" class="button button-secondary" disabled>导出 TXT</button>
+          </div>
+          <div class="button-row export-secondary-row">
+            <button id="export-project" class="button button-secondary" disabled>保存项目</button>
+            <button id="export-overlay" class="button button-ghost" disabled>导出 Overlay PNG</button>
+          </div>
+        </section>
+      </aside>
+
+      <section class="workspace" aria-label="图像工作区">
+        <div class="workspace-toolbar">
+          <div>
+            <strong id="workspace-title" data-i18n-skip>fig1.png</strong>
+            <span id="mode-hint">先框选单个 panel 的绘图区</span>
+          </div>
+          <div class="workspace-toolbar-actions">
+            <div class="history-control" aria-label="编辑历史">
+              <button id="undo-action" class="icon-button" type="button" disabled title="撤销最近一次编辑（Ctrl+Z）">撤销</button>
+              <button id="redo-action" class="icon-button" type="button" disabled title="重做最近一次编辑（Ctrl+Shift+Z）">重做</button>
+              <span id="autosave-status">自动保存待命</span>
+            </div>
+            <div class="zoom-control">
+              <button id="zoom-fit" class="icon-button">适应</button>
+              <input id="zoom-range" type="range" min="20" max="200" value="100" aria-label="缩放" />
+              <output id="zoom-output">100%</output>
+            </div>
+          </div>
+        </div>
+        <div id="canvas-scroller" class="canvas-scroller">
+          <div class="canvas-stage">
+            <canvas id="plot-canvas" aria-label="待提取的科学图像"></canvas>
+            <div id="empty-state" class="empty-state">正在载入样例…</div>
+          </div>
+        </div>
+        <footer class="workspace-footer">
+          <div class="legend-item"><span class="legend-box excluded"></span>遮挡 / 图例屏蔽区</div>
+          <div class="legend-item"><span class="legend-point sampled"></span>圆圈即导出数据点（不连线）</div>
+          <div class="legend-item"><span class="legend-point inferred"></span>橙心虚线为遮挡推断点</div>
+          <div class="legend-item"><span class="legend-guide"></span>引导点（可拖动）</div>
+          <div id="cursor-readout" class="cursor-readout">pixel: — · data: —</div>
+        </footer>
+      </section>
+
+      <aside class="inspector-stack" aria-label="鼠标放大与数据点编辑器">
+        <section id="magnifier-window" class="magnifier-window" aria-label="鼠标位置放大窗口">
+          <div class="magnifier-heading">
+            <strong>鼠标放大窗</strong>
+            <span id="magnifier-coordinate">pixel: —<br />data: —</span>
+          </div>
+          <canvas id="magnifier-canvas" width="224" height="224"></canvas>
+          <div id="magnifier-hint" class="magnifier-hint">引导菱形与数据圆圈同步显示 · 可回到图中拖动</div>
+        </section>
+        <section class="data-point-window" aria-label="可编辑数据点坐标表">
+          <div class="data-point-heading">
+            <div>
+              <strong>数据点坐标</strong>
+              <span>悬停行可定位图中圆圈</span>
+            </div>
+            <div class="data-point-heading-actions">
+              <span id="point-count">0 点</span>
+              <button id="clear-all-points" type="button" title="清空当前曲线的全部数据点" aria-label="清空当前曲线的全部数据点" disabled>清空</button>
+            </div>
+          </div>
+          <div class="data-point-columns">
+            <span>#</span>
+            <strong id="point-x-heading">x</strong>
+            <strong id="point-y-heading">y</strong>
+            <span></span>
+          </div>
+          <div id="point-list" class="point-list">
+            <div class="point-list-empty">自动追踪后显示全部数据点</div>
+          </div>
+          <p>可直接修改坐标 · 上下箭头每次约移动 0.1 px · 左键拖动 · 右键删除最近点</p>
+        </section>
+      </aside>
+    </main>
+
+    <dialog id="rotation-confirm" class="rotation-confirm-dialog">
+      <form method="dialog">
+        <h3>应用图片旋转？</h3>
+        <p>旋转会改变像素坐标系。当前绘图区、坐标标定、引导点和曲线数据需要清除，请确认后重新框选和校准。</p>
+        <div class="dialog-actions">
+          <button id="rotation-confirm-cancel" value="cancel" class="button button-ghost">取消</button>
+          <button id="rotation-confirm-apply" value="default" class="button button-accent">继续应用</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script type="module" src="src/app.js?v=0.20.0"></script>
+  </body>
+</html>

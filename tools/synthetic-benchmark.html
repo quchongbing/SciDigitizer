@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="UTF-8"><title>SciDigitizer synthetic benchmark</title></head>
+  <body>
+    <pre id="summary">running</pre>
+    <pre id="output">running</pre>
+    <script type="module">
+      import {
+        detectPlotRect,
+        sampleRepresentativeColor,
+        traceCurveThroughAnchors,
+      } from "../src/core.js";
+
+      const parameters = new URLSearchParams(location.search);
+      const traceThreshold = Number(parameters.get("threshold") ?? 42);
+
+      function interpolateGroundTruth(series, pixelX) {
+        const xs = series.pixelX;
+        const ys = series.pixelY;
+        let low = 0;
+        let high = xs.length - 1;
+        while (low < high - 1) {
+          const middle = Math.floor((low + high) / 2);
+          if (xs[middle] <= pixelX) low = middle;
+          else high = middle;
+        }
+        const fraction = (pixelX - xs[low]) / Math.max(1e-12, xs[high] - xs[low]);
+        return ys[low] + fraction * (ys[high] - ys[low]);
+      }
+
+      function iou(a, b) {
+        const left = Math.max(a.left, b.left);
+        const right = Math.min(a.right, b.right);
+        const top = Math.max(a.top, b.top);
+        const bottom = Math.min(a.bottom, b.bottom);
+        if (right < left || bottom < top) return 0;
+        const intersection = (right - left + 1) * (bottom - top + 1);
+        const areaA = a.width * a.height;
+        const areaB = b.width * b.height;
+        return intersection / (areaA + areaB - intersection);
+      }
+
+      const manifest = await fetch("../benchmarks/generated/manifest.json").then((response) => response.json());
+      function scoreTrace(path, series, chart) {
+        const squaredErrors = path.map((point) => {
+          const expectedY = interpolateGroundTruth(series, point.x);
+          return (point.y - expectedY) ** 2;
+        });
+        const rmsePx = Math.sqrt(squaredErrors.reduce((sum, value) => sum + value, 0) / Math.max(1, squaredErrors.length));
+        const expectedSpan = series.pixelX.at(-1) - series.pixelX[0];
+        const actualSpan = path.length ? path.at(-1).x - path[0].x : 0;
+        const spanFraction = Math.min(1, actualSpan / Math.max(1, expectedSpan));
+        const nrmse = rmsePx / chart.plotRect.height + Math.max(0, 1 - spanFraction) * 0.25;
+        return { points: path.length, spanFraction, rmsePx, nrmse };
+      }
+
+      const chartResults = [];
+      for (const chartEntry of manifest.charts) {
+        const chart = await fetch(`../benchmarks/generated/${chartEntry.metadata}`).then((response) => response.json());
+        const image = new Image();
+        image.src = `../benchmarks/generated/${chartEntry.image}`;
+        await image.decode();
+        const canvas = document.createElement("canvas");
+        canvas.width = image.naturalWidth;
+        canvas.height = image.naturalHeight;
+        const context = canvas.getContext("2d", { willReadFrequently: true });
+        context.drawImage(image, 0, 0);
+        const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+        const detected = detectPlotRect(imageData.data, canvas.width, canvas.height);
+        const seriesResults = [];
+
+        for (const series of chart.series) {
+          const anchorIndex = Math.floor(series.pixelX.length * 0.38);
+          const guidedIndices = [0.22, 0.78].map((fraction) => Math.floor(series.pixelX.length * fraction));
+          const sampledTarget = sampleRepresentativeColor(
+            imageData.data,
+            canvas.width,
+            canvas.height,
+            { x: series.pixelX[anchorIndex], y: series.pixelY[anchorIndex] },
+          );
+          const traceWith = (anchors) => traceCurveThroughAnchors({
+              rgba: imageData.data,
+              width: canvas.width,
+              height: canvas.height,
+              rect: chart.plotRect,
+              anchors,
+              target: sampledTarget,
+              threshold: traceThreshold,
+              maxJump: 16,
+              maxGap: 30,
+            });
+          const oneAnchor = scoreTrace(traceWith([
+            { x: series.pixelX[anchorIndex], y: series.pixelY[anchorIndex] },
+          ]), series, chart);
+          const guided = scoreTrace(traceWith(guidedIndices.map((index) => ({
+            x: series.pixelX[index], y: series.pixelY[index],
+          }))), series, chart);
+          seriesResults.push({
+            label: series.label,
+            style: series.lineStyle,
+            marker: series.marker,
+            oneAnchor,
+            guided,
+          });
+        }
+        chartResults.push({
+          id: chart.id,
+          xScale: chart.xScale,
+          yScale: chart.yScale,
+          artifacts: chart.artifacts,
+          plotIoU: iou(detected, chart.plotRect),
+          series: seriesResults,
+        });
+      }
+
+      const allSeries = chartResults.flatMap((chart) => chart.series);
+      const rankedGuided = chartResults.flatMap((chart) => chart.series.map((series) => ({
+        chart: chart.id,
+        xScale: chart.xScale,
+        yScale: chart.yScale,
+        artifacts: chart.artifacts,
+        label: series.label,
+        style: series.style,
+        marker: series.marker,
+        ...series.guided,
+      }))).sort((a, b) => b.nrmse - a.nrmse);
+      const summary = {
+        seed: manifest.seed,
+        traceThreshold,
+        charts: chartResults.length,
+        series: allSeries.length,
+        meanPlotIoU: chartResults.reduce((sum, chart) => sum + chart.plotIoU, 0) / chartResults.length,
+        oneAnchor: {
+          meanNRMSE: allSeries.reduce((sum, series) => sum + series.oneAnchor.nrmse, 0) / allSeries.length,
+          medianNRMSE: [...allSeries].sort((a, b) => a.oneAnchor.nrmse - b.oneAnchor.nrmse)[Math.floor(allSeries.length / 2)].oneAnchor.nrmse,
+          fullSpanRate: allSeries.filter((series) => series.oneAnchor.spanFraction >= 0.95).length / allSeries.length,
+        },
+        guided: {
+          meanNRMSE: allSeries.reduce((sum, series) => sum + series.guided.nrmse, 0) / allSeries.length,
+          medianNRMSE: [...allSeries].sort((a, b) => a.guided.nrmse - b.guided.nrmse)[Math.floor(allSeries.length / 2)].guided.nrmse,
+          fullSpanRate: allSeries.filter((series) => series.guided.spanFraction >= 0.95).length / allSeries.length,
+        },
+        worstGuided: rankedGuided.slice(0, 10),
+        chartResults,
+      };
+      document.querySelector("#summary").textContent = JSON.stringify({
+        seed: summary.seed,
+        traceThreshold: summary.traceThreshold,
+        charts: summary.charts,
+        series: summary.series,
+        meanPlotIoU: summary.meanPlotIoU,
+        oneAnchor: summary.oneAnchor,
+        guided: summary.guided,
+        worstGuided: summary.worstGuided,
+      }, null, 2);
+      document.querySelector("#output").textContent = JSON.stringify(summary, null, 2);
+      document.title = "done";
+    </script>
+  </body>
+</html>

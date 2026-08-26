@@ -1,0 +1,24 @@
+{
+  "name": "scidigitizer",
+  "version": "0.20.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "description": "Local-first scientific curve digitizer",
+  "scripts": {
+    "serve": "python tools/serve.py",
+    "test": "node tests/core.test.js && node tests/i18n.test.js && node tests/desktop-bridge.test.js",
+    "check": "node --check src/app.js && node --check src/core.js && node --check src/i18n.js && node --check src/image-geometry.js && node --check src/edit-session.js && node --check src/image-transform.js",
+    "desktop:prepare": "node tools/prepare-desktop.mjs",
+    "desktop:update": "node tools/update-neutralino.mjs",
+    "desktop:build": "npm run desktop:prepare && neu build --embed-resources --clean && node tools/package-desktop.mjs",
+    "desktop:run": "npm run desktop:prepare && neu run",
+    "benchmark:generate": "python tools/generate_synthetic.py --count 30 --seed 20260719",
+    "benchmark": "node tools/synthetic-node-benchmark.mjs 0",
+    "smoke:real": "node tools/real-node-smoke.mjs"
+  },
+  "devDependencies": {
+    "@neutralinojs/neu": "11.7.2",
+    "zip-lib": "1.4.0"
+  }
+}

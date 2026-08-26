@@ -1,0 +1,49 @@
+{
+  "$schema": "https://raw.githubusercontent.com/neutralinojs/neutralinojs/main/schemas/neutralino.config.schema.json",
+  "applicationId": "org.chongbingqu.scidigitizer",
+  "version": "0.20.0",
+  "applicationName": "SciDigitizer",
+  "author": "Chongbing Qu (瞿崇兵)",
+  "description": "Local-first scientific curve digitizer",
+  "copyright": "Copyright © 2026 Chongbing Qu (瞿崇兵)",
+  "defaultMode": "window",
+  "port": 0,
+  "documentRoot": "/build/desktop-web/",
+  "url": "/",
+  "enableServer": true,
+  "enableNativeAPI": true,
+  "tokenSecurity": "one-time",
+  "logging": {
+    "enabled": false,
+    "writeToLogFile": false
+  },
+  "nativeAllowList": [
+    "os.showSaveDialog",
+    "filesystem.writeBinaryFile"
+  ],
+  "modes": {
+    "window": {
+      "title": "SciDigitizer",
+      "width": 1440,
+      "height": 900,
+      "minWidth": 1024,
+      "minHeight": 700,
+      "center": true,
+      "fullScreen": false,
+      "alwaysOnTop": false,
+      "enableInspector": false,
+      "borderless": false,
+      "maximize": false,
+      "hidden": false,
+      "resizable": true,
+      "exitProcessOnClose": true,
+      "injectClientLibrary": true
+    }
+  },
+  "cli": {
+    "binaryName": "scidigitizer",
+    "resourcesPath": "/build/desktop-web/",
+    "distributionPath": "/dist-desktop/",
+    "binaryVersion": "6.9.0"
+  }
+}

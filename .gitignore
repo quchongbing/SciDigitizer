@@ -1,0 +1,13 @@
+.DS_Store
+node_modules/
+__pycache__/
+*.pyc
+.pytest_cache/
+projects/
+exports/
+benchmarks/generated/
+/bin/
+/build/desktop-web/
+/build/neutralino-update/
+/dist-desktop/
+/.tmp/

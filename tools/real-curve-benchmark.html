@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <title>SciDigitizer real curve benchmark</title>
+    <style>
+      body { margin: 20px; font: 13px system-ui, sans-serif; color: #17202c; background: #eef2f6; }
+      h1 { margin: 0 0 16px; font-size: 20px; }
+      #grid { display: grid; grid-template-columns: repeat(2, minmax(420px, 1fr)); gap: 18px; }
+      figure { margin: 0; padding: 12px; background: white; border-radius: 8px; box-shadow: 0 4px 20px #2342; }
+      canvas { display: block; width: 100%; height: auto; border: 1px solid #d6dde7; }
+      figcaption { margin-top: 8px; line-height: 1.45; }
+      code { color: #087f8c; }
+    </style>
+  </head>
+  <body>
+    <h1>Real-image curve tracing smoke benchmark</h1>
+    <div id="grid"></div>
+    <pre id="output">running</pre>
+    <script type="module">
+      import {
+        detectPlotRect,
+        estimateColorThreshold,
+        sampleRepresentativeColor,
+        traceCurveThroughAnchors,
+      } from "../src/core.js";
+
+      const cases = [
+        { image: "fig1.png", name: "fig1 green peak", anchors: [[276, 85]], maxJump: 16, maxGap: 18 },
+        { image: "fig1.png", name: "fig1 orange solid", anchors: [[280, 173]], maxJump: 14, maxGap: 18 },
+        { image: "fig1.png", name: "fig1 blue solid", anchors: [[134, 132]], maxJump: 14, maxGap: 20 },
+      ];
+
+      const summaries = [];
+      for (const config of cases) {
+        const image = new Image();
+        image.src = `../images/${config.image}`;
+        await image.decode();
+        const canvas = document.createElement("canvas");
+        canvas.width = image.naturalWidth;
+        canvas.height = image.naturalHeight;
+        const context = canvas.getContext("2d", { willReadFrequently: true });
+        context.drawImage(image, 0, 0);
+        const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+        const rect = detectPlotRect(imageData.data, canvas.width, canvas.height);
+        const anchors = config.anchors.map(([x, y]) => ({ x, y }));
+        const target = sampleRepresentativeColor(imageData.data, canvas.width, canvas.height, anchors[0]);
+        const threshold = estimateColorThreshold(imageData.data, canvas.width, canvas.height, anchors[0], target);
+        const started = performance.now();
+        const path = traceCurveThroughAnchors({
+          rgba: imageData.data,
+          width: canvas.width,
+          height: canvas.height,
+          rect,
+          anchors,
+          target,
+          threshold,
+          maxJump: config.maxJump,
+          maxGap: config.maxGap,
+        });
+        const elapsedMs = performance.now() - started;
+
+        context.lineCap = "round";
+        context.lineJoin = "round";
+        for (const [observed, color] of [[true, "#00b8a9"], [false, "#f28c28"]]) {
+          context.strokeStyle = "white";
+          context.lineWidth = 6;
+          context.beginPath();
+          path.forEach((point, index) => {
+            if (index === 0 || point.observed !== observed || path[index - 1].observed !== observed) context.moveTo(point.x, point.y);
+            else context.lineTo(point.x, point.y);
+          });
+          context.stroke();
+          context.strokeStyle = color;
+          context.lineWidth = 3;
+          context.stroke();
+        }
+        for (const anchor of anchors) {
+          context.fillStyle = "#e31b62";
+          context.beginPath();
+          context.arc(anchor.x, anchor.y, 5, 0, Math.PI * 2);
+          context.fill();
+        }
+
+        const observedCount = path.filter((point) => point.observed).length;
+        const lowConfidence = path.filter((point) => point.confidence < 0.5).length;
+        const figure = document.createElement("figure");
+        figure.append(canvas);
+        const caption = document.createElement("figcaption");
+        caption.innerHTML = `<strong>${config.name}</strong><br><code>RGB(${target.r},${target.g},${target.b})</code> · ${path.length} points · ${(100 * observedCount / path.length).toFixed(1)}% observed · ${(100 * lowConfidence / path.length).toFixed(1)}% low confidence · ${elapsedMs.toFixed(1)} ms`;
+        figure.append(caption);
+        document.querySelector("#grid").append(figure);
+        summaries.push({
+          name: config.name,
+          target,
+          threshold,
+          plotRect: rect,
+          points: path.length,
+          observedFraction: observedCount / path.length,
+          lowConfidenceFraction: lowConfidence / path.length,
+          elapsedMs,
+        });
+      }
+      document.querySelector("#output").textContent = JSON.stringify(summaries, null, 2);
+      document.title = "done";
+    </script>
+  </body>
+</html>
