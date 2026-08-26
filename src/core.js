@@ -358,18 +358,100 @@ export function estimateColorThreshold(rgba, width, height, point, target, radiu
   return Math.round(clamp(distances[clusterEnd] + 5, 9, 15));
 }
 
-export function clusterColumnCandidates(rgba, width, x, top, bottom, target, threshold, exclusions = []) {
+function inclusionMaskAllows(inclusionMask, width, x, y) {
+  if (!inclusionMask?.data || !inclusionMask?.columns) return true;
+  const column = Math.round(x);
+  const row = Math.round(y);
+  if (!inclusionMask.columns[column]) return true;
+  return Boolean(inclusionMask.data[row * width + column]);
+}
+
+function inclusionRunsAt(inclusionMask, width, x, top, bottom) {
+  if (!inclusionMask?.data || !inclusionMask?.columns) return [];
+  const column = Math.round(x);
+  if (!inclusionMask.columns[column]) return [];
+  const runs = [];
+  let start = null;
+  for (let y = top; y <= bottom; y += 1) {
+    const allowed = Boolean(inclusionMask.data[y * width + column]);
+    if (allowed && start === null) start = y;
+    if (!allowed && start !== null) {
+      runs.push({ start, end: y - 1, center: (start + y - 1) / 2 });
+      start = null;
+    }
+  }
+  if (start !== null) runs.push({ start, end: bottom, center: (start + bottom) / 2 });
+  return runs;
+}
+
+function nearestInclusionRun(inclusionMask, width, x, y, top, bottom) {
+  const runs = inclusionRunsAt(inclusionMask, width, x, top, bottom);
+  if (!runs.length) return null;
+  return runs
+    .map((run) => ({
+      ...run,
+      distance: y < run.start ? run.start - y : y > run.end ? y - run.end : 0,
+      centerDistance: Math.abs(y - run.center),
+    }))
+    .sort((left, right) => left.distance - right.distance || left.centerDistance - right.centerDistance)[0];
+}
+
+/**
+ * Enforce a user-painted inclusion corridor on every non-anchor path point.
+ * Candidate filtering alone is insufficient because inferred gaps, polynomial
+ * recovery, and final resampling can otherwise create points outside the ROI.
+ */
+export function constrainPathToInclusionMask(path, {
+  inclusionMask = null,
+  width,
+  rect,
+} = {}) {
+  if (!Array.isArray(path) || !path.length) return [];
+  if (!inclusionMask?.data || !inclusionMask?.columns || !Number.isFinite(width) || !rect) return path;
+  const top = Math.round(rect.top);
+  const bottom = Math.round(rect.bottom);
+  return path.map((point) => {
+    if (point.anchor || point.userGuided || !Number.isFinite(point.x) || !Number.isFinite(point.y)) return point;
+    const column = Math.round(point.x);
+    if (!inclusionMask.columns[column]) return point;
+    const run = nearestInclusionRun(inclusionMask, width, column, point.y, top, bottom);
+    if (!run || run.distance === 0) return point;
+    const y = clamp(point.y, run.start, run.end);
+    return {
+      ...point,
+      y,
+      corridorConstrained: true,
+      confidence: Math.min(point.confidence ?? 1, 0.55),
+    };
+  });
+}
+
+export function clusterColumnCandidates(
+  rgba,
+  width,
+  x,
+  top,
+  bottom,
+  target,
+  threshold,
+  exclusions = [],
+  inclusionMask = null,
+) {
   const candidates = [];
   let run = null;
 
   const closeRun = () => {
     if (!run) return;
+    const y = (run.start + run.end) / 2;
+    const inclusionRun = nearestInclusionRun(inclusionMask, width, x, y, top, bottom);
     candidates.push({
-      y: (run.start + run.end) / 2,
+      y,
       start: run.start,
       end: run.end,
       thickness: run.end - run.start + 1,
       distance: run.minimumDistance,
+      corridorCenterDistance: inclusionRun ? Math.abs(y - inclusionRun.center) : 0,
+      corridorHalfWidth: inclusionRun ? Math.max(1, (inclusionRun.end - inclusionRun.start + 1) / 2) : null,
     });
     run = null;
   };
@@ -381,7 +463,10 @@ export function clusterColumnCandidates(rgba, width, x, top, bottom, target, thr
     const excluded = exclusions.some((rect) => (
       x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom
     ));
-    const matches = !excluded && alpha >= 32 && distance <= threshold;
+    const matches = !excluded
+      && inclusionMaskAllows(inclusionMask, width, x, y)
+      && alpha >= 32
+      && distance <= threshold;
 
     if (matches) {
       if (!run) {
@@ -413,6 +498,11 @@ function candidateThicknessPenalty(candidate, targetStyle, scale = 1) {
   return Math.max(0, candidate.thickness - 8) * 0.08 * scale;
 }
 
+function candidateCorridorPenalty(candidate) {
+  if (!Number.isFinite(candidate.corridorHalfWidth) || candidate.corridorHalfWidth <= 0) return 0;
+  return (candidate.corridorCenterDistance / candidate.corridorHalfWidth) * 0.9;
+}
+
 function targetPixelPresent(options, x, y, radius = 2) {
   const roundedX = Math.round(x);
   const roundedY = Math.round(y);
@@ -425,6 +515,7 @@ function targetPixelPresent(options, x, y, radius = 2) {
       && sampleY >= area.top && sampleY <= area.bottom
     ));
     if (excluded) continue;
+    if (!inclusionMaskAllows(options.inclusionMask, options.width, roundedX, sampleY)) continue;
     const index = (sampleY * options.width + roundedX) * 4;
     if (options.rgba[index + 3] < 32) continue;
     const distance = compositedColorDistance(
@@ -687,6 +778,7 @@ function traceDirection({
   initialSlope = null,
   avoidanceByX = null,
   avoidanceRadius = 3,
+  inclusionMask = null,
 }) {
   const points = [];
   let lastObserved = { x: Math.round(seed.x), y: seed.y };
@@ -709,6 +801,7 @@ function traceDirection({
       target,
       threshold,
       exclusions,
+      inclusionMask,
     );
     const dx = Math.abs(x - lastObserved.x);
     const velocity = previousObserved
@@ -750,6 +843,7 @@ function traceDirection({
         + colorPenalty * 2
         + thicknessPenalty
         + stylePenalty
+        + candidateCorridorPenalty(candidate)
         + candidate.avoidance.penalty;
       if (cost < bestCost) {
         secondBestCost = bestCost;
@@ -818,6 +912,7 @@ export function traceCurve({
   targetStyle = "auto",
   avoidPaths = [],
   avoidanceRadius = 3,
+  inclusionMask = null,
 }) {
   if (!rgba || rgba.length !== width * height * 4) {
     throw new Error("RGBA buffer dimensions do not match width and height");
@@ -850,6 +945,7 @@ export function traceCurve({
     targetStyle,
     avoidanceByX: buildAvoidanceByX(avoidPaths, safeRect),
     avoidanceRadius,
+    inclusionMask,
   };
   options.strokePatternCache = new Map();
   options.styleReference = buildStyleReference(options, safeSeed, 0);
@@ -986,6 +1082,7 @@ function globalGuidedSegment(options, start, end) {
         options.target,
         options.threshold,
         options.exclusions,
+        options.inclusionMask,
       );
     if (!candidates.length) continue;
 
@@ -1029,6 +1126,7 @@ function globalGuidedSegment(options, start, end) {
           + colorCost * 1.4
           + thicknessCost
           + styleCost
+          + candidateCorridorPenalty(candidate)
           + avoidance.penalty
           + Math.abs(slope) * (noisyMode ? 0.012 : 0.035)
           + Math.min(20, curvature) * (noisyMode ? 0.12 : 0.72)
@@ -1100,6 +1198,7 @@ export function traceCurveThroughAnchors({
   targetStyle = "auto",
   avoidPaths = [],
   avoidanceRadius = 3,
+  inclusionMask = null,
 }) {
   if (!Array.isArray(anchors) || anchors.length === 0) {
     throw new Error("At least one curve anchor is required");
@@ -1119,6 +1218,7 @@ export function traceCurveThroughAnchors({
       targetStyle,
       avoidPaths,
       avoidanceRadius,
+      inclusionMask,
     });
   }
 
@@ -1140,6 +1240,7 @@ export function traceCurveThroughAnchors({
         target,
         threshold,
         exclusions,
+        inclusionMask,
       ).find((candidate) => Math.abs(candidate.y - y) <= Math.max(2, candidate.thickness / 2 + 1));
       return {
         ...anchor,
@@ -1168,6 +1269,7 @@ export function traceCurveThroughAnchors({
       targetStyle,
       avoidPaths,
       avoidanceRadius,
+      inclusionMask,
     });
   }
 
@@ -1184,6 +1286,7 @@ export function traceCurveThroughAnchors({
     strictGuideCorridor: Boolean(strictGuideCorridor),
     avoidanceByX: buildAvoidanceByX(avoidPaths, safeRect),
     avoidanceRadius,
+    inclusionMask,
   };
   const originalReference = {
     x: clamp(Math.round(anchors[0].x), safeRect.left, safeRect.right),
@@ -1263,11 +1366,13 @@ function targetInkAffinity({
   target,
   threshold,
   exclusions,
+  inclusionMask,
 }, x, y) {
   if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) return 0;
   if ((exclusions ?? []).some((area) => (
     x >= area.left && x <= area.right && y >= area.top && y <= area.bottom
   ))) return 0;
+  if (!inclusionMaskAllows(inclusionMask, width, x, y)) return 0;
   const color = bilinearColorAt(rgba, width, height, x, y);
   if (color.a < 32) return 0;
   const distance = compositedColorDistance(color.r, color.g, color.b, target);
@@ -1309,6 +1414,7 @@ export function refinePathCenterline({
   rect = { left: 0, top: 0, right: width - 1, bottom: height - 1 },
   exclusions = [],
   iterations = 2,
+  inclusionMask = null,
 }) {
   if (!rgba || rgba.length !== width * height * 4) {
     throw new Error("RGBA buffer dimensions do not match width and height");
@@ -1353,6 +1459,7 @@ export function refinePathCenterline({
             target,
             threshold,
             exclusions,
+            inclusionMask,
           }, point.x + normalX * offset, point.y + normalY * offset),
         });
       }
@@ -2160,6 +2267,7 @@ export function extractMarkerCenters({
   exclusions = [],
   anchors = [],
   strictGuideCorridor = false,
+  inclusionMask = null,
 }) {
   if (!rgba || rgba.length !== width * height * 4) {
     throw new Error("RGBA buffer dimensions do not match width and height");
@@ -2183,6 +2291,7 @@ export function extractMarkerCenters({
         x >= area.left && x <= area.right && y >= area.top && y <= area.bottom
       ));
       if (excluded) continue;
+      if (!inclusionMaskAllows(inclusionMask, width, x, y)) continue;
       const sourceIndex = (y * width + x) * 4;
       if (rgba[sourceIndex + 3] < 32) continue;
       const distance = compositedColorDistance(

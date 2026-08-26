@@ -7,9 +7,9 @@
 
 **[Open SciDigitizer online / 在线使用](https://quchongbing.github.io/SciDigitizer/)** · **[Desktop downloads / 桌面版下载](https://github.com/quchongbing/SciDigitizer/releases)** · **[Installation guide / 安装指南](docs/installation.md)**
 
-![Version](https://img.shields.io/badge/version-0.20.0--preview.2-1666d8)
+![Version](https://img.shields.io/badge/version-0.20.0--preview.3-1666d8)
 ![Local](https://img.shields.io/badge/data-local--only-00a9a5)
-![Tests](https://img.shields.io/badge/tests-75%20passing-2f8f5b)
+![Tests](https://img.shields.io/badge/tests-77%20passing-2f8f5b)
 ![License](https://img.shields.io/badge/license-MIT-f0c040)
 
 SciDigitizer 从 PNG、JPEG 或 WebP 图像中提取曲线数据。通常只需选择曲线颜色；遇到同色分支、交叉或遮挡时，再添加少量引导点。图像和数据始终保留在浏览器本地。
@@ -31,6 +31,8 @@ SciDigitizer is a personal open-source project created by Chongbing Qu (瞿崇�
 - 自动追踪实线、虚线、点划线、点线、噪声线和 marker 中心。
 - 亚像素线宽中心校正；用直线、Hermite 和二次趋势恢复遮挡段。
 - 引导点始终作为追踪基准；支持多条同色曲线避让。
+- Pen 曲线走廊可局部限定搜索区域，减少重合曲线与邻近分支干扰。
+- 选中标定点或数据点后，方向键移动 1 px，`Shift` + 方向键微调 0.1 px。
 - 智能复核低置信度、遮挡推断和模型分歧区域。
 - 导出 CSV、TXT、项目 JSON 和 Overlay PNG。
 - 默认显示英文；GUI 顶部可随时切换 `中文 / EN`，选择会保存在本机。
@@ -45,7 +47,7 @@ SciDigitizer is a personal open-source project created by Chongbing Qu (瞿崇�
 1. 打开图片，确认方向和绘图区。
 2. 输入 X/Y 已知刻度值，并点击图中对应刻度完成标定。
 3. 点击目标曲线取色，程序会立即追踪。
-4. 遮挡处先框选“遮挡 / 图例”以忽略覆盖物，再在前后添加引导点；长遮挡可在预计趋势上再加一点，该点会自动启用局部强约束。
+4. 多曲线重合或邻近时，用“Pen 曲线走廊”涂出目标的大致路径；遮挡处再框选“遮挡 / 图例”并在前后添加引导点。
 5. 查看“智能复核”，拖动或编辑不准确的数据点。
 6. 保存曲线；如下一条曲线使用平移后的 Y 轴，可重新标定，已保存曲线的坐标不会改变。最后导出数据。
 
@@ -62,6 +64,8 @@ SciDigitizer is a personal open-source project created by Chongbing Qu (瞿崇�
 - Traces solid, dashed, dash-dot, dotted, noisy lines, and marker centers.
 - Refines the subpixel stroke center and recovers occlusions with linear, Hermite, and quadratic models.
 - Keeps every guide point as an exact tracing constraint and avoids saved same-color curves.
+- Uses an optional Pen corridor to constrain ambiguous overlaps and nearby branches locally.
+- Moves selected calibration or data points by 1 px with arrow keys, or 0.1 px with `Shift` + arrow keys.
 - Ranks low-confidence, inferred, and model-disagreement regions for review.
 - Exports CSV, TXT, project JSON, and overlay PNG files.
 - English is the default; switch between `中文 / EN` from the top bar. Your choice is stored locally.
@@ -76,7 +80,7 @@ SciDigitizer is a personal open-source project created by Chongbing Qu (瞿崇�
 1. Open an image and confirm its orientation and plot area.
 2. Enter known X/Y tick values and click the matching ticks to calibrate the axes.
 3. Click a clear part of the target curve to sample its color and trace it.
-4. Mask an occlusion or legend first, then add guides on both sides. For a long occlusion, add a guide along the expected trend; it automatically constrains adjacent segments.
+4. For overlapping or nearby curves, paint an approximate Pen corridor. For occlusions, mask the covering object and add guides on both sides.
 5. Use Smart review, then drag or edit inaccurate points.
 6. Save the curve. Recalibrate Y for a vertically offset series when needed; saved coordinates remain unchanged. Then export the data.
 
@@ -102,7 +106,7 @@ SciDigitizer 也可以通过 Neutralinojs 打包成数 MB 的 Windows、macOS �
 
 SciDigitizer can also be wrapped as a few-megabyte Windows, macOS, or Linux desktop application with Neutralinojs. It reuses the system WebView instead of bundling Chromium. See the concise [Windows, Linux, and macOS installation guide](docs/installation.md). Developers can find the size budget and build commands in [desktop packaging](docs/desktop-packaging.md).
 
-The application has no runtime npm dependencies and requires no backend. Project schema v6 stores per-series calibration, guides, editable points, confidence, occlusion-model weights, uncertainty, and preprocessing records. Older project files remain supported. Uploaded image pixels are not embedded in project JSON.
+The application has no runtime npm dependencies and requires no backend. Project schema v7 stores per-series calibration, Pen corridors, guides, editable points, confidence, occlusion-model weights, uncertainty, and preprocessing records. Older project files remain supported. Uploaded image pixels are not embedded in project JSON.
 
 Maintainers publish an audited source snapshot without private development history. See the [public release workflow](docs/public-release.md).
 

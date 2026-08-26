@@ -5,6 +5,7 @@ import {
   calibrationError,
   clamp,
   compositedColorDistance,
+  constrainPathToInclusionMask,
   csvEscape,
   detectPlotRects,
   estimateColorThreshold,
@@ -28,7 +29,7 @@ import {
   validateCalibration,
   valueStepForPixelNudge,
   valueToPixel,
-} from "./core.js?v=0.20.0-preview.2";
+} from "./core.js?v=0.20.0-preview.3";
 
 import {
   alignmentCorrectionDegrees,
@@ -36,27 +37,27 @@ import {
   normalizeRotationDegrees,
   renderRotatedImage,
   splitRotationDegrees,
-} from "./image-transform.js?v=0.20.0-preview.2";
+} from "./image-transform.js?v=0.20.0-preview.3";
 
 import {
   cloneSerializable,
   createEditSession,
   fingerprintImageData,
-} from "./edit-session.js?v=0.20.0-preview.2";
+} from "./edit-session.js?v=0.20.0-preview.3";
 
 import {
   detectFrameQuadrilateral,
   detectPerspectiveFrame,
   estimateAxisSkew,
   warpPerspectiveRgba,
-} from "./image-geometry.js?v=0.20.0-preview.2";
+} from "./image-geometry.js?v=0.20.0-preview.3";
 
 import {
   initializeI18n,
   refreshTranslations,
   setLanguage,
   translateMessage,
-} from "./i18n.js?v=0.20.0-preview.2";
+} from "./i18n.js?v=0.20.0-preview.3";
 
 initializeI18n();
 
@@ -78,6 +79,8 @@ const state = {
   draftRect: null,
   exclusions: [],
   draftExclusion: null,
+  traceCorridorOperations: [],
+  draftTraceCorridor: null,
   calibrationPoints: { x1: null, x2: null, x3: null, y1: null, y2: null, y3: null },
   seed: null,
   seedColor: null,
@@ -126,6 +129,8 @@ const draftStoragePrefix = "scidigitizer:draft:v1:";
 let pointIdSequence = 0;
 let guideIdSequence = 0;
 let editSession = null;
+let traceCorridorRevision = 0;
+let traceCorridorCache = null;
 
 const editableControlSelectors = [
   "#x-scale", "#y-scale", "#x-value-1", "#x-value-2", "#x-value-3",
@@ -133,6 +138,7 @@ const editableControlSelectors = [
   "#series-label", "#color-threshold", "#max-jump", "#max-gap", "#sampling-mode",
   "#peak-density", "#peak-width", "#noise-density", "#noise-window", "#strict-guide",
   "#target-style", "#path-refinement", "#trace-point-count", "#export-density",
+  "#trace-corridor-width",
 ];
 
 let imageLoadSequence = 0;
@@ -233,6 +239,63 @@ function showToast(message) {
   showToast.timeout = window.setTimeout(() => toast.classList.remove("visible"), 2600);
 }
 
+const panelSummarySources = {
+  image: "#source-meta",
+  plot: "#plot-status",
+  calibration: "#calibration-status",
+  trace: "#seed-status",
+  export: "#export-status",
+};
+
+function setPanelSectionExpanded(section, expanded) {
+  section.classList.toggle("is-expanded", expanded);
+  section.classList.toggle("is-collapsed", !expanded);
+  const heading = section.querySelector(":scope > .section-heading");
+  heading?.setAttribute("aria-expanded", String(expanded));
+  heading?.querySelector(".section-compact-status")?.setAttribute("aria-hidden", String(expanded));
+}
+
+function togglePanelSection(section) {
+  const expand = !section.classList.contains("is-expanded");
+  for (const candidate of document.querySelectorAll(".panel-collapsible")) {
+    setPanelSectionExpanded(candidate, expand && candidate === section);
+  }
+}
+
+function updatePanelSectionSummaries() {
+  for (const section of document.querySelectorAll(".panel-collapsible")) {
+    const summary = section.querySelector(".section-compact-status");
+    const source = $(panelSummarySources[section.dataset.panelStep]);
+    if (!summary || !source) continue;
+    const savedCurveSummary = section.dataset.panelStep === "trace" && !state.path.length && state.series.length
+      ? `已保存 ${state.series.length} 条曲线`
+      : null;
+    summary.textContent = savedCurveSummary ?? source.textContent.trim();
+  }
+}
+
+function initializePanelAccordion() {
+  const sections = [...document.querySelectorAll(".panel-collapsible")];
+  sections.forEach((section, index) => {
+    const heading = section.querySelector(":scope > .section-heading");
+    const headingCopy = heading?.querySelector(":scope > div");
+    if (!heading || !headingCopy) return;
+    heading.setAttribute("role", "button");
+    heading.tabIndex = 0;
+    const summary = document.createElement("span");
+    summary.className = "section-compact-status";
+    headingCopy.append(summary);
+    setPanelSectionExpanded(section, index === 0);
+    heading.addEventListener("click", () => togglePanelSection(section));
+    heading.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      togglePanelSection(section);
+    });
+  });
+  updatePanelSectionSummaries();
+}
+
 for (const button of document.querySelectorAll("[data-language]")) {
   button.addEventListener("click", () => setLanguage(button.dataset.language));
 }
@@ -298,6 +361,7 @@ function captureEditableSnapshot() {
     geometry: cloneSerializable({
       plotRect: state.plotRect,
       exclusions: state.exclusions,
+      traceCorridorOperations: state.traceCorridorOperations,
       calibrationPoints: state.calibrationPoints,
       seed: state.seed,
       seedColor: state.seedColor,
@@ -368,6 +432,7 @@ function restoreEditableSnapshot(snapshot) {
     mode: null,
     draftRect: null,
     draftExclusion: null,
+    draftTraceCorridor: null,
     dragStart: null,
     cursor: null,
     hoveredPointId: null,
@@ -382,6 +447,8 @@ function restoreEditableSnapshot(snapshot) {
     selectedAnchorIndex: geometry.anchors?.length ? 0 : null,
     draggedAnchorIndex: null,
   });
+  state.traceCorridorOperations ??= [];
+  invalidateTraceCorridor();
   for (const [selector, value] of Object.entries(snapshot.controls ?? {})) {
     const element = $(selector);
     if (!element) continue;
@@ -439,6 +506,8 @@ function syncModeControls() {
   $("#add-exclusion").classList.toggle("button-accent", state.mode === "exclude");
   $("#exclude-trace").classList.toggle("button-ghost", state.mode !== "exclude");
   $("#exclude-trace").classList.toggle("button-accent", state.mode === "exclude");
+  $("#draw-trace-corridor").classList.toggle("active", state.mode === "corridor-pen");
+  $("#erase-trace-corridor").classList.toggle("active", state.mode === "corridor-erase");
   for (const axis of ["horizontal", "vertical"]) {
     const button = $(`#rotation-align-${axis}`);
     const active = state.mode === `align-${axis}`;
@@ -447,6 +516,7 @@ function syncModeControls() {
     button?.setAttribute("aria-pressed", String(active));
   }
   canvas.classList.toggle("mode-active", Boolean(state.mode));
+  canvas.classList.toggle("corridor-mode", state.mode === "corridor-pen" || state.mode === "corridor-erase");
 
   const magnifierHint = $("#magnifier-hint");
   if (magnifierHint) {
@@ -459,7 +529,7 @@ function syncModeControls() {
       : calibrating
         ? `十字中心即 ${calibrationPointLabel(state.mode)} · 点击后可拖动或按方向键微调`
         : state.selectedCalibrationKey
-          ? `${calibrationPointLabel(state.selectedCalibrationKey)} 已选 · 拖动图中十字或使用 0.1 px 微调`
+          ? `${calibrationPointLabel(state.selectedCalibrationKey)} 已选 · 方向键 1 px，Shift+方向键 0.1 px`
       : "引导菱形与数据圆圈同步显示 · 可回到图中拖动";
   }
 }
@@ -483,6 +553,8 @@ function setMode(mode) {
     seed: "点击目标曲线的清晰位置以采样颜色；这会开始一条新的追踪路径",
     guide: "点击目标曲线应经过的位置；遮挡处也可按趋势放置，右键菱形可删除",
     exclude: "拖拽框住遮挡、图例、文字或其他不应参与追踪的区域；框内将由引导点和两侧趋势恢复",
+    "corridor-pen": "按住左键沿目标曲线涂画；只在画过的横向区段内限制自动追踪",
+    "corridor-erase": "按住左键擦除 Pen 走廊；完全擦空的横向区段会恢复普通搜索",
     "align-horizontal": "校水平：把十字中心对准同一条水平参考线，依次点击相距较远的 R1、R2",
     "align-vertical": "校垂直：把十字中心对准同一条垂直参考线，依次点击相距较远的 R1、R2",
   };
@@ -498,6 +570,9 @@ function resetExtraction({ keepCalibrationValues = true } = {}) {
   state.draftRect = null;
   state.exclusions = [];
   state.draftExclusion = null;
+  state.traceCorridorOperations = [];
+  state.draftTraceCorridor = null;
+  invalidateTraceCorridor();
   state.calibrationPoints = { x1: null, x2: null, x3: null, y1: null, y2: null, y3: null };
   state.seed = null;
   state.seedColor = null;
@@ -548,6 +623,185 @@ function imageCoordinates(event) {
     x: clamp((event.clientX - bounds.left) * (canvas.width / bounds.width), 0, canvas.width - 1),
     y: clamp((event.clientY - bounds.top) * (canvas.height / bounds.height), 0, canvas.height - 1),
   };
+}
+
+function traceCorridorWidth() {
+  const value = Number($("#trace-corridor-width")?.value ?? 24);
+  return Number.isFinite(value) ? clamp(value, 4, 80) : 24;
+}
+
+function invalidateTraceCorridor() {
+  traceCorridorRevision += 1;
+  traceCorridorCache = null;
+}
+
+function normalizeTraceCorridorOperations(operations) {
+  if (!Array.isArray(operations)) return [];
+  return operations.flatMap((operation) => {
+    const points = Array.isArray(operation?.points)
+      ? operation.points
+        .filter((point) => Number.isFinite(point?.x) && Number.isFinite(point?.y))
+        .map((point) => ({ x: Number(point.x), y: Number(point.y) }))
+      : [];
+    if (!points.length) return [];
+    return [{
+      mode: operation.mode === "erase" ? "erase" : "paint",
+      width: clamp(Number(operation.width) || 24, 4, 80),
+      points,
+    }];
+  });
+}
+
+function renderTraceCorridorOperations(drawingContext, operations) {
+  drawingContext.clearRect(0, 0, drawingContext.canvas.width, drawingContext.canvas.height);
+  for (const operation of operations) {
+    const points = operation.points ?? [];
+    if (!points.length) continue;
+    drawingContext.save();
+    drawingContext.globalCompositeOperation = operation.mode === "erase" ? "destination-out" : "source-over";
+    drawingContext.strokeStyle = "#ffffff";
+    drawingContext.fillStyle = "#ffffff";
+    drawingContext.lineWidth = operation.width;
+    drawingContext.lineCap = "round";
+    drawingContext.lineJoin = "round";
+    if (points.length === 1) {
+      drawingContext.beginPath();
+      drawingContext.arc(points[0].x, points[0].y, operation.width / 2, 0, Math.PI * 2);
+      drawingContext.fill();
+    } else {
+      drawingContext.beginPath();
+      drawingContext.moveTo(points[0].x, points[0].y);
+      for (const point of points.slice(1)) drawingContext.lineTo(point.x, point.y);
+      drawingContext.stroke();
+    }
+    drawingContext.restore();
+  }
+}
+
+function traceCorridorMask() {
+  if (!canvas.width || !canvas.height || !state.traceCorridorOperations.length) return null;
+  if (
+    traceCorridorCache
+    && traceCorridorCache.revision === traceCorridorRevision
+    && traceCorridorCache.width === canvas.width
+    && traceCorridorCache.height === canvas.height
+  ) return traceCorridorCache.activePixels ? traceCorridorCache : null;
+
+  const maskCanvas = document.createElement("canvas");
+  maskCanvas.width = canvas.width;
+  maskCanvas.height = canvas.height;
+  const maskContext = maskCanvas.getContext("2d", { willReadFrequently: true });
+  renderTraceCorridorOperations(maskContext, state.traceCorridorOperations);
+  const rgba = maskContext.getImageData(0, 0, canvas.width, canvas.height).data;
+  const data = new Uint8Array(canvas.width * canvas.height);
+  const columns = new Uint8Array(canvas.width);
+  let activePixels = 0;
+  for (let index = 0; index < data.length; index += 1) {
+    if (rgba[index * 4 + 3] < 32) continue;
+    data[index] = 1;
+    columns[index % canvas.width] = 1;
+    activePixels += 1;
+  }
+
+  const displayCanvas = document.createElement("canvas");
+  displayCanvas.width = canvas.width;
+  displayCanvas.height = canvas.height;
+  const displayContext = displayCanvas.getContext("2d");
+  displayContext.drawImage(maskCanvas, 0, 0);
+  displayContext.globalCompositeOperation = "source-in";
+  displayContext.fillStyle = "rgba(0, 169, 165, 0.24)";
+  displayContext.fillRect(0, 0, canvas.width, canvas.height);
+  displayContext.globalCompositeOperation = "source-over";
+
+  traceCorridorCache = {
+    revision: traceCorridorRevision,
+    width: canvas.width,
+    height: canvas.height,
+    data,
+    columns,
+    activePixels,
+    displayCanvas,
+  };
+  return activePixels ? traceCorridorCache : null;
+}
+
+function traceCorridorColumnCount(mask = traceCorridorMask()) {
+  if (!mask) return 0;
+  let count = 0;
+  for (const covered of mask.columns) count += covered ? 1 : 0;
+  return count;
+}
+
+function constrainToCurrentTraceCorridor(path, inclusionMask = traceCorridorMask()) {
+  return constrainPathToInclusionMask(path, {
+    inclusionMask,
+    width: canvas.width,
+    rect: state.plotRect,
+  });
+}
+
+function boundedPlotPoint(point) {
+  if (!state.plotRect) return point;
+  return {
+    x: clamp(point.x, state.plotRect.left, state.plotRect.right),
+    y: clamp(point.y, state.plotRect.top, state.plotRect.bottom),
+  };
+}
+
+function appendTraceCorridorPoint(point) {
+  const stroke = state.draftTraceCorridor;
+  if (!stroke) return false;
+  const bounded = boundedPlotPoint(point);
+  const previous = stroke.points.at(-1);
+  if (previous && Math.hypot(previous.x - bounded.x, previous.y - bounded.y) < 0.45) return false;
+  stroke.points.push(bounded);
+  return true;
+}
+
+function drawDraftTraceCorridor() {
+  const operation = state.draftTraceCorridor;
+  if (!operation?.points?.length) return;
+  context.save();
+  context.strokeStyle = operation.mode === "erase" ? "rgba(209, 73, 91, 0.48)" : "rgba(0, 169, 165, 0.34)";
+  context.fillStyle = context.strokeStyle;
+  context.lineWidth = operation.width;
+  context.lineCap = "round";
+  context.lineJoin = "round";
+  if (operation.points.length === 1) {
+    context.beginPath();
+    context.arc(operation.points[0].x, operation.points[0].y, operation.width / 2, 0, Math.PI * 2);
+    context.fill();
+  } else {
+    context.beginPath();
+    context.moveTo(operation.points[0].x, operation.points[0].y);
+    for (const point of operation.points.slice(1)) context.lineTo(point.x, point.y);
+    context.stroke();
+  }
+  context.restore();
+}
+
+function drawTraceCorridor(drawingContext = context, focus = null) {
+  const mask = traceCorridorMask();
+  if (!mask) return;
+  drawingContext.save();
+  if (focus) {
+    const sourceSize = 24;
+    drawingContext.imageSmoothingEnabled = false;
+    drawingContext.drawImage(
+      mask.displayCanvas,
+      focus.x - sourceSize / 2,
+      focus.y - sourceSize / 2,
+      sourceSize,
+      sourceSize,
+      0,
+      0,
+      drawingContext.canvas.width,
+      drawingContext.canvas.height,
+    );
+  } else {
+    drawingContext.drawImage(mask.displayCanvas, 0, 0);
+  }
+  drawingContext.restore();
 }
 
 function drawCross(point, color, label = "", {
@@ -859,6 +1113,7 @@ function drawMagnifier(point = state.magnifierPoint, { includeAllSaved = false }
     y: (value.y - sourceTop) * magnification,
   });
   if (!state.rotationPreviewActive) {
+    drawTraceCorridor(magnifierContext, point);
     drawCurrentReviewRegion(magnifierContext, magnifierTransform);
     for (const series of state.series) {
       if (series.id === state.editingSeriesId || !(includeAllSaved || series.visible)) continue;
@@ -938,7 +1193,7 @@ function drawPointLayers({ includeAllSaved = false } = {}) {
   drawDataPoints(state.path, { active: true, color: colorToCss(state.seedColor) });
 }
 
-function draw({ includeAllSaved = false, includeGuides = true } = {}) {
+function draw({ includeAllSaved = false, includeGuides = true, includeCorridor = true } = {}) {
   const displayImage = currentDisplayImage();
   if (!displayImage) return;
   context.clearRect(0, 0, canvas.width, canvas.height);
@@ -971,6 +1226,11 @@ function draw({ includeAllSaved = false, includeGuides = true } = {}) {
     context.restore();
   }
 
+  if (includeCorridor) {
+    drawTraceCorridor();
+    drawDraftTraceCorridor();
+  }
+
   if (!includeAllSaved) drawCurrentReviewRegion();
   drawPointLayers({ includeAllSaved });
   if (includeGuides) drawGuideAnchors();
@@ -984,6 +1244,21 @@ function draw({ includeAllSaved = false, includeGuides = true } = {}) {
     context.lineTo(canvas.width, state.cursor.y);
     context.moveTo(state.cursor.x, 0);
     context.lineTo(state.cursor.x, canvas.height);
+    context.stroke();
+    context.restore();
+  }
+  if (state.cursor && (state.mode === "corridor-pen" || state.mode === "corridor-erase")) {
+    const radius = traceCorridorWidth() / 2;
+    context.save();
+    context.fillStyle = state.mode === "corridor-erase"
+      ? "rgba(255, 255, 255, 0.20)"
+      : "rgba(0, 169, 165, 0.18)";
+    context.strokeStyle = state.mode === "corridor-erase" ? "#d1495b" : "#087f8c";
+    context.lineWidth = Math.max(1, 1.5 / state.zoom);
+    context.setLineDash([4 / state.zoom, 3 / state.zoom]);
+    context.beginPath();
+    context.arc(state.cursor.x, state.cursor.y, radius, 0, Math.PI * 2);
+    context.fill();
     context.stroke();
     context.restore();
   }
@@ -1224,12 +1499,37 @@ function setCalibrationPixel(key, value) {
   return true;
 }
 
+function setCalibrationPointPosition(key, x, y) {
+  const point = state.calibrationPoints[key];
+  if (!point || !Number.isFinite(x) || !Number.isFinite(y)) return false;
+  point.x = clamp(x, 0, canvas.width - 1);
+  point.y = clamp(y, 0, canvas.height - 1);
+  state.selectedCalibrationKey = key;
+  state.selectedPointId = null;
+  state.selectedAnchorIndex = null;
+  state.magnifierPoint = { ...point };
+  state.cursor = null;
+  updateUi();
+  updateCursorReadout(point);
+  draw();
+  scheduleDraftSave();
+  return true;
+}
+
 function nudgeCalibrationPoint(key, delta, { commit = true } = {}) {
   const point = state.calibrationPoints[key];
   const coordinate = calibrationCoordinate(key);
   if (!point || !Number.isFinite(Number(delta))) return false;
   const moved = setCalibrationPixel(key, point[coordinate] + Number(delta));
   if (moved && commit) commitHistory(`微调标定点 ${calibrationPointLabel(key)}`);
+  return moved;
+}
+
+function nudgeCalibrationPoint2d(key, deltaX, deltaY, { commit = true } = {}) {
+  const point = state.calibrationPoints[key];
+  if (!point || !Number.isFinite(deltaX) || !Number.isFinite(deltaY)) return false;
+  const moved = setCalibrationPointPosition(key, point.x + deltaX, point.y + deltaY);
+  if (moved && commit) commitHistory(`方向键微调标定点 ${calibrationPointLabel(key)}`);
   return moved;
 }
 
@@ -1245,8 +1545,8 @@ function syncCalibrationRefinement() {
   const input = $("#calibration-pixel-position");
   if (document.activeElement !== input) input.value = formatNumber(point[coordinate], 8);
   $("#calibration-refine-hint").textContent = coordinate === "x"
-    ? "拖动蓝色十字或按 ←/→；每次 0.1 px，Shift 为 1 px。"
-    : "拖动紫色十字或按 ↑/↓；每次 0.1 px，Shift 为 1 px。";
+    ? "方向键可上下左右移动蓝色十字；每次 1 px，Shift+方向键为 0.1 px。"
+    : "方向键可上下左右移动紫色十字；每次 1 px，Shift+方向键为 0.1 px。";
 }
 
 function renderSeriesList() {
@@ -1469,7 +1769,8 @@ function updatePointListRow(point) {
     ? ` · 估计不确定度 ±${formatNumber(point.inferenceUncertainty, 3)} px`
     : "";
   const inferenceModel = point.inferenceModel ? ` · 遮挡恢复 ${point.inferenceModel}` : "";
-  row.title = `pixel (${formatNumber(point.x, 8)}, ${formatNumber(point.y, 8)}) · ${originLabel}${inferenceModel}${uncertainty}`;
+  const corridorLabel = point.corridorConstrained ? " · Pen 边界修正" : "";
+  row.title = `pixel (${formatNumber(point.x, 8)}, ${formatNumber(point.y, 8)}) · ${originLabel}${inferenceModel}${uncertainty}${corridorLabel}`;
 }
 
 function renderPointList() {
@@ -1512,7 +1813,8 @@ function renderPointList() {
       ? ` · 遮挡恢复 ${point.inferenceModel}`
       : "";
     const reviewLabel = reviewPointIndices.has(index) ? " · 当前智能复核区" : "";
-    const title = `pixel (${formatNumber(point.x, 8)}, ${formatNumber(point.y, 8)}) · ${originLabel}${inferenceModel}${uncertainty}${reviewLabel}`;
+    const corridorLabel = point.corridorConstrained ? " · Pen 边界修正" : "";
+    const title = `pixel (${formatNumber(point.x, 8)}, ${formatNumber(point.y, 8)}) · ${originLabel}${inferenceModel}${uncertainty}${corridorLabel}${reviewLabel}`;
     return `<div class="${classes}" data-point-id="${escapeHtml(point.pointId)}" title="${escapeHtml(title)}">
       <span class="point-list-index">${index + 1}</span>
       <input class="point-coordinate-input" data-coordinate="x" type="number" step="${escapeHtml(xStep)}" value="${escapeHtml(formatNumber(xValue, 12))}" title="上下箭头每次约移动 0.1 px" aria-label="第 ${index + 1} 点 x 坐标" />
@@ -1540,6 +1842,7 @@ function activeTraceParameters() {
     strictGuidance: $("#strict-guide").checked,
     targetStyle: $("#target-style").value,
     refinementMode: $("#path-refinement").value,
+    corridorWidth: traceCorridorWidth(),
     ...activeSamplingParameters(),
   };
 }
@@ -1556,6 +1859,7 @@ function curvesForExport() {
         seedColor: state.seedColor,
         anchors: state.anchors,
         rawPath: state.rawPath,
+        traceCorridorOperations: state.traceCorridorOperations,
         parameters: activeTraceParameters(),
         calibration: currentCalibrationSnapshot(),
       }];
@@ -1569,6 +1873,7 @@ function curvesForExport() {
       seedColor: state.seedColor,
       anchors: state.anchors,
       rawPath: state.rawPath,
+      traceCorridorOperations: state.traceCorridorOperations,
       overlayColor: colorToCss(state.seedColor, seriesPalette[saved.length % seriesPalette.length]),
       parameters: activeTraceParameters(),
       calibration: currentCalibrationSnapshot(),
@@ -1750,6 +2055,14 @@ function updateUi() {
   $("#add-exclusion").disabled = !state.plotRect;
   $("#exclude-trace").disabled = !state.plotRect;
   $("#undo-exclusion").disabled = state.exclusions.length === 0;
+  const corridorMask = traceCorridorMask();
+  const corridorColumns = traceCorridorColumnCount(corridorMask);
+  $("#draw-trace-corridor").disabled = !state.plotRect;
+  $("#erase-trace-corridor").disabled = !state.plotRect || !corridorMask;
+  $("#clear-trace-corridor").disabled = !corridorMask;
+  $("#trace-corridor-status").textContent = corridorMask
+    ? `已约束 ${corridorColumns} 列 · 未画区段照常搜索`
+    : "未绘制 · 全绘图区搜索";
   $("#save-series").textContent = state.path.length
     ? (state.editingSeriesId ? "更新当前曲线 · 准备下一条" : "保存当前曲线 · 准备下一条")
     : "开始下一条曲线";
@@ -1831,6 +2144,7 @@ function updateUi() {
     updateSourceMeta();
     updateGeometryDiagnosis();
   }
+  updatePanelSectionSummaries();
 }
 
 function setZoom(percent) {
@@ -1915,6 +2229,7 @@ function applyProject(project) {
       visible: curve?.visible ?? false,
       path,
       rawPath: (curve?.rawPath ?? []).map((point) => ({ ...point })),
+      traceCorridorOperations: normalizeTraceCorridorOperations(curve?.traceCorridorOperations),
       parameters: { ...curve?.parameters, pointCount: path.length || pointCount },
       calibration: cloneSerializable(curve?.calibration ?? legacyCalibration),
     };
@@ -1925,6 +2240,9 @@ function applyProject(project) {
   state.anchors = restoredActive?.anchors ?? [];
   state.rawPath = restoredActive?.rawPath ?? [];
   state.path = restoredActive?.path ?? [];
+  state.traceCorridorOperations = restoredActive?.traceCorridorOperations ?? [];
+  state.draftTraceCorridor = null;
+  invalidateTraceCorridor();
   state.reviewRegionIndex = 0;
   state.series = (project.series ?? []).map(restoreCurve);
   const requestedEditingId = activeCurve?.editingSeriesId ?? null;
@@ -1954,6 +2272,7 @@ function applyProject(project) {
   $("#strict-guide").checked = activeCurve?.parameters?.strictGuidance ?? false;
   $("#target-style").value = activeCurve?.parameters?.targetStyle ?? "auto";
   $("#path-refinement").value = activeCurve?.parameters?.refinementMode ?? "full";
+  $("#trace-corridor-width").value = String(activeCurve?.parameters?.corridorWidth ?? 24);
   $("#trace-point-count").value = String(state.path.length || normalizeTracePointCount(activeCurve?.parameters?.pointCount));
   state.magnifierPoint = { x: canvas.width / 2, y: canvas.height / 2 };
   syncRangeOutputs();
@@ -2051,7 +2370,7 @@ function loadImageSource(source, name, samplePath = null, project = null) {
   image.src = source;
 }
 
-function traceCurrentCurve() {
+function traceCurrentCurve({ silent = false } = {}) {
   if (state.rotationPreviewActive || !state.imageData || !state.plotRect || !state.anchors.length || !state.seedColor) return;
   try {
     const previouslySelectedAnchor = state.selectedAnchorIndex;
@@ -2062,6 +2381,7 @@ function traceCurrentCurve() {
     const effectiveStrictGuidance = $("#strict-guide").checked
       && (targetStyle !== "markers" || state.anchors.length >= 4);
     const avoidPaths = targetStyle === "markers" ? [] : sameColorAvoidancePaths();
+    const inclusionMask = traceCorridorMask();
     const commonOptions = {
       rgba: state.imageData.data,
       width: canvas.width,
@@ -2074,10 +2394,12 @@ function traceCurrentCurve() {
       strictGuideCorridor: effectiveStrictGuidance,
       avoidPaths,
       avoidanceRadius: 2.5,
+      inclusionMask,
     };
+    const constrainToCorridor = (path) => constrainToCurrentTraceCorridor(path, inclusionMask);
     let rawPath;
     if (targetStyle === "markers") {
-      rawPath = extractMarkerCenters(commonOptions);
+      rawPath = constrainToCorridor(extractMarkerCenters(commonOptions));
       if (!rawPath.length) {
         throw new Error("没有检测到符合条件的 marker；请检查目标颜色、引导点和图例屏蔽区");
       }
@@ -2102,14 +2424,18 @@ function traceCurrentCurve() {
       if (refinementMode === "full") {
         rawPath = fitInferredPathGaps(rawPath, { rect: state.plotRect });
       }
+      // Candidate filtering is not enough: gap recovery and interpolation can
+      // synthesize new coordinates outside the painted ROI. Make the Pen a
+      // final path boundary while preserving every exact user guide.
+      rawPath = constrainToCorridor(rawPath);
       state.rawPath = rawPath.map((point) => ({ ...point }));
       const requestedCount = activeTracePointCount();
       const mandatoryGuides = rawPath.filter((point) => point.anchor);
-      const sampledPath = includeMandatoryPoints(
+      const sampledPath = constrainToCorridor(includeMandatoryPoints(
         samplePixelPath(rawPath, requestedCount),
         mandatoryGuides,
         requestedCount,
-      );
+      ));
       state.path = createDataPath(sampledPath);
       $("#trace-point-count").value = String(state.path.length);
     }
@@ -2130,7 +2456,7 @@ function traceCurrentCurve() {
     const observed = state.path.filter((point) => point.observed).length;
     if (targetStyle === "markers") {
       const markerGuidance = effectiveStrictGuidance ? "强约束" : "柔性引导";
-      showToast(`识别到 ${state.path.length} 个 marker 中心 · ${markerGuidance}。已检测独立圆点及粘在线上的局部圆核`);
+      if (!silent) showToast(`识别到 ${state.path.length} 个 marker 中心 · ${markerGuidance}。已检测独立圆点及粘在线上的局部圆核`);
     } else {
       const samplingLabel = $("#sampling-mode").value === "peak"
         ? "峰值自适应"
@@ -2154,6 +2480,13 @@ function traceCurrentCurve() {
         : "";
       const styleLabel = autoStyleLabel || (["dashed", "dashdot", "dotted"].includes(targetStyle) ? "线型指纹 · " : "");
       const avoidanceLabel = avoidPaths.length ? ` · 已避让 ${avoidPaths.length} 条同色已存曲线` : "";
+      const corridorLabel = inclusionMask
+        ? ` · Pen 走廊约束 ${traceCorridorColumnCount(inclusionMask)} 列`
+        : "";
+      const corridorCorrectedCount = state.path.filter((point) => point.corridorConstrained).length;
+      const corridorCorrectionLabel = corridorCorrectedCount
+        ? ` / 边界修正 ${corridorCorrectedCount} 点`
+        : "";
       const refinementMode = $("#path-refinement").value;
       const centeredCount = rawPath.filter((point) => point.centerRefined).length;
       const fittedCount = rawPath.filter((point) => point.occlusionInferred).length;
@@ -2162,7 +2495,7 @@ function traceCurrentCurve() {
         : refinementMode === "center"
           ? ` · 中心校正 ${centeredCount} 点`
           : "";
-      showToast(`追踪完成：${state.anchors.length}/${state.anchors.length} 个引导点已锁定 · ${styleLabel}${guidanceLabel}${avoidanceLabel}${refinementLabel} · ${samplingLabel}生成 ${state.path.length} 个数据点；其中 ${observed} 个直接来自图像`);
+      if (!silent) showToast(`追踪完成：${state.anchors.length}/${state.anchors.length} 个引导点已锁定 · ${styleLabel}${guidanceLabel}${avoidanceLabel}${corridorLabel}${corridorCorrectionLabel}${refinementLabel} · ${samplingLabel}生成 ${state.path.length} 个数据点；其中 ${observed} 个直接来自图像`);
     }
   } catch (error) {
     showToast(`追踪失败：${error.message}`);
@@ -2193,6 +2526,10 @@ function clearActiveCurve({ keepLabel = false, keepTargetStyle = false } = {}) {
   state.seed = null;
   state.seedColor = null;
   state.anchors = [];
+  state.traceCorridorOperations = [];
+  state.draftTraceCorridor = null;
+  invalidateTraceCorridor();
+  if (state.mode === "corridor-pen" || state.mode === "corridor-erase") state.mode = null;
   $("#strict-guide").checked = false;
   if (!keepTargetStyle || $("#target-style").dataset.autoDetected) $("#target-style").value = "auto";
   delete $("#target-style").dataset.autoDetected;
@@ -2255,6 +2592,60 @@ function addDataPoint(point) {
   return true;
 }
 
+function nudgeGuideAnchor(index, deltaX, deltaY) {
+  const anchor = state.anchors[index];
+  if (!anchor || !state.plotRect) return false;
+  const next = boundedPlotPoint({ x: anchor.x + deltaX, y: anchor.y + deltaY });
+  if (next.x === anchor.x && next.y === anchor.y) return false;
+  anchor.x = next.x;
+  anchor.y = next.y;
+  anchor.occlusionGuide = !targetInkNearGuide(anchor);
+  if (anchor.anchorId === state.seed?.anchorId) state.seed = anchor;
+  state.selectedCalibrationKey = null;
+  state.selectedPointId = null;
+  state.selectedAnchorIndex = index;
+  state.magnifierPoint = { ...anchor };
+  state.cursor = null;
+  if (state.path.length) traceCurrentCurve({ silent: true });
+  else {
+    updateUi();
+    draw();
+  }
+  state.selectedAnchorIndex = index;
+  state.magnifierPoint = { ...anchor };
+  draw();
+  commitHistory(`方向键微调引导点 A${index + 1}`);
+  return true;
+}
+
+function nudgeDataPoint(pointId, deltaX, deltaY) {
+  const point = dataPointById(pointId);
+  if (!point || !state.plotRect) return false;
+  if (point.anchor) {
+    const anchorIndex = state.anchors.findIndex((anchor) => anchor.anchorId === point.anchorId);
+    if (anchorIndex >= 0) return nudgeGuideAnchor(anchorIndex, deltaX, deltaY);
+  }
+  const next = boundedPlotPoint({ x: point.x + deltaX, y: point.y + deltaY });
+  if (next.x === point.x && next.y === point.y) return false;
+  state.rawPath = [];
+  point.x = next.x;
+  point.y = next.y;
+  point.userEdited = true;
+  state.selectedCalibrationKey = null;
+  state.selectedAnchorIndex = null;
+  state.selectedPointId = point.pointId;
+  state.hoveredPointId = null;
+  state.pointHoverSource = null;
+  state.magnifierPoint = { ...point };
+  state.cursor = null;
+  sortDataPoints();
+  updateUi();
+  draw();
+  window.requestAnimationFrame(() => revealPointInList(point.pointId));
+  commitHistory("方向键微调数据点");
+  return true;
+}
+
 function deleteDataPoint(pointId, { nearby = false } = {}) {
   const index = state.path.findIndex((point) => point.pointId === pointId);
   if (index < 0) return false;
@@ -2309,9 +2700,12 @@ canvas.addEventListener("pointerdown", (event) => {
     const calibrationHit = calibrationPointAt(point);
     if (calibrationHit !== null) {
       state.selectedCalibrationKey = calibrationHit;
+      state.selectedPointId = null;
+      state.selectedAnchorIndex = null;
       state.draggedCalibrationKey = calibrationHit;
       state.calibrationDragMoved = false;
       state.magnifierPoint = { ...state.calibrationPoints[calibrationHit] };
+      canvas.focus({ preventScroll: true });
       canvas.setPointerCapture(event.pointerId);
       event.preventDefault();
       updateUi();
@@ -2326,8 +2720,11 @@ canvas.addEventListener("pointerdown", (event) => {
       state.anchorDragMoved = false;
       state.hoveredPointId = null;
       state.pointHoverSource = null;
+      state.selectedPointId = null;
+      state.selectedCalibrationKey = null;
       syncPointCursor();
       syncPointListSelection();
+      canvas.focus({ preventScroll: true });
       canvas.setPointerCapture(event.pointerId);
       event.preventDefault();
       draw();
@@ -2340,9 +2737,12 @@ canvas.addEventListener("pointerdown", (event) => {
       state.hoveredPointId = hit;
       state.pointHoverSource = "canvas";
       state.pointDragMoved = false;
+      state.selectedCalibrationKey = null;
+      state.selectedAnchorIndex = null;
       syncPointCursor();
       syncPointListSelection();
       revealPointInList(hit);
+      canvas.focus({ preventScroll: true });
       canvas.setPointerCapture(event.pointerId);
       event.preventDefault();
       draw();
@@ -2351,6 +2751,22 @@ canvas.addEventListener("pointerdown", (event) => {
   }
 
   if (!state.mode) return;
+  if (event.button === 0 && (state.mode === "corridor-pen" || state.mode === "corridor-erase")) {
+    if (!pointInsidePlot(point)) {
+      showToast("Pen 走廊需要从已框选的绘图区内开始");
+      return;
+    }
+    const operation = {
+      mode: state.mode === "corridor-erase" ? "erase" : "paint",
+      width: traceCorridorWidth(),
+      points: [boundedPlotPoint(point)],
+    };
+    state.draftTraceCorridor = operation;
+    canvas.setPointerCapture(event.pointerId);
+    event.preventDefault();
+    draw();
+    return;
+  }
   if (state.mode === "plot" || state.mode === "exclude") {
     state.dragStart = point;
     const draft = normalizeRect(point, point, { width: canvas.width, height: canvas.height });
@@ -2418,6 +2834,11 @@ canvas.addEventListener("pointermove", (event) => {
       updatePointListRow(current);
     }
     syncPointCursor();
+    scheduleInteractiveDraw();
+    return;
+  }
+  if (state.draftTraceCorridor) {
+    appendTraceCorridorPoint(point);
     scheduleInteractiveDraw();
     return;
   }
@@ -2530,6 +2951,31 @@ canvas.addEventListener("pointerup", (event) => {
     return;
   }
 
+  if (state.draftTraceCorridor) {
+    const operation = state.draftTraceCorridor;
+    const operationMode = operation.mode;
+    appendTraceCorridorPoint(point);
+    state.draftTraceCorridor = null;
+    state.traceCorridorOperations.push(operation);
+    invalidateTraceCorridor();
+    const corridorMask = traceCorridorMask();
+    if (!corridorMask && operationMode === "erase") {
+      state.traceCorridorOperations = [];
+      invalidateTraceCorridor();
+    }
+    if (state.path.length) traceCurrentCurve({ silent: true });
+    else {
+      updateUi();
+      draw();
+    }
+    const columns = traceCorridorColumnCount();
+    showToast(operationMode === "erase"
+      ? (columns ? `已擦除部分 Pen 走廊；当前约束 ${columns} 列` : "Pen 走廊已完全擦除；恢复全绘图区搜索")
+      : `Pen 走廊已更新；当前约束 ${columns} 列${state.path.length ? "，已自动重新追踪" : ""}`);
+    commitHistory(operationMode === "erase" ? "擦除 Pen 曲线走廊" : "绘制 Pen 曲线走廊");
+    return;
+  }
+
   if (event.button !== 0) return;
   if (!state.mode) {
     addDataPoint(point);
@@ -2568,6 +3014,8 @@ canvas.addEventListener("pointerup", (event) => {
     const key = state.mode;
     state.calibrationPoints[key] = point;
     state.selectedCalibrationKey = key;
+    state.selectedPointId = null;
+    state.selectedAnchorIndex = null;
     state.magnifierPoint = { ...point };
     setMode(null);
     updateUi();
@@ -2665,6 +3113,13 @@ canvas.addEventListener("pointerup", (event) => {
   draw();
 });
 
+canvas.addEventListener("pointercancel", () => {
+  if (!state.draftTraceCorridor) return;
+  state.draftTraceCorridor = null;
+  updateUi();
+  draw();
+});
+
 canvas.addEventListener("contextmenu", (event) => {
   if (!state.image || state.rotationPreviewActive) return;
   const point = imageCoordinates(event);
@@ -2752,6 +3207,8 @@ $("#point-list").addEventListener("focusin", (event) => {
   const row = event.target.closest(".data-point-row");
   if (!row) return;
   state.selectedPointId = row.dataset.pointId;
+  state.selectedCalibrationKey = null;
+  state.selectedAnchorIndex = null;
   const point = dataPointById(row.dataset.pointId);
   if (point?.anchor) {
     const anchorIndex = state.anchors.findIndex((anchor) => anchor.anchorId === point.anchorId);
@@ -2769,6 +3226,8 @@ $("#point-list").addEventListener("click", (event) => {
     return;
   }
   state.selectedPointId = row.dataset.pointId;
+  state.selectedCalibrationKey = null;
+  state.selectedAnchorIndex = null;
   const point = dataPointById(row.dataset.pointId);
   if (point?.anchor) {
     const anchorIndex = state.anchors.findIndex((anchor) => anchor.anchorId === point.anchorId);
@@ -2839,6 +3298,20 @@ $("#review-next").addEventListener("click", () => focusReviewRegion(1));
 $("#select-plot").addEventListener("click", () => setMode("plot"));
 $("#add-exclusion").addEventListener("click", () => setMode("exclude"));
 $("#exclude-trace").addEventListener("click", () => setMode("exclude"));
+$("#draw-trace-corridor").addEventListener("click", () => setMode("corridor-pen"));
+$("#erase-trace-corridor").addEventListener("click", () => setMode("corridor-erase"));
+$("#clear-trace-corridor").addEventListener("click", () => {
+  if (!traceCorridorMask()) return;
+  state.traceCorridorOperations = [];
+  state.draftTraceCorridor = null;
+  invalidateTraceCorridor();
+  if (state.mode === "corridor-erase") setMode(null);
+  if (state.path.length) traceCurrentCurve({ silent: true });
+  updateUi();
+  draw();
+  showToast(`Pen 走廊已清除；恢复全绘图区搜索${state.path.length ? "，并已自动重新追踪" : ""}`);
+  commitHistory("清除 Pen 曲线走廊");
+});
 $("#undo-exclusion").addEventListener("click", () => {
   if (!state.exclusions.length) return;
   state.exclusions.pop();
@@ -3024,7 +3497,7 @@ $("#project-upload").addEventListener("change", async (event) => {
   if (!file) return;
   try {
     const project = JSON.parse(await file.text());
-    if (![1, 2, 3, 4, 5, 6].includes(project.schemaVersion)) throw new Error("不支持的项目文件版本");
+    if (![1, 2, 3, 4, 5, 6, 7].includes(project.schemaVersion)) throw new Error("不支持的项目文件版本");
     if (project.source?.samplePath) {
       $("#sample-select").value = project.source.samplePath;
       loadImageSource(project.source.samplePath, project.source.name, project.source.samplePath, project);
@@ -3054,6 +3527,7 @@ function syncRangeOutputs() {
   $("#peak-width-output").value = `${$("#peak-width").value}%`;
   $("#noise-density-output").value = `${$("#noise-density").value}×`;
   $("#noise-window-output").value = `${$("#noise-window").value}%`;
+  $("#trace-corridor-width-output").value = $("#trace-corridor-width").value;
   $("#peak-sampling-options").hidden = $("#sampling-mode").value !== "peak";
   $("#noise-sampling-options").hidden = $("#sampling-mode").value !== "noise";
   $("#sampling-mode-hint").textContent = $("#sampling-mode").value === "peak"
@@ -3064,6 +3538,12 @@ function syncRangeOutputs() {
         ? "推荐：按平滑后的屏幕弧长和转折自动分配；高斜率和急转弯处更密。"
         : "保持总点数不变，严格沿 X 等间距分布。";
 }
+
+$("#trace-corridor-width").addEventListener("input", () => {
+  syncRangeOutputs();
+  draw();
+});
+$("#trace-corridor-width").addEventListener("change", () => commitHistory("调整 Pen 宽度"));
 
 for (const selector of ["#color-threshold", "#max-jump", "#max-gap"]) {
   $(selector).addEventListener("input", () => {
@@ -3170,11 +3650,11 @@ $("#trace-point-count").addEventListener("change", (event) => {
     }
     state.path = markerData
       ? createDataPath(selectExistingDataPoints(sourcePath, pointCount), "marker")
-      : createDataPath(includeMandatoryPoints(
+      : createDataPath(constrainToCurrentTraceCorridor(includeMandatoryPoints(
         samplePixelPath(sourcePath, pointCount),
         sourcePath.filter((point) => point.anchor),
         pointCount,
-      ), "resampled");
+      )), "resampled");
     event.target.value = String(state.path.length);
     state.hoveredPointId = null;
     state.pointHoverSource = null;
@@ -3229,6 +3709,7 @@ $("#save-series").addEventListener("click", () => {
     seed: state.seed,
     seedColor: state.seedColor,
     anchors: state.anchors,
+    traceCorridorOperations: cloneSerializable(state.traceCorridorOperations),
     visible: false,
     overlayColor: colorToCss(state.seedColor, seriesPalette[
       (existingIndex >= 0 ? existingIndex : state.series.length) % seriesPalette.length
@@ -3286,6 +3767,9 @@ $("#series-list").addEventListener("click", (event) => {
       ?? state.path[0]
       ?? null;
     state.rawPath = (series.rawPath ?? []).map((point) => ({ ...point }));
+    state.traceCorridorOperations = normalizeTraceCorridorOperations(series.traceCorridorOperations);
+    state.draftTraceCorridor = null;
+    invalidateTraceCorridor();
     state.hoveredPointId = null;
     state.pointHoverSource = null;
     state.selectedPointId = null;
@@ -3305,6 +3789,7 @@ $("#series-list").addEventListener("click", (event) => {
     $("#strict-guide").checked = series.parameters?.strictGuidance ?? false;
     $("#target-style").value = series.parameters?.targetStyle ?? "auto";
     $("#path-refinement").value = series.parameters?.refinementMode ?? "full";
+    $("#trace-corridor-width").value = String(series.parameters?.corridorWidth ?? 24);
     $("#trace-point-count").value = String(state.path.length || normalizeTracePointCount(series.parameters?.pointCount));
     syncRangeOutputs();
     updateUi();
@@ -3327,14 +3812,31 @@ window.addEventListener("keydown", (event) => {
     navigateHistory(event.shiftKey ? "redo" : "undo");
     return;
   }
-  if (editingText || event.ctrlKey || event.metaKey || event.altKey || !state.selectedCalibrationKey) return;
-  const coordinate = calibrationCoordinate(state.selectedCalibrationKey);
-  const direction = coordinate === "x"
-    ? { ArrowLeft: -1, ArrowRight: 1 }[event.key]
-    : { ArrowUp: -1, ArrowDown: 1 }[event.key];
+  if (editingText || event.ctrlKey || event.metaKey || event.altKey) return;
+  const direction = {
+    ArrowLeft: { x: -1, y: 0 },
+    ArrowRight: { x: 1, y: 0 },
+    ArrowUp: { x: 0, y: -1 },
+    ArrowDown: { x: 0, y: 1 },
+  }[event.key];
   if (!direction) return;
+  const hasSelection = Boolean(
+    state.selectedPointId
+    || Number.isInteger(state.selectedAnchorIndex)
+    || state.selectedCalibrationKey,
+  );
+  if (!hasSelection) return;
   event.preventDefault();
-  nudgeCalibrationPoint(state.selectedCalibrationKey, direction * (event.shiftKey ? 1 : 0.1));
+  const step = event.shiftKey ? 0.1 : 1;
+  const deltaX = direction.x * step;
+  const deltaY = direction.y * step;
+  if (state.selectedPointId) {
+    nudgeDataPoint(state.selectedPointId, deltaX, deltaY);
+  } else if (Number.isInteger(state.selectedAnchorIndex)) {
+    nudgeGuideAnchor(state.selectedAnchorIndex, deltaX, deltaY);
+  } else if (state.selectedCalibrationKey) {
+    nudgeCalibrationPoint2d(state.selectedCalibrationKey, deltaX, deltaY);
+  }
 });
 
 async function downloadBlob(content, mimeType, fileName) {
@@ -3411,7 +3913,7 @@ $("#export-txt").addEventListener("click", () => {
 });
 
 $("#export-overlay").addEventListener("click", () => {
-  draw({ includeAllSaved: true, includeGuides: false });
+  draw({ includeAllSaved: true, includeGuides: false, includeCorridor: false });
   const exportCanvas = document.createElement("canvas");
   exportCanvas.width = canvas.width;
   exportCanvas.height = canvas.height;
@@ -3437,7 +3939,7 @@ $("#export-project").addEventListener("click", async () => {
     reviewRegions: findPathReviewRegions(series.path, state.plotRect),
   }));
   const project = {
-    schemaVersion: 6,
+    schemaVersion: 7,
     createdAt: new Date().toISOString(),
     source: state.source,
     preprocessing: {
@@ -3474,15 +3976,18 @@ $("#export-project").addEventListener("click", async () => {
       parameters: activeTraceParameters(),
       path: state.path,
       rawPath: state.rawPath,
+      traceCorridorOperations: state.traceCorridorOperations,
       calibration: currentCalibrationSnapshot(),
       calibrationBeforeSeriesEdit: state.calibrationBeforeSeriesEdit,
     },
-    extractor: { name: "SciDigitizer", version: "0.20.0-preview.2", engine: "bilingual-adaptive-occlusion-ensemble-risk-ranked-review-audited-manual-calibration-guided-color-centerline-multicurve-core" },
+    extractor: { name: "SciDigitizer", version: "0.20.0-preview.3", engine: "bilingual-adaptive-occlusion-ensemble-risk-ranked-review-audited-manual-calibration-guided-color-centerline-multicurve-core" },
   };
   const saved = await downloadBlob(`${JSON.stringify(project, null, 2)}\n`, "application/json", `${baseName()}-project.json`);
   if (saved) showToast("项目文件已保存，可恢复标定、参数和路径");
 });
 
+initializePanelAccordion();
+window.addEventListener("languagechange", () => window.requestAnimationFrame(updatePanelSectionSummaries));
 syncRangeOutputs();
 updateUi();
 loadImageSource("images/fig1.png", "fig1.png", "images/fig1.png");
@@ -3506,6 +4011,7 @@ function rotationHasGeometry() {
   return Boolean(
     state.plotRect
     || state.exclusions.length
+    || state.traceCorridorOperations.length
     || state.series.length
     || state.path.length
     || state.rawPath.length
@@ -3529,6 +4035,7 @@ function updateWorkingCanvas(image, { preview = false } = {}) {
   imageCanvas.height = dimensions.height;
   canvas.width = dimensions.width;
   canvas.height = dimensions.height;
+  invalidateTraceCorridor();
   imageContext.clearRect(0, 0, imageCanvas.width, imageCanvas.height);
   imageContext.drawImage(image, 0, 0);
   context.clearRect(0, 0, canvas.width, canvas.height);

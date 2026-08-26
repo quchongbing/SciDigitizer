@@ -37,4 +37,12 @@ test("dynamic trace summaries retain their numeric values in English", () => {
     translateMessage("已添加遮挡/干扰屏蔽区 2；框内像素不参与追踪，将由引导点和两侧趋势恢复", "en"),
     "Added occlusion/interference mask 2; guides and trends on both sides recover the ignored pixels",
   );
+  assert.equal(
+    translateMessage("Pen 走廊已更新；当前约束 84 列，并已自动重新追踪", "en"),
+    "Pen corridor updated; 84 columns constrained and the curve was retraced",
+  );
+  assert.equal(
+    translateMessage("Pen 走廊约束 84 列 / 边界修正 7 点", "en"),
+    "Pen corridor constrains 84 columns / 7 points corrected to the boundary",
+  );
 });

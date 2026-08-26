@@ -7,6 +7,7 @@ import {
   assessPathQuality,
   buildPairedCurveRows,
   compositedColorDistance,
+  constrainPathToInclusionMask,
   detectPlotRect,
   estimateColorThreshold,
   extractMarkerCenters,
@@ -368,6 +369,71 @@ test("traceCurve follows a solid diagonal and ignores a parallel curve", () => {
   });
   assert.equal(path.length, 70);
   assert.ok(path.every((point) => Math.abs(point.y - Math.round(12 + point.x * 0.25)) <= 0.5));
+});
+
+test("a partial Pen inclusion mask selects the intended branch only in painted columns", () => {
+  const width = 81;
+  const height = 41;
+  const rgba = whiteImage(width, height);
+  const color = { r: 22, g: 92, b: 205 };
+  const maskData = new Uint8Array(width * height);
+  const maskColumns = new Uint8Array(width);
+  for (let x = 5; x <= 75; x += 1) {
+    const rising = Math.round(10 + x * 0.25);
+    const falling = Math.round(30 - x * 0.25);
+    setPixel(rgba, width, x, rising, color);
+    setPixel(rgba, width, x, falling, color);
+    if (x < 42) continue;
+    maskColumns[x] = 1;
+    for (let y = falling - 1; y <= falling + 1; y += 1) maskData[y * width + x] = 1;
+  }
+
+  const path = traceCurve({
+    rgba,
+    width,
+    height,
+    rect: { left: 5, top: 0, right: 75, bottom: 40 },
+    seed: { x: 20, y: 15 },
+    target: color,
+    threshold: 5,
+    maxJump: 3,
+    maxGap: 2,
+    inclusionMask: { data: maskData, columns: maskColumns },
+  });
+
+  const beforePaint = path.find((point) => point.x === 25);
+  const afterCrossing = path.find((point) => point.x === 70);
+  assert.ok(Math.abs(beforePaint.y - Math.round(10 + beforePaint.x * 0.25)) <= 0.5);
+  assert.ok(Math.abs(afterCrossing.y - Math.round(30 - afterCrossing.x * 0.25)) <= 0.5);
+});
+
+test("the final Pen constraint keeps inferred and resampled points inside while preserving guides", () => {
+  const width = 42;
+  const height = 32;
+  const maskData = new Uint8Array(width * height);
+  const maskColumns = new Uint8Array(width);
+  for (let x = 12; x <= 30; x += 1) {
+    maskColumns[x] = 1;
+    for (let y = 10; y <= 15; y += 1) maskData[y * width + x] = 1;
+  }
+  const path = [
+    { x: 7, y: 24, observed: false, confidence: 0.4 },
+    { x: 18, y: 25, observed: false, confidence: 0.4, occlusionInferred: true },
+    { x: 22, y: 12.5, observed: true, confidence: 0.9 },
+    { x: 26, y: 24, anchor: true, userGuided: true, confidence: 1 },
+  ];
+
+  const constrained = constrainPathToInclusionMask(path, {
+    inclusionMask: { data: maskData, columns: maskColumns },
+    width,
+    rect: { left: 4, top: 3, right: 36, bottom: 28 },
+  });
+
+  assert.equal(constrained[0].y, 24, "unpainted columns remain unconstrained");
+  assert.equal(constrained[1].y, 15);
+  assert.equal(constrained[1].corridorConstrained, true);
+  assert.equal(constrained[2].y, 12.5, "points already inside the corridor stay unchanged");
+  assert.equal(constrained[3].y, 24, "an exact user guide always wins over the Pen mask");
 });
 
 test("centerline refinement finds the subpixel middle of a thick antialiased stroke", () => {

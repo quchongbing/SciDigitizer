@@ -8,7 +8,7 @@
       content="SciDigitizer — 面向科学论文曲线的本地半自动数值提取工具"
     />
     <title>SciDigitizer</title>
-    <link rel="stylesheet" href="styles.css?v=0.20.0-preview.2" />
+    <link rel="stylesheet" href="styles.css?v=0.20.0-preview.3" />
   </head>
   <body>
     <header class="topbar">
@@ -38,7 +38,7 @@
 
     <main class="app-shell">
       <aside class="control-panel" aria-label="提取控制面板">
-        <section class="panel-section">
+        <section class="panel-section panel-collapsible is-expanded" data-panel-step="image">
           <div class="section-heading">
             <span class="step-number">1</span>
             <div>
@@ -98,7 +98,7 @@
           </details>
         </section>
 
-        <section class="panel-section">
+        <section class="panel-section panel-collapsible is-collapsed" data-panel-step="plot">
           <div class="section-heading">
             <span class="step-number">2</span>
             <div>
@@ -117,7 +117,7 @@
           <div id="plot-status" class="status-line">尚未框选</div>
         </section>
 
-        <section class="panel-section">
+        <section class="panel-section panel-collapsible is-collapsed" data-panel-step="calibration">
           <div class="section-heading">
             <span class="step-number">3</span>
             <div>
@@ -188,7 +188,7 @@
               <button type="button" data-calibration-nudge="0.1" aria-label="标定点增加 0.1 像素">+0.1</button>
               <button type="button" data-calibration-nudge="1" aria-label="标定点增加 1 像素">+1</button>
             </div>
-            <p id="calibration-refine-hint">可拖动图中十字，或用方向键进行 0.1 px 微调。</p>
+            <p id="calibration-refine-hint">选中后方向键移动 1 px，Shift+方向键微调 0.1 px。</p>
           </div>
           <div id="calibration-status" class="status-line">需要 4 个刻度点</div>
           <div id="calibration-quality" class="calibration-quality waiting">
@@ -197,7 +197,7 @@
           </div>
         </section>
 
-        <section class="panel-section">
+        <section class="panel-section panel-collapsible is-collapsed" data-panel-step="trace">
           <div class="section-heading">
             <span class="step-number">4</span>
             <div>
@@ -237,6 +237,24 @@
               <small id="strict-guide-help">拒绝偏离引导走廊的同色分支；普通曲线无需开启</small>
             </span>
           </label>
+
+          <div class="trace-corridor-control">
+            <div class="trace-corridor-heading">
+              <strong>Pen 曲线走廊</strong>
+              <span id="trace-corridor-status">未绘制 · 全绘图区搜索</span>
+            </div>
+            <p>用有宽度的笔涂过目标曲线的大致区域；只约束画过的横向区段，重合处可隔离其他曲线。</p>
+            <div class="button-row compact-row trace-corridor-actions">
+              <button id="draw-trace-corridor" class="button button-ghost" type="button" disabled>画走廊</button>
+              <button id="erase-trace-corridor" class="button button-ghost" type="button" disabled>擦除</button>
+              <button id="clear-trace-corridor" class="button button-ghost" type="button" disabled>清除</button>
+            </div>
+            <label class="range-label" for="trace-corridor-width">
+              <span>Pen 宽度 / px</span>
+              <output id="trace-corridor-width-output">24</output>
+            </label>
+            <input id="trace-corridor-width" type="range" min="4" max="80" step="1" value="24" />
+          </div>
 
           <label class="range-label" for="color-threshold">
             <span>颜色容差</span>
@@ -323,7 +341,7 @@
           <p class="multi-series-hint">保存后数据点默认隐藏；提取下一条同色曲线时会自动避让已存轨迹。点“显示”可叠加查看，点“编辑”可载入右侧坐标表。CSV/TXT 会合并全部曲线。</p>
         </section>
 
-        <section class="panel-section export-section">
+        <section class="panel-section panel-collapsible export-section is-collapsed" data-panel-step="export">
           <div class="section-heading">
             <span class="step-number">5</span>
             <div>
@@ -397,7 +415,7 @@
           <div class="canvas-stage">
             <div id="plot-surface" class="plot-surface">
               <canvas id="plot-image-canvas" aria-hidden="true"></canvas>
-              <canvas id="plot-canvas" aria-label="待提取的科学图像"></canvas>
+              <canvas id="plot-canvas" tabindex="0" aria-label="待提取的科学图像"></canvas>
             </div>
             <div id="empty-state" class="empty-state">正在载入样例…</div>
           </div>
@@ -440,7 +458,7 @@
           <div id="point-list" class="point-list">
             <div class="point-list-empty">自动追踪后显示全部数据点</div>
           </div>
-          <p>可直接修改坐标 · 上下箭头每次约移动 0.1 px · 左键拖动 · 右键删除最近点</p>
+          <p>选中后方向键移动 1 px · Shift+方向键微调 0.1 px · 左键拖动 · 右键删除最近点</p>
         </section>
       </aside>
     </main>
@@ -457,6 +475,6 @@
     </dialog>
 
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
-    <script type="module" src="src/app.js?v=0.20.0-preview.2"></script>
+    <script type="module" src="src/app.js?v=0.20.0-preview.3"></script>
   </body>
 </html>

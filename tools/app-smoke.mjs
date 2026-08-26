@@ -110,6 +110,27 @@ async function rightClickNaturalPoint(x, y) {
   await command("Input.dispatchMouseEvent", { type: "mouseReleased", ...point, button: "right", buttons: 0, clickCount: 1 });
 }
 
+async function pressArrow(key, { shift = false } = {}) {
+  const code = key;
+  const keyCode = { ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39, ArrowDown: 40 }[key];
+  await command("Input.dispatchKeyEvent", {
+    type: "keyDown",
+    key,
+    code,
+    modifiers: shift ? 8 : 0,
+    windowsVirtualKeyCode: keyCode,
+    nativeVirtualKeyCode: keyCode,
+  });
+  await command("Input.dispatchKeyEvent", {
+    type: "keyUp",
+    key,
+    code,
+    modifiers: shift ? 8 : 0,
+    windowsVirtualKeyCode: keyCode,
+    nativeVirtualKeyCode: keyCode,
+  });
+}
+
 await command("Runtime.enable");
 await command("Emulation.setDeviceMetricsOverride", {
   width: 1440,
@@ -184,6 +205,22 @@ assert.equal(await evaluate("document.querySelector('.privacy-pill').textContent
 assert.equal(await evaluate("document.querySelector('.creator-credit').textContent.trim()"), "Created by Chongbing Qu（瞿崇兵）");
 assert.equal(await evaluate("document.querySelector('#pick-seed').textContent"), "Pick target curve");
 assert.equal(await evaluate("localStorage.getItem('scidigitizer:language:v1')"), null);
+assert.deepEqual(await evaluate(`[...document.querySelectorAll('.panel-collapsible.is-expanded')]
+  .map((section) => section.dataset.panelStep)`), ["image"]);
+assert.equal(await evaluate("document.querySelector('[data-panel-step=\"plot\"] .section-compact-status').textContent.length > 0"), true);
+await evaluate("document.querySelector('[data-panel-step=\"plot\"] > .section-heading').click()");
+assert.deepEqual(await evaluate(`[...document.querySelectorAll('.panel-collapsible.is-expanded')]
+  .map((section) => section.dataset.panelStep)`), ["plot"]);
+assert.equal(await evaluate("document.querySelector('[data-panel-step=\"image\"] > .section-heading').getAttribute('aria-expanded')"), "false");
+await evaluate("document.querySelector('[data-panel-step=\"plot\"] > .section-heading').click()");
+assert.equal(await evaluate("document.querySelectorAll('.panel-collapsible.is-expanded').length"), 0);
+await evaluate(`(() => {
+  const heading = document.querySelector('[data-panel-step="calibration"] > .section-heading');
+  heading.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+})()`);
+assert.deepEqual(await evaluate(`[...document.querySelectorAll('.panel-collapsible.is-expanded')]
+  .map((section) => section.dataset.panelStep)`), ["calibration"]);
+await evaluate("document.querySelector('[data-panel-step=\"image\"] > .section-heading').click()");
 const untranslatedEnglish = await untranslatedVisibleEnglish();
 assert.deepEqual(untranslatedEnglish, [], `untranslated visible English UI: ${untranslatedEnglish.join(' | ')}`);
 if (process.env.ENGLISH_SCREENSHOT_PATH) {
@@ -371,6 +408,13 @@ await evaluate("document.querySelector('[data-calibration-nudge=\"0.1\"]').click
 assert.ok(Math.abs(await evaluate("Number(document.querySelector('#calibration-pixel-position').value)") - 324.1) < 1e-8);
 await evaluate("document.querySelector('[data-calibration-nudge=\"-0.1\"]').click()");
 assert.ok(Math.abs(await evaluate("Number(document.querySelector('#calibration-pixel-position').value)") - 324) < 1e-8);
+await pressArrow("ArrowUp");
+assert.ok(Math.abs(await evaluate("Number(document.querySelector('#calibration-pixel-position').value)") - 323) < 1e-8);
+await pressArrow("ArrowDown");
+await pressArrow("ArrowUp", { shift: true });
+assert.ok(Math.abs(await evaluate("Number(document.querySelector('#calibration-pixel-position').value)") - 323.9) < 1e-8);
+await pressArrow("ArrowDown", { shift: true });
+assert.ok(Math.abs(await evaluate("Number(document.querySelector('#calibration-pixel-position').value)") - 324) < 1e-8);
 await clickAtNaturalPoint("#pick-seed", 276, 85);
 assert.equal(await evaluate("document.querySelector('#add-guide').disabled"), false);
 assert.equal(await evaluate("document.querySelector('#exclude-trace').disabled"), false);
@@ -463,6 +507,34 @@ const coordinateNudgeSteps = await evaluate(`[...document.querySelectorAll('.dat
   .map((input) => Number(input.step))`);
 assert.ok(coordinateNudgeSteps.every((step) => step > 0 && step < 0.003),
   `coordinate nudge should be about 0.1 px: ${coordinateNudgeSteps}`);
+await evaluate("document.querySelector('.data-point-row:not(.guide-point)').click()");
+const selectedPointPixel = () => evaluate(`(() => {
+  const title = document.querySelector('.data-point-row.selected')?.title ?? '';
+  const match = title.match(/pixel \\(([-+\\d.]+), ([-+\\d.]+)\\)/);
+  return match ? { x: Number(match[1]), y: Number(match[2]) } : null;
+})()`);
+const pointBeforeArrow = await selectedPointPixel();
+await pressArrow("ArrowRight");
+const pointAfterPixelArrow = await selectedPointPixel();
+assert.ok(Math.abs(pointAfterPixelArrow.x - pointBeforeArrow.x - 1) < 1e-8);
+await pressArrow("ArrowUp", { shift: true });
+const pointAfterFineArrow = await selectedPointPixel();
+assert.ok(Math.abs(pointAfterFineArrow.y - pointBeforeArrow.y + 0.1) < 1e-8);
+await pressArrow("ArrowLeft");
+await pressArrow("ArrowDown", { shift: true });
+
+await evaluate("document.querySelector('#draw-trace-corridor').click()");
+assert.equal(await evaluate("document.querySelector('#plot-canvas').classList.contains('corridor-mode')"), true);
+await dragNaturalPoint(276, 85, 324, 226);
+assert.match(await evaluate("document.querySelector('#trace-corridor-status').textContent"), /已约束/);
+assert.equal(await evaluate("document.querySelector('#clear-trace-corridor').disabled"), false);
+assert.equal(await evaluate("document.querySelectorAll('.data-point-row').length"), 100);
+await evaluate("document.querySelector('#draw-trace-corridor').click()");
+assert.equal(await evaluate("document.querySelector('#plot-canvas').classList.contains('corridor-mode')"), false);
+await evaluate("document.querySelector('#erase-trace-corridor').click()");
+await dragNaturalPoint(298, 146, 302, 158);
+assert.match(await evaluate("document.querySelector('#trace-corridor-status').textContent"), /已约束/);
+await evaluate("document.querySelector('#erase-trace-corridor').click()");
 const exportedCsv = await evaluate(`(async () => {
   let exportedBlob = null;
   const originalCreateObjectURL = URL.createObjectURL;
@@ -546,8 +618,8 @@ const exportedProject = await evaluate(`(async () => {
   }
 })()`);
 const parsedProject = JSON.parse(exportedProject);
-assert.equal(parsedProject.schemaVersion, 6);
-assert.equal(parsedProject.extractor.version, "0.20.0-preview.2");
+assert.equal(parsedProject.schemaVersion, 7);
+assert.equal(parsedProject.extractor.version, "0.20.0-preview.3");
 assert.equal("calibrationSuggestion" in parsedProject, false);
 assert.match(parsedProject.extractor.engine, /^bilingual-adaptive-occlusion-ensemble-risk-ranked-review-/);
 assert.equal(parsedProject.calibrationAudit.x.valid, true);
@@ -556,6 +628,8 @@ assert.equal(parsedProject.activeCurve.calibration.y.value1, 7);
 assert.equal(parsedProject.activeCurve.calibration.y.value2, 1);
 assert.ok(Array.isArray(parsedProject.qualityReport[0].reviewRegions));
 assert.ok("perspective" in parsedProject.preprocessing);
+assert.ok(parsedProject.activeCurve.traceCorridorOperations.length > 0);
+assert.ok(parsedProject.activeCurve.traceCorridorOperations.some((operation) => operation.mode === "erase"));
 await clickNaturalPoint(360, 280);
 assert.equal(await evaluate("document.querySelectorAll('.data-point-row').length"), 101);
 await dragNaturalPoint(360, 280, 370, 270);
@@ -654,6 +728,8 @@ if (process.env.ENGLISH_TRACE_SCREENSHOT_PATH) {
 await evaluate("document.querySelector('[data-language=\"zh\"]').click()");
 await waitFor("document.documentElement.lang === 'zh-CN'");
 
+await evaluate("document.querySelector('#draw-trace-corridor').click()");
+assert.equal(await evaluate("document.querySelector('#plot-canvas').classList.contains('corridor-mode')"), true);
 await evaluate("document.querySelector('#save-series').click()");
 const afterSave = await evaluate(`({
   saved: document.querySelector('#metric-series').textContent,
@@ -668,6 +744,8 @@ const afterSave = await evaluate(`({
   saveLabel: document.querySelector('#save-series').textContent,
   visibilityAction: document.querySelector('[data-action="visibility"]')?.textContent,
   seriesColor: getComputedStyle(document.querySelector('.series-color')).backgroundColor,
+  corridorStatus: document.querySelector('#trace-corridor-status').textContent,
+  corridorMode: document.querySelector('#plot-canvas').classList.contains('corridor-mode'),
 })`);
 assert.equal(afterSave.saved, "1");
 assert.equal(afterSave.label, "Ti = 0.4 eV");
@@ -681,6 +759,8 @@ assert.equal(afterSave.saveDisabled, false);
 assert.equal(afterSave.saveLabel, "开始下一条曲线");
 assert.equal(afterSave.visibilityAction, "显示");
 assert.equal(afterSave.seriesColor, beforeSave.seedColor);
+assert.match(afterSave.corridorStatus, /未绘制/);
+assert.equal(afterSave.corridorMode, false);
 
 const savedCalibrationCsv = await evaluate(`(async () => {
   let exportedBlob = null;
@@ -747,6 +827,7 @@ assert.equal(await evaluate("document.querySelectorAll('.legend-line').length"),
 
 await evaluate("document.querySelector('[data-action=\"edit\"]').click()");
 assert.equal(await evaluate("document.querySelectorAll('.data-point-row').length"), 100);
+assert.match(await evaluate("document.querySelector('#trace-corridor-status').textContent"), /已约束/);
 assert.deepEqual(await evaluate(`[
   document.querySelector('#y-value-1').value,
   document.querySelector('#y-value-2').value,
@@ -775,6 +856,15 @@ const untranslatedNextCurveEnglish = await untranslatedVisibleEnglish();
 assert.deepEqual(untranslatedNextCurveEnglish, [], `untranslated next-curve English UI: ${untranslatedNextCurveEnglish.join(' | ')}`);
 await evaluate("document.querySelector('[data-language=\"zh\"]').click()");
 await waitFor("document.documentElement.lang === 'zh-CN'");
+await evaluate(`(() => {
+  const dataTransfer = new DataTransfer();
+  dataTransfer.items.add(new File([${JSON.stringify(exportedProject)}], 'fig1-project.json', { type: 'application/json' }));
+  const input = document.querySelector('#project-upload');
+  input.files = dataTransfer.files;
+  input.dispatchEvent(new Event('change', { bubbles: true }));
+})()`);
+await waitFor("document.querySelector('#trace-corridor-status').textContent.includes('已约束') && document.querySelectorAll('.data-point-row').length === 100");
+assert.match(await evaluate("document.querySelector('#trace-corridor-status').textContent"), /已约束/);
 assert.deepEqual(consoleErrors, []);
 
 process.stdout.write(`${JSON.stringify({ beforeSave, afterSave, consoleErrors }, null, 2)}\n`);

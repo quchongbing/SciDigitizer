@@ -178,13 +178,68 @@ button:disabled {
 .panel-section {
   padding: 22px 22px 23px;
   border-bottom: 1px solid #e8ecf1;
+  transition: padding 160ms ease, background-color 160ms ease;
+}
+
+.panel-section.panel-collapsible.is-collapsed {
+  padding-top: 13px;
+  padding-bottom: 13px;
+  background: #fbfcfe;
+}
+
+.panel-section.panel-collapsible.is-collapsed > :not(.section-heading) {
+  display: none !important;
 }
 
 .section-heading {
+  position: relative;
   display: flex;
   align-items: flex-start;
   gap: 11px;
   margin-bottom: 16px;
+}
+
+.panel-collapsible > .section-heading {
+  padding-right: 25px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.panel-collapsible > .section-heading::after {
+  position: absolute;
+  top: 6px;
+  right: 3px;
+  width: 8px;
+  height: 8px;
+  border-right: 2px solid #7d8b9d;
+  border-bottom: 2px solid #7d8b9d;
+  content: "";
+  transform: rotate(45deg);
+  transition: transform 160ms ease, border-color 160ms ease;
+}
+
+.panel-collapsible.is-expanded > .section-heading::after {
+  transform: translateY(4px) rotate(225deg);
+}
+
+.panel-collapsible > .section-heading:hover h2,
+.panel-collapsible > .section-heading:focus-visible h2 {
+  color: #1765bd;
+}
+
+.panel-collapsible > .section-heading:focus-visible {
+  border-radius: 8px;
+  outline: 3px solid rgb(43 111 216 / 18%);
+  outline-offset: 5px;
+}
+
+.panel-collapsible.is-collapsed > .section-heading {
+  margin-bottom: 0;
+}
+
+.section-heading > div {
+  min-width: 0;
+  flex: 1;
 }
 
 .section-heading h2 {
@@ -198,6 +253,25 @@ button:disabled {
   margin: 4px 0 0;
   color: var(--muted);
   font-size: 12px;
+}
+
+.section-compact-status {
+  display: none;
+  overflow: hidden;
+  margin-top: 4px;
+  color: #66778a;
+  font-size: 11px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.panel-collapsible.is-collapsed .section-heading p {
+  display: none;
+}
+
+.panel-collapsible.is-collapsed .section-compact-status {
+  display: block;
 }
 
 .step-number {
@@ -990,6 +1064,46 @@ button:disabled {
   font-weight: 650;
 }
 
+.trace-corridor-control {
+  margin: 10px 0 11px;
+  padding: 10px;
+  border: 1px solid #bcdfe2;
+  border-radius: 8px;
+  background: #f2fbfb;
+}
+
+.trace-corridor-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  color: #234052;
+  font-size: 11px;
+}
+
+.trace-corridor-heading span {
+  color: #557883;
+  font-size: 9px;
+  text-align: right;
+}
+
+.trace-corridor-control > p {
+  margin: 6px 0 0;
+  color: #667b85;
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.trace-corridor-actions {
+  margin-top: 7px;
+}
+
+.trace-corridor-actions .button.active {
+  border-color: #087f8c;
+  color: #075c66;
+  background: #d8f4f2;
+}
+
 input[type="range"] {
   width: 100%;
   accent-color: var(--blue);
@@ -1328,8 +1442,17 @@ input[type="range"] {
   touch-action: none;
 }
 
+#plot-canvas:focus-visible {
+  outline: 2px solid #1666d8;
+  outline-offset: -3px;
+}
+
 #plot-canvas.mode-active {
   cursor: crosshair;
+}
+
+#plot-canvas.corridor-mode {
+  cursor: none;
 }
 
 #plot-canvas.point-hover {
