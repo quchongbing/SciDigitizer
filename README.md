@@ -7,7 +7,7 @@
 
 **[Open SciDigitizer online / 在线使用](https://quchongbing.github.io/SciDigitizer/)** · **[Desktop downloads / 桌面版下载](https://github.com/quchongbing/SciDigitizer/releases)** · **[Installation guide / 安装指南](docs/installation.md)**
 
-![Version](https://img.shields.io/badge/version-0.20.0--preview.3-1666d8)
+![Version](https://img.shields.io/badge/version-0.20.0--preview.3.1-1666d8)
 ![Local](https://img.shields.io/badge/data-local--only-00a9a5)
 ![Tests](https://img.shields.io/badge/tests-77%20passing-2f8f5b)
 ![License](https://img.shields.io/badge/license-MIT-f0c040)

@@ -892,6 +892,38 @@ button:disabled {
   line-height: 1.4;
 }
 
+.trace-assist-tools {
+  margin: 9px 0 10px;
+  padding: 8px 9px;
+  border: 1px solid #d9e2eb;
+  border-radius: 8px;
+  color: #526174;
+  background: #fbfcfe;
+  font-size: 10px;
+}
+
+.trace-assist-tools > summary {
+  color: #405468;
+  font-weight: 700;
+  cursor: pointer;
+  user-select: none;
+}
+
+.trace-assist-tools[open] > summary {
+  margin-bottom: 6px;
+}
+
+.trace-assist-hint {
+  margin: 0;
+  color: #748294;
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.trace-assist-tools .strict-guide-toggle {
+  margin-top: 7px;
+}
+
 .trace-point-count-control {
   display: flex;
   align-items: center;
@@ -1072,6 +1104,10 @@ button:disabled {
   background: #f2fbfb;
 }
 
+.trace-assist-tools .trace-corridor-control {
+  margin-bottom: 1px;
+}
+
 .trace-corridor-heading {
   display: flex;
   align-items: baseline;
@@ -1118,6 +1154,10 @@ input[type="range"] {
 .advanced-options summary {
   cursor: pointer;
   user-select: none;
+}
+
+.advanced-color-option {
+  margin-top: 9px;
 }
 
 .adaptive-sampling-options {

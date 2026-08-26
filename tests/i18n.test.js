@@ -16,6 +16,10 @@ test("static interface labels translate to concise English", () => {
   assert.equal(translateMessage("选择图像", "en"), "Choose image");
   assert.equal(translateMessage("保存当前曲线 · 准备下一条", "en"), "Save curve · start the next");
   assert.equal(translateMessage("框选遮挡 / 图例", "en"), "Mask occlusion / legend");
+  assert.equal(
+    translateMessage("重叠 / 遮挡辅助（可选）", "en"),
+    "Overlap / occlusion assistance (optional)",
+  );
   assert.equal(translateMessage("选择图像", "zh"), "选择图像");
 });
 

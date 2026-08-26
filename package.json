@@ -1,6 +1,6 @@
 {
   "name": "scidigitizer",
-  "version": "0.20.0-preview.3",
+  "version": "0.20.0-preview.3.1",
   "private": true,
   "license": "MIT",
   "type": "module",

@@ -14,13 +14,18 @@ const releaseRoot = join(projectRoot, "dist-desktop", "releases");
 const sizeBudget = 8 * 1024 * 1024;
 const version = packageMetadata.version;
 const baseVersion = config.version;
-const previewMatch = version.match(/^(\d+)\.(\d+)\.(\d+)-preview\.(\d+)$/);
+const previewMatch = version.match(/^(\d+)\.(\d+)\.(\d+)-preview\.(\d+)(?:\.(\d+))?$/);
 if (version !== baseVersion && previewMatch?.slice(1, 4).join(".") !== baseVersion) {
   throw new Error(`Package version ${version} must use Neutralino base version ${baseVersion}.`);
 }
-const debianVersion = previewMatch ? `${baseVersion}-0preview${previewMatch[4]}` : `${version}-1`;
+const previewPatch = previewMatch?.[5] ? Number(previewMatch[5]) : null;
+const debianVersion = previewMatch
+  ? `${baseVersion}-0preview${previewMatch[4]}${previewPatch === null ? "" : `patch${previewPatch}`}`
+  : `${version}-1`;
 const macBundleVersion = previewMatch
-  ? `${previewMatch[1]}.${previewMatch[2]}.${previewMatch[4]}`
+  ? `${previewMatch[1]}.${previewMatch[2]}.${previewPatch === null
+    ? previewMatch[4]
+    : Number(previewMatch[4]) * 100 + previewPatch}`
   : baseVersion;
 
 await rm(stagingRoot, { recursive: true, force: true });

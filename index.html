@@ -8,7 +8,7 @@
       content="SciDigitizer — 面向科学论文曲线的本地半自动数值提取工具"
     />
     <title>SciDigitizer</title>
-    <link rel="stylesheet" href="styles.css?v=0.20.0-preview.3" />
+    <link rel="stylesheet" href="styles.css?v=0.20.0-preview.3.1" />
   </head>
   <body>
     <header class="topbar">
@@ -230,37 +230,35 @@
             <span id="seed-status">尚未选择曲线</span>
           </div>
           <p id="target-style-hint" class="guide-help">同色曲线：在分叉前后分别加点。每个引导点都会锁定为追踪基准并进入数据采样；悬停后可直接拖动。</p>
-          <label class="strict-guide-toggle" for="strict-guide">
-            <input id="strict-guide" type="checkbox" disabled />
-            <span>
-              <strong>同色 / 遮挡强约束</strong>
-              <small id="strict-guide-help">拒绝偏离引导走廊的同色分支；普通曲线无需开启</small>
-            </span>
-          </label>
-
-          <div class="trace-corridor-control">
-            <div class="trace-corridor-heading">
-              <strong>Pen 曲线走廊</strong>
-              <span id="trace-corridor-status">未绘制 · 全绘图区搜索</span>
-            </div>
-            <p>用有宽度的笔涂过目标曲线的大致区域；只约束画过的横向区段，重合处可隔离其他曲线。</p>
-            <div class="button-row compact-row trace-corridor-actions">
-              <button id="draw-trace-corridor" class="button button-ghost" type="button" disabled>画走廊</button>
-              <button id="erase-trace-corridor" class="button button-ghost" type="button" disabled>擦除</button>
-              <button id="clear-trace-corridor" class="button button-ghost" type="button" disabled>清除</button>
-            </div>
-            <label class="range-label" for="trace-corridor-width">
-              <span>Pen 宽度 / px</span>
-              <output id="trace-corridor-width-output">24</output>
+          <details id="trace-assist-tools" class="trace-assist-tools">
+            <summary>重叠 / 遮挡辅助（可选）</summary>
+            <p class="trace-assist-hint">普通曲线无需设置；只有自动追踪出现串线、重叠或遮挡时再打开。</p>
+            <label class="strict-guide-toggle" for="strict-guide">
+              <input id="strict-guide" type="checkbox" disabled />
+              <span>
+                <strong>同色 / 遮挡强约束</strong>
+                <small id="strict-guide-help">拒绝偏离引导走廊的同色分支；普通曲线无需开启</small>
+              </span>
             </label>
-            <input id="trace-corridor-width" type="range" min="4" max="80" step="1" value="24" />
-          </div>
 
-          <label class="range-label" for="color-threshold">
-            <span>颜色容差</span>
-            <output id="color-threshold-output">15</output>
-          </label>
-          <input id="color-threshold" type="range" min="4" max="80" value="15" />
+            <div class="trace-corridor-control">
+              <div class="trace-corridor-heading">
+                <strong>Pen 曲线走廊</strong>
+                <span id="trace-corridor-status">未绘制 · 全绘图区搜索</span>
+              </div>
+              <p>用有宽度的笔涂过目标曲线的大致区域；只约束画过的横向区段，重合处可隔离其他曲线。</p>
+              <div class="button-row compact-row trace-corridor-actions">
+                <button id="draw-trace-corridor" class="button button-ghost" type="button" disabled>画走廊</button>
+                <button id="erase-trace-corridor" class="button button-ghost" type="button" disabled>擦除</button>
+                <button id="clear-trace-corridor" class="button button-ghost" type="button" disabled>清除</button>
+              </div>
+              <label class="range-label" for="trace-corridor-width">
+                <span>Pen 宽度 / px</span>
+                <output id="trace-corridor-width-output">24</output>
+              </label>
+              <input id="trace-corridor-width" type="range" min="4" max="80" step="1" value="24" />
+            </div>
+          </details>
 
           <div class="trace-point-count-control">
             <label for="trace-point-count">
@@ -275,6 +273,13 @@
 
           <details class="advanced-options">
             <summary>高级追踪参数</summary>
+            <div class="advanced-color-option">
+              <label class="range-label" for="color-threshold">
+                <span>颜色容差</span>
+                <output id="color-threshold-output">15</output>
+              </label>
+              <input id="color-threshold" type="range" min="4" max="80" value="15" />
+            </div>
             <div class="adaptive-sampling-options">
               <label class="field-label" for="sampling-mode">数据点分布</label>
               <select id="sampling-mode" class="select-control">
@@ -475,6 +480,6 @@
     </dialog>
 
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
-    <script type="module" src="src/app.js?v=0.20.0-preview.3"></script>
+    <script type="module" src="src/app.js?v=0.20.0-preview.3.1"></script>
   </body>
 </html>

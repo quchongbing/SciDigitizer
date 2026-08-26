@@ -239,6 +239,8 @@ assert.equal(await evaluate("document.querySelector('#export-density').value"), 
 assert.equal(await evaluate("document.querySelector('#sampling-mode').value"), "geometry");
 assert.equal(await evaluate("document.querySelector('#target-style').value"), "auto");
 assert.equal(await evaluate("document.querySelector('#path-refinement').value"), "full");
+assert.equal(await evaluate("document.querySelector('#trace-assist-tools').open"), false);
+assert.equal(await evaluate("document.querySelector('#color-threshold').closest('details').open"), false);
 assert.equal(await evaluate("document.querySelector('#rotation-range').step"), "0.01");
 assert.equal(await evaluate("document.querySelector('#rotation-fine').step"), "0.01");
 await evaluate("(() => { document.querySelector('#rotation-details').open = true; const input = document.querySelector('#rotation-fine'); input.focus(); input.select(); })()");
@@ -619,7 +621,7 @@ const exportedProject = await evaluate(`(async () => {
 })()`);
 const parsedProject = JSON.parse(exportedProject);
 assert.equal(parsedProject.schemaVersion, 7);
-assert.equal(parsedProject.extractor.version, "0.20.0-preview.3");
+assert.equal(parsedProject.extractor.version, "0.20.0-preview.3.1");
 assert.equal("calibrationSuggestion" in parsedProject, false);
 assert.match(parsedProject.extractor.engine, /^bilingual-adaptive-occlusion-ensemble-risk-ranked-review-/);
 assert.equal(parsedProject.calibrationAudit.x.valid, true);
@@ -630,6 +632,10 @@ assert.ok(Array.isArray(parsedProject.qualityReport[0].reviewRegions));
 assert.ok("perspective" in parsedProject.preprocessing);
 assert.ok(parsedProject.activeCurve.traceCorridorOperations.length > 0);
 assert.ok(parsedProject.activeCurve.traceCorridorOperations.some((operation) => operation.mode === "erase"));
+await clickAtNaturalPoint("#pick-seed", 276, 85);
+assert.equal(await evaluate("document.querySelector('#trace-assist-tools').open"), false);
+assert.match(await evaluate("document.querySelector('#trace-corridor-status').textContent"), /未绘制/);
+assert.equal(await evaluate("document.querySelector('#clear-trace-corridor').disabled"), true);
 await clickNaturalPoint(360, 280);
 assert.equal(await evaluate("document.querySelectorAll('.data-point-row').length"), 101);
 await dragNaturalPoint(360, 280, 370, 270);
@@ -730,6 +736,15 @@ await waitFor("document.documentElement.lang === 'zh-CN'");
 
 await evaluate("document.querySelector('#draw-trace-corridor').click()");
 assert.equal(await evaluate("document.querySelector('#plot-canvas').classList.contains('corridor-mode')"), true);
+await dragNaturalPoint(276, 85, 324, 226);
+assert.match(await evaluate("document.querySelector('#trace-corridor-status').textContent"), /已约束/);
+await evaluate(`(() => {
+  const select = document.querySelector('#target-style');
+  select.value = 'dashed';
+  delete select.dataset.autoDetected;
+  delete select.dataset.autoConfidence;
+  delete select.dataset.autoFallback;
+})()`);
 await evaluate("document.querySelector('#save-series').click()");
 const afterSave = await evaluate(`({
   saved: document.querySelector('#metric-series').textContent,
@@ -761,6 +776,8 @@ assert.equal(afterSave.visibilityAction, "显示");
 assert.equal(afterSave.seriesColor, beforeSave.seedColor);
 assert.match(afterSave.corridorStatus, /未绘制/);
 assert.equal(afterSave.corridorMode, false);
+assert.equal(await evaluate("document.querySelector('#target-style').value"), "auto");
+assert.equal(await evaluate("document.querySelector('#trace-assist-tools').open"), false);
 
 const savedCalibrationCsv = await evaluate(`(async () => {
   let exportedBlob = null;

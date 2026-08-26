@@ -29,7 +29,7 @@ import {
   validateCalibration,
   valueStepForPixelNudge,
   valueToPixel,
-} from "./core.js?v=0.20.0-preview.3";
+} from "./core.js?v=0.20.0-preview.3.1";
 
 import {
   alignmentCorrectionDegrees,
@@ -37,27 +37,27 @@ import {
   normalizeRotationDegrees,
   renderRotatedImage,
   splitRotationDegrees,
-} from "./image-transform.js?v=0.20.0-preview.3";
+} from "./image-transform.js?v=0.20.0-preview.3.1";
 
 import {
   cloneSerializable,
   createEditSession,
   fingerprintImageData,
-} from "./edit-session.js?v=0.20.0-preview.3";
+} from "./edit-session.js?v=0.20.0-preview.3.1";
 
 import {
   detectFrameQuadrilateral,
   detectPerspectiveFrame,
   estimateAxisSkew,
   warpPerspectiveRgba,
-} from "./image-geometry.js?v=0.20.0-preview.3";
+} from "./image-geometry.js?v=0.20.0-preview.3.1";
 
 import {
   initializeI18n,
   refreshTranslations,
   setLanguage,
   translateMessage,
-} from "./i18n.js?v=0.20.0-preview.3";
+} from "./i18n.js?v=0.20.0-preview.3.1";
 
 initializeI18n();
 
@@ -579,6 +579,10 @@ function resetExtraction({ keepCalibrationValues = true } = {}) {
   state.anchors = [];
   $("#strict-guide").checked = false;
   $("#target-style").value = "auto";
+  delete $("#target-style").dataset.autoDetected;
+  delete $("#target-style").dataset.autoConfidence;
+  delete $("#target-style").dataset.autoFallback;
+  $("#trace-assist-tools").open = false;
   $("#path-refinement").value = "full";
   state.rawPath = [];
   state.path = [];
@@ -2048,7 +2052,7 @@ function updateUi() {
       ? "在清晰、孤立且较平缓的目标划线上取色；程序会学习划线长度和间隔。交叉或陡峭处仍需添加引导点；右键菱形可删除。"
       : $("#target-style").value === "noisy"
         ? "适合带抖动的实验连续线：降低曲率平滑约束，并在快速波动处增加采样点。右键菱形可删除引导点。"
-      : "同色曲线：在分叉前后分别加点。每个引导点都会锁定为追踪基准并进入数据采样；悬停后可直接拖动。遮挡处可按趋势放点。";
+      : "普通曲线只需选择目标即可；分叉、重叠或遮挡时再添加引导点并打开可选辅助工具。";
   $("#clear-curve").disabled = !(state.path.length || state.seedColor || state.editingSeriesId);
   $("#clear-all-points").disabled = state.path.length === 0;
   $("#save-series").disabled = !state.path.length && !state.series.length;
@@ -2063,6 +2067,7 @@ function updateUi() {
   $("#trace-corridor-status").textContent = corridorMask
     ? `已约束 ${corridorColumns} 列 · 未画区段照常搜索`
     : "未绘制 · 全绘图区搜索";
+  if (corridorMask || $("#strict-guide").checked) $("#trace-assist-tools").open = true;
   $("#save-series").textContent = state.path.length
     ? (state.editingSeriesId ? "更新当前曲线 · 准备下一条" : "保存当前曲线 · 准备下一条")
     : "开始下一条曲线";
@@ -2271,6 +2276,9 @@ function applyProject(project) {
   $("#noise-window").value = activeCurve?.parameters?.noiseWindow ?? 3;
   $("#strict-guide").checked = activeCurve?.parameters?.strictGuidance ?? false;
   $("#target-style").value = activeCurve?.parameters?.targetStyle ?? "auto";
+  delete $("#target-style").dataset.autoDetected;
+  delete $("#target-style").dataset.autoConfidence;
+  delete $("#target-style").dataset.autoFallback;
   $("#path-refinement").value = activeCurve?.parameters?.refinementMode ?? "full";
   $("#trace-corridor-width").value = String(activeCurve?.parameters?.corridorWidth ?? 24);
   $("#trace-point-count").value = String(state.path.length || normalizeTracePointCount(activeCurve?.parameters?.pointCount));
@@ -2374,7 +2382,7 @@ function traceCurrentCurve({ silent = false } = {}) {
   if (state.rotationPreviewActive || !state.imageData || !state.plotRect || !state.anchors.length || !state.seedColor) return;
   try {
     const previouslySelectedAnchor = state.selectedAnchorIndex;
-    const targetStyle = $("#target-style").value;
+    let targetStyle = $("#target-style").value;
     if (targetStyle === "markers" && state.anchors.length < 3) {
       throw new Error("marker 模式需要取色种子，并在点列弯曲处和另一端各添加 1 个引导点");
     }
@@ -2413,6 +2421,31 @@ function traceCurrentCurve({ silent = false } = {}) {
         maxGap: Number($("#max-gap").value),
         targetStyle,
       });
+      const autoPatternedStyle = Boolean($("#target-style").dataset.autoDetected)
+        && ["dashed", "dashdot", "dotted"].includes(targetStyle);
+      const horizontalSpan = (path) => {
+        if (!path?.length) return 0;
+        const xs = path.map((point) => point.x);
+        return (Math.max(...xs) - Math.min(...xs)) / Math.max(1, state.plotRect.width);
+      };
+      // Local markers or antialias gaps can make a simple curve look dotted.
+      // In automatic mode only, retry ordinary continuity when the patterned
+      // path stalls. Explicit user-selected dashed/dotted modes remain exact.
+      if (autoPatternedStyle && horizontalSpan(rawPath) < 0.72) {
+        const ordinaryPath = traceCurveThroughAnchors({
+          ...commonOptions,
+          maxJump: Number($("#max-jump").value),
+          maxGap: Number($("#max-gap").value),
+          targetStyle: "line",
+        });
+        if (horizontalSpan(ordinaryPath) >= horizontalSpan(rawPath) + 0.15) {
+          rawPath = ordinaryPath;
+          targetStyle = "line";
+          $("#target-style").value = "line";
+          $("#target-style").dataset.autoDetected = "line";
+          $("#target-style").dataset.autoFallback = "true";
+        }
+      }
       const refinementMode = $("#path-refinement").value;
       if (refinementMode !== "off") {
         rawPath = refinePathCenterline({
@@ -2534,6 +2567,8 @@ function clearActiveCurve({ keepLabel = false, keepTargetStyle = false } = {}) {
   if (!keepTargetStyle || $("#target-style").dataset.autoDetected) $("#target-style").value = "auto";
   delete $("#target-style").dataset.autoDetected;
   delete $("#target-style").dataset.autoConfidence;
+  delete $("#target-style").dataset.autoFallback;
+  $("#trace-assist-tools").open = false;
   state.rawPath = [];
   state.path = [];
   state.reviewRegionIndex = 0;
@@ -3040,6 +3075,14 @@ canvas.addEventListener("pointerup", (event) => {
       showToast("这里接近纯白背景，没有采到曲线；请放大后重新点击线条中心");
       return;
     }
+    // Picking a target begins a fresh, simple trace. Pen and strict-guide
+    // constraints are opt-in aids for ambiguities and must never leak from a
+    // previous attempt into an ordinary one-click trace.
+    state.traceCorridorOperations = [];
+    state.draftTraceCorridor = null;
+    invalidateTraceCorridor();
+    $("#strict-guide").checked = false;
+    $("#trace-assist-tools").open = false;
     state.seed = createGuideAnchor(point);
     state.seedColor = sampledColor;
     state.anchors = [state.seed];
@@ -3065,9 +3108,11 @@ canvas.addEventListener("pointerup", (event) => {
       $("#target-style").value = inferredStyle.style;
       $("#target-style").dataset.autoDetected = inferredStyle.style;
       $("#target-style").dataset.autoConfidence = String(inferredStyle.confidence);
+      delete $("#target-style").dataset.autoFallback;
     } else {
       delete $("#target-style").dataset.autoDetected;
       delete $("#target-style").dataset.autoConfidence;
+      delete $("#target-style").dataset.autoFallback;
     }
     state.rawPath = [];
     state.path = [];
@@ -3571,6 +3616,7 @@ $("#path-refinement").addEventListener("change", () => {
 $("#target-style").addEventListener("change", () => {
   delete $("#target-style").dataset.autoDetected;
   delete $("#target-style").dataset.autoConfidence;
+  delete $("#target-style").dataset.autoFallback;
   if ($("#target-style").value === "markers" && state.anchors.length < 4) {
     $("#strict-guide").checked = false;
   }
@@ -3693,7 +3739,7 @@ $("#clear-curve").addEventListener("click", () => {
 $("#save-series").addEventListener("click", () => {
   if (!state.path.length) {
     if (!state.series.length) return;
-    clearActiveCurve({ keepTargetStyle: true });
+    clearActiveCurve();
     if (state.mode !== "seed") setMode("seed");
     showToast("已准备下一条曲线；请点击目标曲线取色");
     commitHistory("准备下一条曲线");
@@ -3720,7 +3766,7 @@ $("#save-series").addEventListener("click", () => {
   if (existingIndex >= 0) state.series.splice(existingIndex, 1, record);
   else state.series.push(record);
   const action = existingIndex >= 0 ? "已更新" : "已保存";
-  clearActiveCurve({ keepTargetStyle: true });
+  clearActiveCurve();
   showToast(`${action}曲线“${label}”；数据点已隐藏，可继续选择下一条曲线`);
   commitHistory(`${action}曲线`);
 });
@@ -3788,6 +3834,9 @@ $("#series-list").addEventListener("click", (event) => {
     $("#noise-window").value = series.parameters?.noiseWindow ?? 3;
     $("#strict-guide").checked = series.parameters?.strictGuidance ?? false;
     $("#target-style").value = series.parameters?.targetStyle ?? "auto";
+    delete $("#target-style").dataset.autoDetected;
+    delete $("#target-style").dataset.autoConfidence;
+    delete $("#target-style").dataset.autoFallback;
     $("#path-refinement").value = series.parameters?.refinementMode ?? "full";
     $("#trace-corridor-width").value = String(series.parameters?.corridorWidth ?? 24);
     $("#trace-point-count").value = String(state.path.length || normalizeTracePointCount(series.parameters?.pointCount));
@@ -3980,7 +4029,7 @@ $("#export-project").addEventListener("click", async () => {
       calibration: currentCalibrationSnapshot(),
       calibrationBeforeSeriesEdit: state.calibrationBeforeSeriesEdit,
     },
-    extractor: { name: "SciDigitizer", version: "0.20.0-preview.3", engine: "bilingual-adaptive-occlusion-ensemble-risk-ranked-review-audited-manual-calibration-guided-color-centerline-multicurve-core" },
+    extractor: { name: "SciDigitizer", version: "0.20.0-preview.3.1", engine: "bilingual-adaptive-occlusion-ensemble-risk-ranked-review-audited-manual-calibration-guided-color-centerline-multicurve-core" },
   };
   const saved = await downloadBlob(`${JSON.stringify(project, null, 2)}\n`, "application/json", `${baseName()}-project.json`);
   if (saved) showToast("项目文件已保存，可恢复标定、参数和路径");
