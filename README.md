@@ -5,6 +5,8 @@
 
 [中文说明](#中文) · [English](#english)
 
+**[Open SciDigitizer online / 在线使用](https://quchongbing.github.io/SciDigitizer/)**
+
 ![Version](https://img.shields.io/badge/version-0.20.0-1666d8)
 ![Local](https://img.shields.io/badge/data-local--only-00a9a5)
 ![Tests](https://img.shields.io/badge/tests-75%20passing-2f8f5b)
@@ -104,6 +106,8 @@ SciDigitizer 也可以通过 Neutralinojs 打包成数 MB 的 Windows、macOS �
 SciDigitizer can also be wrapped as a few-megabyte Windows, macOS, or Linux desktop application with Neutralinojs. It reuses the system WebView instead of bundling Chromium. See [desktop packaging](docs/desktop-packaging.md) for the size budget and build commands.
 
 The application has no runtime npm dependencies and requires no backend. Project schema v6 stores per-series calibration, guides, editable points, confidence, occlusion-model weights, uncertainty, and preprocessing records. Older project files remain supported. Uploaded image pixels are not embedded in project JSON.
+
+Maintainers publish an audited source snapshot without private development history. See the [public release workflow](docs/public-release.md).
 
 The tracing engine is best suited to horizontally single-valued line plots. Near-vertical loops, extremely low-resolution images, indistinguishable black-and-white objects, and fully hidden curve details still require manual review or original vector/source data.
 
