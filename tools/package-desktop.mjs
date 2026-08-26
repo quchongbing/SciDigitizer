@@ -7,11 +7,21 @@ import zipLib from "zip-lib";
 
 const projectRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const config = JSON.parse(await readFile(join(projectRoot, "neutralino.config.json"), "utf8"));
+const packageMetadata = JSON.parse(await readFile(join(projectRoot, "package.json"), "utf8"));
 const packageRoot = join(projectRoot, "dist-desktop", config.cli.binaryName);
 const stagingRoot = join(projectRoot, "dist-desktop", "package-staging");
 const releaseRoot = join(projectRoot, "dist-desktop", "releases");
 const sizeBudget = 8 * 1024 * 1024;
-const version = config.version;
+const version = packageMetadata.version;
+const baseVersion = config.version;
+const previewMatch = version.match(/^(\d+)\.(\d+)\.(\d+)-preview\.(\d+)$/);
+if (version !== baseVersion && previewMatch?.slice(1, 4).join(".") !== baseVersion) {
+  throw new Error(`Package version ${version} must use Neutralino base version ${baseVersion}.`);
+}
+const debianVersion = previewMatch ? `${baseVersion}-0preview${previewMatch[4]}` : `${version}-1`;
+const macBundleVersion = previewMatch
+  ? `${previewMatch[1]}.${previewMatch[2]}.${previewMatch[4]}`
+  : baseVersion;
 
 await rm(stagingRoot, { recursive: true, force: true });
 await rm(releaseRoot, { recursive: true, force: true });
@@ -62,8 +72,8 @@ async function packageMac(architecture, sourceName) {
   <key>CFBundleIdentifier</key><string>${config.applicationId}</string>
   <key>CFBundleName</key><string>SciDigitizer</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>${version}</string>
-  <key>CFBundleVersion</key><string>${version}</string>
+  <key>CFBundleShortVersionString</key><string>${baseVersion}</string>
+  <key>CFBundleVersion</key><string>${macBundleVersion}</string>
   <key>LSMinimumSystemVersion</key><string>10.13</string>
   <key>NSHighResolutionCapable</key><true/>
 </dict>
@@ -92,7 +102,7 @@ async function packageDebianX64() {
   await mkdir(join(root, "usr", "share", "doc", "scidigitizer"), { recursive: true });
   await copyFile(join(projectRoot, "LICENSE"), join(root, "usr", "share", "doc", "scidigitizer", "copyright"));
   await writeFile(join(root, "DEBIAN", "control"), `Package: scidigitizer
-Version: ${version}
+Version: ${debianVersion}
 Section: science
 Priority: optional
 Architecture: amd64
@@ -138,7 +148,7 @@ for (const release of releases) {
 
 await writeFile(
   join(releaseRoot, "sizes.json"),
-  `${JSON.stringify({ version, budgetBytes: sizeBudget, releases: releaseManifest }, null, 2)}\n`,
+  `${JSON.stringify({ version, baseVersion, debianVersion, budgetBytes: sizeBudget, releases: releaseManifest }, null, 2)}\n`,
 );
 await writeFile(
   join(releaseRoot, "SHA256SUMS.txt"),

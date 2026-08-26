@@ -28,7 +28,7 @@ import {
   validateCalibration,
   valueStepForPixelNudge,
   valueToPixel,
-} from "./core.js?v=0.20.0";
+} from "./core.js?v=0.20.0-preview.2";
 
 import {
   alignmentCorrectionDegrees,
@@ -36,27 +36,27 @@ import {
   normalizeRotationDegrees,
   renderRotatedImage,
   splitRotationDegrees,
-} from "./image-transform.js?v=0.20.0";
+} from "./image-transform.js?v=0.20.0-preview.2";
 
 import {
   cloneSerializable,
   createEditSession,
   fingerprintImageData,
-} from "./edit-session.js?v=0.20.0";
+} from "./edit-session.js?v=0.20.0-preview.2";
 
 import {
   detectFrameQuadrilateral,
   detectPerspectiveFrame,
   estimateAxisSkew,
   warpPerspectiveRgba,
-} from "./image-geometry.js?v=0.20.0";
+} from "./image-geometry.js?v=0.20.0-preview.2";
 
 import {
   initializeI18n,
   refreshTranslations,
   setLanguage,
   translateMessage,
-} from "./i18n.js?v=0.20.0";
+} from "./i18n.js?v=0.20.0-preview.2";
 
 initializeI18n();
 
@@ -3477,7 +3477,7 @@ $("#export-project").addEventListener("click", async () => {
       calibration: currentCalibrationSnapshot(),
       calibrationBeforeSeriesEdit: state.calibrationBeforeSeriesEdit,
     },
-    extractor: { name: "SciDigitizer", version: "0.20.0", engine: "bilingual-adaptive-occlusion-ensemble-risk-ranked-review-audited-manual-calibration-guided-color-centerline-multicurve-core" },
+    extractor: { name: "SciDigitizer", version: "0.20.0-preview.2", engine: "bilingual-adaptive-occlusion-ensemble-risk-ranked-review-audited-manual-calibration-guided-color-centerline-multicurve-core" },
   };
   const saved = await downloadBlob(`${JSON.stringify(project, null, 2)}\n`, "application/json", `${baseName()}-project.json`);
   if (saved) showToast("项目文件已保存，可恢复标定、参数和路径");

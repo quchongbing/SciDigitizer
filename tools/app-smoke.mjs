@@ -547,7 +547,7 @@ const exportedProject = await evaluate(`(async () => {
 })()`);
 const parsedProject = JSON.parse(exportedProject);
 assert.equal(parsedProject.schemaVersion, 6);
-assert.equal(parsedProject.extractor.version, "0.20.0");
+assert.equal(parsedProject.extractor.version, "0.20.0-preview.2");
 assert.equal("calibrationSuggestion" in parsedProject, false);
 assert.match(parsedProject.extractor.engine, /^bilingual-adaptive-occlusion-ensemble-risk-ranked-review-/);
 assert.equal(parsedProject.calibrationAudit.x.valid, true);

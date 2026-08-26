@@ -27,4 +27,6 @@ Per-platform release files are written to `dist-desktop/releases/`. The build fa
 
 Every build also writes `SHA256SUMS.txt` and a machine-readable `sizes.json`. Publish the checksum file with all release packages so users can verify that downloads are complete and unchanged.
 
+Preview builds use the public semantic version in `package.json` for archive names, while `neutralino.config.json` keeps the three-part platform version required by native metadata. Debian previews use revision `0previewN` (for example, `0.20.0-0preview2`), while a final build uses revision `1`. This lets APT upgrade the legacy preview 1 package (`0.20.0`) to preview 2 and later to the final package (`0.20.0-1`).
+
 The generated desktop page adds a narrowly scoped native bridge for Save As. It only permits the native save dialog and binary file writing. Image and project import continue to use the operating system WebView's local file picker.
