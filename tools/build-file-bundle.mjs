@@ -7,7 +7,13 @@ const outputPath = join(projectRoot, "dist", "app-file.js");
 const checkOnly = process.argv.includes("--check");
 
 const modules = [
+  { file: "src/mask-geometry.js", namespace: "SciMaskGeometry" },
   { file: "src/core.js", namespace: "SciCore" },
+  { file: "src/trace-output.js", namespace: "SciTraceOutput" },
+  { file: "src/parametric-trace.js", namespace: "SciParametricTrace" },
+  { file: "src/compute-engine.js", namespace: "SciComputeEngine" },
+  { file: "src/compute-client.js", namespace: "SciComputeClient" },
+  { file: "src/image-import.js", namespace: "SciImageImport" },
   { file: "src/image-transform.js", namespace: "SciImageTransform" },
   { file: "src/edit-session.js", namespace: "SciEditSession" },
   { file: "src/image-geometry.js", namespace: "SciImageGeometry" },

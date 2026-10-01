@@ -6,15 +6,32 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import os
 from pathlib import Path
 import sys
+from urllib.parse import unquote, urlsplit
 
 
 ROOT = Path(__file__).resolve().parents[1]
-HOST = os.environ.get("SCIDIGITIZER_HOST", "0.0.0.0")
+HOST = os.environ.get("SCIDIGITIZER_HOST", "127.0.0.1")
 PORT = int(os.environ.get("SCIDIGITIZER_PORT", "8000"))
 
 
 class DevelopmentHandler(SimpleHTTPRequestHandler):
     """Serve current local assets instead of silently reusing stale JS/CSS."""
+
+    def _contains_hidden_segment(self) -> bool:
+        path = unquote(urlsplit(self.path).path)
+        return any(part.startswith(".") for part in Path(path).parts if part not in {".", ".."})
+
+    def _serve_visible_path(self, method: str) -> None:
+        if self._contains_hidden_segment():
+            self.send_error(404)
+            return
+        getattr(super(), method)()
+
+    def do_GET(self) -> None:
+        self._serve_visible_path("do_GET")
+
+    def do_HEAD(self) -> None:
+        self._serve_visible_path("do_HEAD")
 
     def end_headers(self) -> None:
         self.send_header("Cache-Control", "no-store")
@@ -30,7 +47,7 @@ def main() -> int:
         return 1
 
     actual_port = server.server_address[1]
-    display_host = "localhost" if HOST in {"0.0.0.0", "127.0.0.1", "::"} else HOST
+    display_host = "localhost" if HOST in {"127.0.0.1", "::1"} else HOST
     print("\nSciDigitizer 已启动", flush=True)
     print(f"界面地址: http://{display_host}:{actual_port}/", flush=True)
     print("按 Ctrl+C 停止服务\n", flush=True)

@@ -59,8 +59,13 @@ export function createEditSession({
   });
   const emitHistory = () => onHistoryChange(historyStatus());
 
-  function saveNow() {
+  function cancelPendingSave() {
+    if (saveTimer !== null && clearTimer) clearTimer(saveTimer);
     saveTimer = null;
+  }
+
+  function saveNow() {
+    cancelPendingSave();
     const key = storageKey();
     const snapshot = capture();
     if (!storage || !key || !snapshot) return false;
@@ -83,6 +88,7 @@ export function createEditSession({
   }
 
   function reset() {
+    cancelPendingSave();
     undoEntries = [];
     redoEntries = [];
     current = snapshotRecord(capture());
@@ -117,6 +123,17 @@ export function createEditSession({
     return true;
   }
 
+  // Update the present snapshot after an already-committed action finishes
+  // asynchronous derived work. The previous entry remains the undo target.
+  function refreshCurrent() {
+    if (restoring) return false;
+    const next = snapshotRecord(capture());
+    if (!next || next.serialized === current?.serialized) return false;
+    current = next;
+    scheduleSave();
+    return true;
+  }
+
   function navigate(direction) {
     const source = direction === "undo" ? undoEntries : redoEntries;
     const target = direction === "undo" ? redoEntries : undoEntries;
@@ -142,12 +159,27 @@ export function createEditSession({
     return { direction, label: entry.label };
   }
 
-  function restoreDraft() {
+  // Looking for a draft must not apply it or write an empty fresh session
+  // over it. Recovery is a separate, explicit user action.
+  function readDraft() {
     const key = storageKey();
-    if (!storage || !key) return false;
+    if (!storage || !key) return null;
     try {
       const stored = JSON.parse(storage.getItem(key) ?? "null");
-      if (!stored?.snapshot) return false;
+      return stored?.snapshot && typeof stored.snapshot === "object" ? stored : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function flushPendingSave() {
+    return saveTimer !== null ? saveNow() : false;
+  }
+
+  function restoreDraft() {
+    const stored = readDraft();
+    if (!stored) return false;
+    try {
       restoring = true;
       const restored = restore(stored.snapshot);
       restoring = false;
@@ -163,8 +195,7 @@ export function createEditSession({
 
   function clearDraft() {
     const key = storageKey();
-    if (saveTimer !== null && clearTimer) clearTimer(saveTimer);
-    saveTimer = null;
+    cancelPendingSave();
     if (!storage || !key) return false;
     try {
       storage.removeItem(key);
@@ -179,8 +210,11 @@ export function createEditSession({
   return {
     clearDraft,
     commit,
+    flushPendingSave,
     historyStatus,
     navigate,
+    refreshCurrent,
+    readDraft,
     reset,
     restoreDraft,
     saveNow,

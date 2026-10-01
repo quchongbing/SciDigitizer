@@ -8,7 +8,7 @@
       content="SciDigitizer — 面向科学论文曲线的本地半自动数值提取工具"
     />
     <title>SciDigitizer</title>
-    <link rel="stylesheet" href="styles.css?v=0.20.0-preview.3.1" />
+    <link rel="stylesheet" href="styles.css?v=0.20.0-preview.3.21" />
   </head>
   <body>
     <header class="topbar">
@@ -60,6 +60,7 @@
               <input id="project-upload" type="file" accept="application/json,.json" />
             </label>
           </div>
+          <p class="image-import-hint">也可把 PNG、JPEG 或 WebP 拖到页面，或直接粘贴截图</p>
           <div id="source-meta" class="source-meta">等待图像载入…</div>
           <details id="rotation-details" class="rotation-panel">
             <summary>方向与校直</summary>
@@ -114,6 +115,23 @@
             <button id="add-exclusion" class="button button-ghost" disabled>屏蔽遮挡/图例</button>
             <button id="undo-exclusion" class="button button-ghost" disabled>撤销屏蔽</button>
           </div>
+          <button id="suggest-exclusions" class="button button-ghost button-full interference-scan-button" type="button" disabled>扫描图例 / 文字干扰</button>
+          <div id="exclusion-suggestion-review" class="exclusion-suggestion-review" hidden>
+            <div class="exclusion-suggestion-heading">
+              <strong>发现可能的干扰区</strong>
+              <span id="exclusion-suggestion-count">1 / 1</span>
+            </div>
+            <p id="exclusion-suggestion-status">橙色框只是建议；接受前不会影响自动追踪。</p>
+            <div class="button-row compact-row exclusion-suggestion-navigation">
+              <button id="previous-exclusion-suggestion" class="button button-ghost" type="button">上一个</button>
+              <button id="next-exclusion-suggestion" class="button button-ghost" type="button">下一个</button>
+            </div>
+            <div class="button-row compact-row exclusion-suggestion-actions">
+              <button id="accept-exclusion-suggestion" class="button button-accent" type="button">接受当前</button>
+              <button id="accept-all-exclusion-suggestions" class="button button-secondary" type="button">全部接受</button>
+              <button id="dismiss-exclusion-suggestions" class="button button-ghost" type="button">忽略</button>
+            </div>
+          </div>
           <div id="plot-status" class="status-line">尚未框选</div>
         </section>
 
@@ -143,9 +161,22 @@
               <input id="x-value-2" type="number" step="any" value="" placeholder="端点值" aria-label="X 第二个刻度值" />
               <button id="pick-x-2" class="pick-button" data-pick="x2">点击刻度 2</button>
             </div>
-            <div id="x-piecewise-row" class="calibration-row piecewise-row" hidden>
+            <div id="x-reference-row-3" class="calibration-row additional-calibration-row" hidden>
               <input id="x-value-3" type="number" step="any" value="" placeholder="第三点值" aria-label="X 第三个刻度值" />
               <button id="pick-x-3" class="pick-button" data-pick="x3">点击刻度 3</button>
+            </div>
+            <div id="x-reference-row-4" class="calibration-row additional-calibration-row" hidden>
+              <input id="x-value-4" type="number" step="any" value="" placeholder="第四点值" aria-label="X 第四个刻度值" />
+              <button id="pick-x-4" class="pick-button" data-pick="x4">点击刻度 4</button>
+            </div>
+            <div id="x-reference-row-5" class="calibration-row additional-calibration-row" hidden>
+              <input id="x-value-5" type="number" step="any" value="" placeholder="第五点值" aria-label="X 第五个刻度值" />
+              <button id="pick-x-5" class="pick-button" data-pick="x5">点击刻度 5</button>
+            </div>
+            <div class="calibration-reference-actions">
+              <button id="add-x-reference" type="button">＋ 增加参考点</button>
+              <button id="remove-x-reference" type="button">－ 移除末点</button>
+              <span id="x-reference-count">2 个参考点</span>
             </div>
             <input id="x-label" class="metadata-input" type="text" placeholder="X 轴名称/单位，例如 k [Å⁻¹]" />
           </div>
@@ -167,12 +198,32 @@
               <input id="y-value-2" type="number" step="any" value="" placeholder="端点值" aria-label="Y 第二个刻度值" />
               <button id="pick-y-2" class="pick-button" data-pick="y2">点击刻度 2</button>
             </div>
-            <div id="y-piecewise-row" class="calibration-row piecewise-row" hidden>
+            <div id="y-reference-row-3" class="calibration-row additional-calibration-row" hidden>
               <input id="y-value-3" type="number" step="any" value="" placeholder="第三点值" aria-label="Y 第三个刻度值" />
               <button id="pick-y-3" class="pick-button" data-pick="y3">点击刻度 3</button>
             </div>
+            <div id="y-reference-row-4" class="calibration-row additional-calibration-row" hidden>
+              <input id="y-value-4" type="number" step="any" value="" placeholder="第四点值" aria-label="Y 第四个刻度值" />
+              <button id="pick-y-4" class="pick-button" data-pick="y4">点击刻度 4</button>
+            </div>
+            <div id="y-reference-row-5" class="calibration-row additional-calibration-row" hidden>
+              <input id="y-value-5" type="number" step="any" value="" placeholder="第五点值" aria-label="Y 第五个刻度值" />
+              <button id="pick-y-5" class="pick-button" data-pick="y5">点击刻度 5</button>
+            </div>
+            <div class="calibration-reference-actions">
+              <button id="add-y-reference" type="button">＋ 增加参考点</button>
+              <button id="remove-y-reference" type="button">－ 移除末点</button>
+              <span id="y-reference-count">2 个参考点</span>
+            </div>
             <input id="y-label" class="metadata-input" type="text" placeholder="Y 轴名称/单位，例如 Sii(k)" />
           </div>
+          <label class="calibration-snap-toggle" for="calibration-snap">
+            <input id="calibration-snap" type="checkbox" checked />
+            <span>
+              <strong>吸附到刻度中心</strong>
+              <small>您仍需点击每个参考刻度；程序只在点击位置附近微调到线条中心。</small>
+            </span>
+          </label>
           <div id="calibration-refine" class="calibration-refine" hidden>
             <div class="calibration-refine-heading">
               <strong id="calibration-refine-title">微调标定点</strong>
@@ -226,6 +277,14 @@
             </select>
           </details>
 
+          <div id="color-suggestions" class="color-suggestions" hidden>
+            <div class="color-suggestions-copy">
+              <strong>可能的彩色曲线</strong>
+              <small>点一个颜色即可从可靠位置开始提取</small>
+            </div>
+            <div id="color-suggestion-list" class="color-suggestion-list" role="list"></div>
+          </div>
+
           <div id="trace-primary-action" class="trace-primary-action">
             <div class="trace-primary-copy">
               <strong>在目标曲线的清晰位置点击一次</strong>
@@ -265,7 +324,12 @@
                   <strong>Pen 曲线走廊</strong>
                   <span id="trace-corridor-status">未绘制 · 全绘图区搜索</span>
                 </div>
-                <p>用有宽度的笔涂过目标曲线的大致区域；只约束画过的横向区段，重合处可隔离其他曲线。</p>
+                <label class="field-label" for="trace-corridor-mode">Pen 范围</label>
+                <select id="trace-corridor-mode" class="select-control">
+                  <option value="strict" selected>仅在涂画区域提取（默认）</option>
+                  <option value="local">局部辅助（沿两端延伸）</option>
+                </select>
+                <p id="trace-corridor-help">默认只提取涂画区域。局部辅助会锁定已涂区段，只允许沿笔迹两端接续，不会从侧面绕到其它曲线。虚线表示入口和出口边界；转弯处请顺着曲线涂画。引导点保持固定。</p>
                 <div class="button-row compact-row trace-corridor-actions">
                   <button id="draw-trace-corridor" class="button button-ghost" type="button" disabled>画走廊</button>
                   <button id="erase-trace-corridor" class="button button-ghost" type="button" disabled>擦除</button>
@@ -341,16 +405,25 @@
               </div>
             </div>
             <div class="path-refinement-options">
+              <label class="field-label" for="trace-orientation">追踪方向</label>
+              <select id="trace-orientation" class="select-control">
+                <option value="auto" selected>自动判断（推荐）</option>
+                <option value="horizontal">水平扫描（X 方向）</option>
+                <option value="vertical">纵向扫描（Y 方向）</option>
+                <option value="parametric">二维路径（发卡弯 / 回环）</option>
+              </select>
+              <p id="trace-2d-settings-help" hidden>二维模式使用弧长采样和引导路径；扫描跳跃、扫描间隔、严格扫描走廊及已存同色避让不适用。中心校正开关有效，遮挡由二维路径重连处理。</p>
+              <p>普通曲线仍保持原有快速追踪；只有证据明确时才自动切换到纵向或二维路径。发卡弯、圆环可保留重复 X/Y；若有额外分叉，请沿目标顺序添加至少 2 个引导点。</p>
               <label class="field-label" for="path-refinement">路径精细化</label>
               <select id="path-refinement" class="select-control">
                 <option value="full" selected>线宽中心 + 多模型遮挡恢复</option>
                 <option value="center">仅做线宽中心校正</option>
                 <option value="off">关闭（保留原始追踪）</option>
               </select>
-              <p>默认沿局部法线寻找抗锯齿像素带的亚像素中心；遮挡段自动比较直线、Hermite 与二次趋势并传播模型分歧。手工引导点始终固定；落在无目标像素处时自动启用局部强约束。</p>
+              <p>默认沿局部法线寻找抗锯齿像素带的亚像素中心；长遮挡段自动比较直线、正则平滑、Hermite 与二次趋势，并随远离可靠像素增加不确定度。手工引导点始终固定；框选遮挡后会自动寻找远端曲线。</p>
             </div>
             <label class="range-label" for="max-jump">
-              <span>每列最大跳跃 / px</span>
+              <span>相邻扫描线最大跳跃 / px</span>
               <output id="max-jump-output">14</output>
             </label>
             <input id="max-jump" type="range" min="2" max="40" value="14" />
@@ -364,6 +437,20 @@
           <div id="trace-current-actions" class="button-row trace-current-actions" hidden>
             <button id="trace-curve" class="button button-secondary" disabled>重新追踪</button>
             <button id="clear-curve" class="button button-ghost" disabled>重置当前曲线</button>
+          </div>
+          <div id="review-assistant" class="review-assistant waiting" hidden>
+            <div class="review-assistant-heading">
+              <div>
+                <strong>智能消歧</strong>
+                <span>自动寻找最值得人工确认的一处；一次点击即可重新约束整条曲线</span>
+              </div>
+              <span id="review-region-count">0 处</span>
+            </div>
+            <p id="review-region-status">追踪后自动标出最需要检查的位置</p>
+            <div class="review-assistant-actions">
+              <button id="review-resolve" type="button" class="button button-accent" disabled>定位并确认分支</button>
+              <button id="review-next" type="button" class="button button-ghost" disabled>下一处</button>
+            </div>
           </div>
           <button id="save-series" class="button button-primary button-full save-series-button" disabled hidden>保存当前曲线 · 准备下一条</button>
           <div id="series-list" class="series-list">
@@ -389,20 +476,6 @@
             <div><span>Y 范围</span><strong id="metric-y-range">—</strong></div>
           </div>
           <div id="quality-status" class="quality-status empty">等待曲线路径</div>
-          <div id="review-assistant" class="review-assistant waiting">
-            <div class="review-assistant-heading">
-              <div>
-                <strong>智能复核</strong>
-                <span>低置信度、遮挡推断或多模型分歧，建议人工检查</span>
-              </div>
-              <span id="review-region-count">0 处</span>
-            </div>
-            <p id="review-region-status">追踪后自动标出最需要检查的位置</p>
-            <div class="review-assistant-actions">
-              <button id="review-focus" type="button" class="button button-secondary" disabled>定位当前</button>
-              <button id="review-next" type="button" class="button button-ghost" disabled>下一处</button>
-            </div>
-          </div>
           <div id="export-status" class="export-status waiting" role="status">完成至少一条曲线后可导出数据</div>
           <label class="field-label export-density-label" for="export-density">CSV / TXT 采样密度</label>
           <select id="export-density" class="select-control">
@@ -434,6 +507,7 @@
               <button id="undo-action" class="icon-button" type="button" disabled title="撤销最近一次编辑（Ctrl+Z）">撤销</button>
               <button id="redo-action" class="icon-button" type="button" disabled title="重做最近一次编辑（Ctrl+Shift+Z）">重做</button>
               <span id="autosave-status">自动保存待命</span>
+              <button id="restore-draft" class="icon-button" type="button" hidden title="仅在开始新操作前可恢复；开始编辑后，自动保存将更新为新草稿">恢复上次草稿</button>
               <button id="restart-session" class="icon-button restart-session-button" type="button" title="清除当前图片的自动保存草稿并重新开始">重新开始</button>
             </div>
             <div class="zoom-control">
@@ -442,6 +516,14 @@
               <output id="zoom-output">100%</output>
             </div>
           </div>
+        </div>
+        <div id="trace-error" class="trace-workspace-status" role="status" hidden>
+          <div>
+            <strong id="trace-error-title">追踪未完成</strong>
+            <p id="trace-error-message"></p>
+            <small id="trace-error-history">旧结果已保留，但暂不显示圆点或允许导出；可补涂、调整引导点或撤销后重试。</small>
+          </div>
+          <button id="retry-trace" type="button" class="button button-secondary">重新追踪</button>
         </div>
         <div id="canvas-scroller" class="canvas-scroller">
           <div class="canvas-stage">
@@ -487,6 +569,7 @@
             <strong id="point-y-heading">y</strong>
             <span></span>
           </div>
+          <p id="point-list-stale" class="point-list-stale" hidden>以下为上次结果，尚未更新；暂不可编辑或导出。</p>
           <div id="point-list" class="point-list">
             <div class="point-list-empty">自动追踪后显示全部数据点</div>
           </div>
@@ -517,15 +600,21 @@
       </form>
     </dialog>
 
+    <div id="image-drop-overlay" class="image-drop-overlay" role="status" aria-live="polite" hidden>
+      <div>
+        <strong>松开以打开图片</strong>
+        <span>PNG、JPEG 或 WebP · 仅在本机处理</span>
+      </div>
+    </div>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
     <script data-scidigitizer-loader>
       (() => {
         const appScript = document.createElement("script");
         if (window.location.protocol === "file:") {
-          appScript.src = "dist/app-file.js?v=0.20.0-preview.3.1";
+          appScript.src = "dist/app-file.js?v=0.20.0-preview.3.21";
         } else {
           appScript.type = "module";
-          appScript.src = "src/app.js?v=0.20.0-preview.3.1";
+          appScript.src = "src/app.js?v=0.20.0-preview.3.21";
         }
         document.body.appendChild(appScript);
       })();

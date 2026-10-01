@@ -1,3 +1,5 @@
+import { skeletonizeMask, buildMaskGraph } from "./mask-geometry.js?v=0.20.0-preview.3.21";
+
 export function clamp(value, minimum, maximum) {
   return Math.max(minimum, Math.min(maximum, value));
 }
@@ -25,51 +27,169 @@ export function normalizeRect(start, end, bounds = null) {
   };
 }
 
+function calibrationReferencePoints(calibration) {
+  const listed = Array.isArray(calibration?.points) ? calibration.points : [];
+  const active = listed.filter((point) => {
+    const hasPixel = point?.pixel !== null && point?.pixel !== undefined && point?.pixel !== "";
+    const hasValue = point?.value !== null && point?.value !== undefined && point?.value !== "";
+    return hasPixel || hasValue;
+  });
+  if (active.length) return active.map((point, index) => ({
+    ...point,
+    sourceIndex: point.sourceIndex ?? index,
+  }));
+  return [
+    {
+      pixel: calibration?.point1,
+      value: calibration?.value1,
+      uncertaintyPx: calibration?.uncertainty1Px,
+      sourceIndex: 0,
+    },
+    {
+      pixel: calibration?.point2,
+      value: calibration?.value2,
+      uncertaintyPx: calibration?.uncertainty2Px,
+      sourceIndex: 1,
+    },
+  ];
+}
+
+function numericCalibrationPoints(calibration) {
+  return calibrationReferencePoints(calibration).map((point) => ({
+    ...point,
+    pixel: Number(point.pixel),
+    value: Number(point.value),
+    uncertaintyPx: Number.isFinite(Number(point.uncertaintyPx))
+      ? Math.max(0.05, Number(point.uncertaintyPx))
+      : 0.5,
+  }));
+}
+
+function transformedCalibrationValue(value, scale) {
+  return scale === "log" ? Math.log10(value) : value;
+}
+
+/**
+ * Fit a robust global axis model for Linear and Log10 calibrations. With two
+ * references this is the exact historical mapping; additional references use
+ * a Theil-Sen slope and median intercept so one misplaced click cannot rotate
+ * the whole coordinate system silently.
+ */
+export function fitCalibrationModel(calibration) {
+  if (!calibration || calibration.scale === "piecewise") return null;
+  const points = numericCalibrationPoints(calibration);
+  if (points.length < 2 || points.some((point) => (
+    !Number.isFinite(point.pixel)
+    || !Number.isFinite(point.value)
+    || (calibration.scale === "log" && point.value <= 0)
+  ))) return null;
+  const transformed = points.map((point) => ({
+    ...point,
+    transformedValue: transformedCalibrationValue(point.value, calibration.scale),
+  }));
+  const slopes = [];
+  for (let left = 0; left < transformed.length - 1; left += 1) {
+    for (let right = left + 1; right < transformed.length; right += 1) {
+      const pixelSpan = transformed[right].pixel - transformed[left].pixel;
+      if (Math.abs(pixelSpan) < 1e-12) continue;
+      slopes.push((transformed[right].transformedValue - transformed[left].transformedValue) / pixelSpan);
+    }
+  }
+  const slope = median(slopes);
+  if (!Number.isFinite(slope) || Math.abs(slope) < 1e-15) return null;
+  const intercept = median(transformed.map((point) => point.transformedValue - slope * point.pixel));
+  if (!Number.isFinite(intercept)) return null;
+  const residuals = transformed.map((point) => {
+    const predictedPixel = (point.transformedValue - intercept) / slope;
+    return {
+      index: point.sourceIndex,
+      key: point.key ?? null,
+      pixel: point.pixel,
+      value: point.value,
+      pixelResidual: point.pixel - predictedPixel,
+      absolutePixelResidual: Math.abs(point.pixel - predictedPixel),
+    };
+  });
+  const residualRmsPx = Math.sqrt(residuals.reduce(
+    (sum, point) => sum + point.pixelResidual ** 2,
+    0,
+  ) / residuals.length);
+  const residualMedian = median(residuals.map((point) => point.pixelResidual)) ?? 0;
+  const robustResidualPx = 1.4826 * (median(residuals.map((point) => (
+    Math.abs(point.pixelResidual - residualMedian)
+  ))) ?? 0);
+  const outlierThresholdPx = Math.max(0.75, robustResidualPx * 3);
+  const outliers = residuals.filter((point) => point.absolutePixelResidual > outlierThresholdPx);
+  return {
+    scale: calibration.scale ?? "linear",
+    slope,
+    intercept,
+    points: transformed,
+    residuals,
+    residualRmsPx,
+    robustResidualPx,
+    maximumResidualPx: Math.max(0, ...residuals.map((point) => point.absolutePixelResidual)),
+    outlierThresholdPx,
+    outliers,
+  };
+}
+
 export function calibrationError(calibration, axisName = "坐标轴") {
   if (!calibration) return `${axisName}尚未标定`;
-  if (calibration?.scale === "piecewise") {
-    const points = calibration.points ?? [];
-    if (points.length < 3 || points.slice(0, 3).some((point) => (
-      point?.pixel === null
-      || point?.pixel === undefined
-    ))) return `${axisName}分段标定需要点击 3 个刻度位置`;
-    if (points.slice(0, 3).some((point) => !Number.isFinite(Number(point?.value)))) {
-      return `${axisName}刻度值必须是有效数字`;
-    }
-    const validPoints = points.slice(0, 3);
-    const uniquePixels = new Set(validPoints.map((point) => Number(point.pixel)));
-    const uniqueValues = new Set(validPoints.map((point) => Number(point.value)));
-    if (uniquePixels.size !== validPoints.length) return `${axisName}的 3 个刻度位置不能重合`;
-    if (uniqueValues.size !== validPoints.length) return `${axisName}的 3 个刻度值必须互不相同`;
-    const ordered = validPoints
-      .map((point) => ({ pixel: Number(point.pixel), value: Number(point.value) }))
-      .sort((left, right) => left.pixel - right.pixel);
-    const firstDirection = Math.sign(ordered[1].value - ordered[0].value);
-    const secondDirection = Math.sign(ordered[2].value - ordered[1].value);
-    if (firstDirection !== secondDirection) {
-      return `${axisName}的刻度值必须随像素位置保持单调，不能在第三点反向`;
-    }
-    if (Math.min(
-      Math.abs(ordered[1].pixel - ordered[0].pixel),
-      Math.abs(ordered[2].pixel - ordered[1].pixel),
-    ) < 1) return `${axisName}相邻刻度位置至少需要相距 1 px`;
-    return null;
+  const references = calibrationReferencePoints(calibration);
+  const minimumPoints = calibration.scale === "piecewise" ? 3 : 2;
+  const positioned = references.filter((point) => (
+    point?.pixel !== null
+    && point?.pixel !== undefined
+    && Number.isFinite(Number(point?.pixel))
+  ));
+  if (positioned.length < minimumPoints || positioned.length !== references.length) {
+    if (calibration.scale === "piecewise") return `${axisName}分段标定需要点击至少 3 个刻度位置`;
+    return `${axisName}需要点击 2 个已知刻度位置`;
   }
-  if (
-    calibration.point1 === null
-    || calibration.point1 === undefined
-    || calibration.point2 === null
-    || calibration.point2 === undefined
-  ) return `${axisName}需要点击 2 个已知刻度位置`;
-  const value1 = Number(calibration.value1);
-  const value2 = Number(calibration.value2);
-  if (!Number.isFinite(value1) || !Number.isFinite(value2)) return `${axisName}刻度值必须是有效数字`;
-  if (value1 === value2) return `${axisName}两个端点的刻度值不能相同`;
-  if (Math.abs(calibration.point1 - calibration.point2) < 1) {
-    return `${axisName}两个刻度位置至少需要相距 1 px`;
+  if (references.some((point) => (
+    point?.value === null
+    || point?.value === undefined
+    || !Number.isFinite(Number(point?.value))
+  ))) return `${axisName}刻度值必须是有效数字`;
+  const points = references.map((point) => ({
+    pixel: Number(point.pixel),
+    value: Number(point.value),
+  }));
+  if (points.some((point) => !Number.isFinite(point.value))) return `${axisName}刻度值必须是有效数字`;
+  const uniquePixels = new Set(points.map((point) => point.pixel));
+  const uniqueValues = new Set(points.map((point) => point.value));
+  if (uniquePixels.size !== points.length) {
+    return points.length === 2
+      ? `${axisName}两个刻度位置至少需要相距 1 px`
+      : `${axisName}的刻度位置不能重合`;
   }
-  if (calibration.scale === "log" && (value1 <= 0 || value2 <= 0)) {
-    return `${axisName}为 Log10 时，两个刻度值都必须大于 0`;
+  if (uniqueValues.size !== points.length) {
+    return points.length === 2
+      ? `${axisName}两个端点的刻度值不能相同`
+      : `${axisName}的刻度值必须互不相同`;
+  }
+  const ordered = [...points].sort((left, right) => left.pixel - right.pixel);
+  if (Math.min(...ordered.slice(1).map((point, index) => (
+    Math.abs(point.pixel - ordered[index].pixel)
+  ))) < 1) {
+    return points.length === 2
+      ? `${axisName}两个刻度位置至少需要相距 1 px`
+      : `${axisName}相邻刻度位置至少需要相距 1 px`;
+  }
+  const directions = ordered.slice(1).map((point, index) => (
+    Math.sign(point.value - ordered[index].value)
+  ));
+  if (directions.some((direction) => direction !== directions[0])) {
+    return `${axisName}的刻度值必须随像素位置保持单调，不能在额外参考点反向`;
+  }
+  if (calibration.scale === "log" && points.some((point) => point.value <= 0)) {
+    return points.length === 2
+      ? `${axisName}为 Log10 时，两个刻度值都必须大于 0`
+      : `${axisName}为 Log10 时，所有刻度值都必须大于 0`;
+  }
+  if (calibration.scale !== "piecewise" && !fitCalibrationModel(calibration)) {
+    return `${axisName}无法从当前参考点建立稳定映射`;
   }
   return null;
 }
@@ -85,15 +205,7 @@ export function validateCalibration(calibration) {
 export function assessCalibrationQuality(calibration, axisPixelSpan) {
   if (!validateCalibration(calibration)) return null;
   const availableSpan = Math.max(1, Number(axisPixelSpan) || 1);
-  const points = calibration.scale === "piecewise"
-    ? calibration.points.slice(0, 3).map((point) => ({
-      pixel: Number(point.pixel),
-      value: Number(point.value),
-    }))
-    : [
-      { pixel: Number(calibration.point1), value: Number(calibration.value1) },
-      { pixel: Number(calibration.point2), value: Number(calibration.value2) },
-    ];
+  const points = numericCalibrationPoints(calibration);
   points.sort((left, right) => left.pixel - right.pixel);
   const segmentPixelSpans = points.slice(1).map((point, index) => point.pixel - points[index].pixel);
   const pixelSpan = points.at(-1).pixel - points[0].pixel;
@@ -106,7 +218,19 @@ export function assessCalibrationQuality(calibration, axisPixelSpan) {
     warnings.push(`基准覆盖坐标轴的 ${Math.round(spanFraction * 100)}%；建议选择距离更远的清晰刻度`);
   }
   if (calibration.scale === "piecewise" && minimumSegmentFraction < 0.12) {
-    warnings.push("分段标定中有一段过短，建议把第三点与相邻点拉开");
+    warnings.push("分段标定中有一段过短，建议把相邻参考点拉开");
+  }
+
+  const model = fitCalibrationModel(calibration);
+  const residualRmsPx = model?.residualRmsPx ?? 0;
+  const maximumResidualPx = model?.maximumResidualPx ?? 0;
+  const outliers = model?.outliers ?? [];
+  if (points.length > 2 && residualRmsPx > 0.45) {
+    warnings.push(`多点拟合残差 RMS ${formatCalibrationNumber(residualRmsPx)} px；请检查偏离最大的参考点`);
+  }
+  if (outliers.length) {
+    const labels = outliers.map((point) => point.key ?? `#${point.index + 1}`).join("、");
+    warnings.push(`疑似异常参考点 ${labels}（最大偏差 ${formatCalibrationNumber(maximumResidualPx)} px）`);
   }
 
   let sensitivity;
@@ -121,24 +245,37 @@ export function assessCalibrationQuality(calibration, axisPixelSpan) {
       Math.abs(point.value - points[index].value) / segmentPixelSpans[index]
     )));
   }
+  const baseGrade = spanFraction >= 0.6 && minimumSegmentFraction >= 0.12
+    ? "good"
+    : spanFraction >= 0.25 ? "review" : "poor";
+  const grade = maximumResidualPx > 2
+    ? "poor"
+    : residualRmsPx > 0.45 && baseGrade === "good" ? "review" : baseGrade;
   return {
-    grade: spanFraction >= 0.6 && minimumSegmentFraction >= 0.12
-      ? "good"
-      : spanFraction >= 0.25 ? "review" : "poor",
+    grade,
+    referenceCount: points.length,
     pixelSpan,
     spanFraction,
     minimumSegmentFraction,
     sensitivity,
     sensitivityKind,
+    residualRmsPx,
+    robustResidualPx: model?.robustResidualPx ?? 0,
+    maximumResidualPx,
+    residuals: model?.residuals ?? [],
+    outliers,
     warnings,
   };
+}
+
+function formatCalibrationNumber(value) {
+  return Number(value.toFixed(value >= 10 ? 2 : 3)).toString();
 }
 
 export function pixelToValue(pixel, calibration) {
   if (!validateCalibration(calibration)) return Number.NaN;
   if (calibration.scale === "piecewise") {
-    const points = calibration.points
-      .map((point) => ({ pixel: Number(point.pixel), value: Number(point.value) }))
+    const points = numericCalibrationPoints(calibration)
       .sort((a, b) => a.pixel - b.pixel);
     let left = points[0];
     let right = points[1];
@@ -157,22 +294,16 @@ export function pixelToValue(pixel, calibration) {
     const fraction = (pixel - left.pixel) / (right.pixel - left.pixel);
     return left.value + fraction * (right.value - left.value);
   }
-  const fraction = (pixel - calibration.point1) / (calibration.point2 - calibration.point1);
-  const value1 = Number(calibration.value1);
-  const value2 = Number(calibration.value2);
-
-  if (calibration.scale === "log") {
-    const logValue = Math.log10(value1) + fraction * (Math.log10(value2) - Math.log10(value1));
-    return 10 ** logValue;
-  }
-  return value1 + fraction * (value2 - value1);
+  const model = fitCalibrationModel(calibration);
+  if (!model) return Number.NaN;
+  const transformedValue = model.intercept + model.slope * pixel;
+  return calibration.scale === "log" ? 10 ** transformedValue : transformedValue;
 }
 
 export function valueToPixel(value, calibration) {
   if (!validateCalibration(calibration)) return Number.NaN;
   if (calibration.scale === "piecewise") {
-    const points = calibration.points
-      .map((point) => ({ pixel: Number(point.pixel), value: Number(point.value) }))
+    const points = numericCalibrationPoints(calibration)
       .sort((a, b) => a.value - b.value);
     let left = points[0];
     let right = points[1];
@@ -191,17 +322,155 @@ export function valueToPixel(value, calibration) {
     const fraction = (value - left.value) / (right.value - left.value);
     return left.pixel + fraction * (right.pixel - left.pixel);
   }
-  const value1 = Number(calibration.value1);
-  const value2 = Number(calibration.value2);
-  let fraction;
+  if (calibration.scale === "log" && value <= 0) return Number.NaN;
+  const model = fitCalibrationModel(calibration);
+  if (!model) return Number.NaN;
+  const transformedValue = transformedCalibrationValue(Number(value), calibration.scale);
+  return (transformedValue - model.intercept) / model.slope;
+}
 
-  if (calibration.scale === "log") {
-    if (value <= 0) return Number.NaN;
-    fraction = (Math.log10(value) - Math.log10(value1)) / (Math.log10(value2) - Math.log10(value1));
+export function calibrationUncertaintyAtPixel(pixel, calibration, extraPixelSigma = 0) {
+  if (!validateCalibration(calibration) || !Number.isFinite(Number(pixel))) return null;
+  const coordinate = Number(pixel);
+  const points = numericCalibrationPoints(calibration).sort((left, right) => left.pixel - right.pixel);
+  let calibrationPixelSigma;
+  let residualRmsPx = 0;
+  if (calibration.scale === "piecewise") {
+    let left = points[0];
+    let right = points[1];
+    if (coordinate >= points.at(-1).pixel) {
+      left = points.at(-2);
+      right = points.at(-1);
+    } else {
+      for (let index = 1; index < points.length; index += 1) {
+        if (coordinate <= points[index].pixel) {
+          left = points[index - 1];
+          right = points[index];
+          break;
+        }
+      }
+    }
+    const fraction = (coordinate - left.pixel) / (right.pixel - left.pixel);
+    calibrationPixelSigma = Math.hypot(
+      (1 - fraction) * left.uncertaintyPx,
+      fraction * right.uncertaintyPx,
+    );
   } else {
-    fraction = (value - value1) / (value2 - value1);
+    const model = fitCalibrationModel(calibration);
+    if (!model) return null;
+    const meanPixel = points.reduce((sum, point) => sum + point.pixel, 0) / points.length;
+    const squaredSpan = points.reduce((sum, point) => sum + (point.pixel - meanPixel) ** 2, 0);
+    const leverage = Math.sqrt(
+      1 / points.length
+      + (coordinate - meanPixel) ** 2 / Math.max(1, squaredSpan),
+    );
+    const referenceSigma = Math.sqrt(points.reduce(
+      (sum, point) => sum + point.uncertaintyPx ** 2,
+      0,
+    ) / points.length);
+    residualRmsPx = model.residualRmsPx;
+    calibrationPixelSigma = Math.hypot(referenceSigma * leverage, residualRmsPx * leverage);
   }
-  return calibration.point1 + fraction * (calibration.point2 - calibration.point1);
+  const pixelSigma = Math.max(0.03, Math.hypot(
+    calibrationPixelSigma,
+    Math.max(0, Number(extraPixelSigma) || 0),
+  ));
+  const centerValue = pixelToValue(coordinate, calibration);
+  const lowerValue = pixelToValue(coordinate - pixelSigma, calibration);
+  const upperValue = pixelToValue(coordinate + pixelSigma, calibration);
+  const valueSigma = Math.max(
+    Math.abs(centerValue - lowerValue),
+    Math.abs(upperValue - centerValue),
+  );
+  return {
+    pixelSigma,
+    valueSigma,
+    relativeSigma: centerValue === 0 ? null : Math.abs(valueSigma / centerValue),
+    referenceCount: points.length,
+    residualRmsPx,
+  };
+}
+
+/**
+ * Refine only the coordinate that controls an axis mapping. The user still
+ * chooses every reference tick; this helper merely centres that click on the
+ * nearby dark tick stroke and declines to move it when local evidence is weak.
+ */
+export function snapCalibrationPoint({
+  rgba,
+  width,
+  height,
+  point,
+  axis,
+  searchRadius = 6,
+  sampleRadius = 8,
+}) {
+  if (!rgba || rgba.length !== width * height * 4 || !point || !["x", "y"].includes(axis)) {
+    return { point: point ? { ...point } : null, snapped: false, confidence: 0, shift: 0, uncertaintyPx: 0.5 };
+  }
+  const coordinate = axis === "x" ? Number(point.x) : Number(point.y);
+  const orthogonal = axis === "x" ? Number(point.y) : Number(point.x);
+  if (!Number.isFinite(coordinate) || !Number.isFinite(orthogonal)) {
+    return { point: { ...point }, snapped: false, confidence: 0, shift: 0, uncertaintyPx: 0.5 };
+  }
+  const minimum = 0;
+  const maximum = (axis === "x" ? width : height) - 1;
+  const scores = [];
+  for (
+    let candidate = Math.max(minimum, Math.floor(coordinate - searchRadius));
+    candidate <= Math.min(maximum, Math.ceil(coordinate + searchRadius));
+    candidate += 1
+  ) {
+    let score = 0;
+    let weightTotal = 0;
+    for (let offset = -sampleRadius; offset <= sampleRadius; offset += 1) {
+      const x = axis === "x" ? candidate : Math.round(orthogonal + offset);
+      const y = axis === "x" ? Math.round(orthogonal + offset) : candidate;
+      if (x < 0 || x >= width || y < 0 || y >= height) continue;
+      const index = (y * width + x) * 4;
+      const alpha = rgba[index + 3] / 255;
+      const luminance = rgba[index] * 0.2126 + rgba[index + 1] * 0.7152 + rgba[index + 2] * 0.0722;
+      const weight = 0.55 + 0.45 * (1 - Math.abs(offset) / (sampleRadius + 1));
+      score += (255 - (luminance * alpha + 255 * (1 - alpha))) * weight;
+      weightTotal += weight;
+    }
+    scores.push({ coordinate: candidate, score: weightTotal ? score / weightTotal : 0 });
+  }
+  const baseline = median(scores.map((entry) => entry.score)) ?? 0;
+  const adjusted = scores.map((entry) => ({
+    ...entry,
+    evidence: Math.max(0, entry.score - baseline),
+  }));
+  const best = [...adjusted].sort((left, right) => right.evidence - left.evidence)[0];
+  if (!best || best.evidence < 12) {
+    return { point: { ...point }, snapped: false, confidence: 0, shift: 0, uncertaintyPx: 0.5 };
+  }
+  const cluster = adjusted.filter((entry) => (
+    Math.abs(entry.coordinate - best.coordinate) <= 2
+    && entry.evidence >= best.evidence * 0.25
+  ));
+  const weightSum = cluster.reduce((sum, entry) => sum + entry.evidence ** 2, 0);
+  const snappedCoordinate = weightSum
+    ? cluster.reduce((sum, entry) => sum + entry.coordinate * entry.evidence ** 2, 0) / weightSum
+    : best.coordinate;
+  const shift = snappedCoordinate - coordinate;
+  const confidence = clamp(
+    best.evidence / Math.max(20, best.score) * (1 - Math.min(0.45, Math.abs(shift) / (searchRadius + 1) * 0.45)),
+    0,
+    1,
+  );
+  if (confidence < 0.18 || Math.abs(shift) > searchRadius + 0.25) {
+    return { point: { ...point }, snapped: false, confidence, shift: 0, uncertaintyPx: 0.5 };
+  }
+  const snappedPoint = { ...point };
+  snappedPoint[axis] = clamp(snappedCoordinate, minimum, maximum);
+  return {
+    point: snappedPoint,
+    snapped: true,
+    confidence,
+    shift,
+    uncertaintyPx: clamp(0.5 - confidence * 0.38, 0.12, 0.5),
+  };
 }
 
 /**
@@ -243,7 +512,26 @@ export function compositedColorDistance(red, green, blue, target) {
     -1,
     1,
   );
-  return Math.sqrt(Math.max(0, 2 - 2 * cosine)) * 100;
+  const hueDistance = Math.sqrt(Math.max(0, 2 - 2 * cosine)) * 100;
+  // All greys have the same ink direction. Use a continuous luminance band
+  // for neutral targets, not a black-only cutoff: otherwise a grey curve can
+  // match both a pale background and a darker grid with distance zero.
+  // Bright-side tolerance admits antialiasing; dark-side tolerance admits
+  // small sampling/compression variations, not unrelated black strokes.
+  // Scale the band with available contrast so light grey on a pale plot
+  // does not inherit the much wider absolute tolerance of black on white.
+  const targetLuminance = 0.2126 * target.r + 0.7152 * target.g + 0.0722 * target.b;
+  const targetChroma = Math.max(target.r, target.g, target.b) - Math.min(target.r, target.g, target.b);
+  const neutralWeight = clamp((36 - targetChroma) / 18, 0, 1);
+  if (neutralWeight > 0) {
+    const luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue;
+    const contrast = Math.max(16, 255 - targetLuminance);
+    const delta = luminance - targetLuminance;
+    const allowance = delta >= 0 ? Math.min(24, contrast * 0.12) : Math.min(12, contrast * 0.08);
+    const luminanceDistance = Math.max(0, Math.abs(delta) - allowance) * 0.4 * Math.sqrt(255 / contrast);
+    return Math.max(hueDistance, luminanceDistance * neutralWeight);
+  }
+  return hueDistance;
 }
 
 export function pixelAt(rgba, width, x, y) {
@@ -254,6 +542,65 @@ export function pixelAt(rgba, width, x, y) {
     b: rgba[index + 2],
     a: rgba[index + 3],
   };
+}
+
+// A narrow stroke is darker than the background on both sides in at least
+// one direction. A flat shaded region or a one-sided region boundary is not.
+// Used only in the small colour-picking neighbourhood, never per full image.
+function localStrokeContrast(rgba, width, height, x, y, luminance) {
+  let contrast = 0;
+  for (const distance of [2, 3, 5, 7]) {
+    for (const [dx, dy] of [[1, 0], [0, 1], [1, 1], [1, -1]]) {
+      const x0 = x - dx * distance, y0 = y - dy * distance;
+      const x1 = x + dx * distance, y1 = y + dy * distance;
+      if (x0 < 0 || y0 < 0 || x1 < 0 || y1 < 0 || x0 >= width || y0 >= height || x1 >= width || y1 >= height) continue;
+      const before = (y0 * width + x0) * 4;
+      const after = (y1 * width + x1) * 4;
+      if (rgba[before + 3] < 32 || rgba[after + 3] < 32) continue;
+      const left = 0.2126 * rgba[before] + 0.7152 * rgba[before + 1] + 0.0722 * rgba[before + 2];
+      const right = 0.2126 * rgba[after] + 0.7152 * rgba[after + 1] + 0.0722 * rgba[after + 2];
+      contrast = Math.max(contrast, Math.min(left, right) - luminance);
+    }
+  }
+  return contrast;
+}
+
+function nearestNeutralStrokePixels(rgba, width, height, point, radius) {
+  const candidates = new Set();
+  let nearest = null, nearestDistance = Infinity;
+  for (let y = Math.max(0, Math.round(point.y) - radius); y <= Math.min(height - 1, Math.round(point.y) + radius); y += 1) {
+    for (let x = Math.max(0, Math.round(point.x) - radius); x <= Math.min(width - 1, Math.round(point.x) + radius); x += 1) {
+      const index = (y * width + x) * 4;
+      const red = rgba[index], green = rgba[index + 1], blue = rgba[index + 2];
+      if (rgba[index + 3] < 32 || Math.max(red, green, blue) - Math.min(red, green, blue) > 18) continue;
+      const luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue;
+      if (localStrokeContrast(rgba, width, height, x, y, luminance) < 6) continue;
+      candidates.add(y * width + x);
+      const distance = Math.hypot(x - point.x, y - point.y);
+      if (distance < nearestDistance) { nearest = y * width + x; nearestDistance = distance; }
+    }
+  }
+  if (nearest === null) return null;
+  // Pick the closest stroke component first, then refine its colour. This
+  // lets an antialias click reach the line core without reaching a separate
+  // black grid or a second grey series a few pixels farther away.
+  const component = new Set([nearest]);
+  const pending = [nearest];
+  while (pending.length) {
+    const index = pending.pop(), x = index % width, y = Math.floor(index / width);
+    for (let dy = -1; dy <= 1; dy += 1) for (let dx = -1; dx <= 1; dx += 1) {
+      if (x + dx < 0 || x + dx >= width || y + dy < 0 || y + dy >= height) continue;
+      const neighbor = (y + dy) * width + x + dx;
+      if (!component.has(neighbor) && candidates.has(neighbor)) {
+        component.add(neighbor);
+        pending.push(neighbor);
+      }
+    }
+  }
+  const refinementRadius = Math.max(2.5, nearestDistance + 1.5);
+  return new Set([...component].filter(index => Math.hypot(
+    index % width - point.x, Math.floor(index / width) - point.y,
+  ) <= refinementRadius));
 }
 
 export function sampleRepresentativeColor(rgba, width, height, point, radius = 6) {
@@ -267,6 +614,8 @@ export function sampleRepresentativeColor(rgba, width, height, point, radius = 6
   let nearbyBlackMaximumX = -Infinity;
   let nearbyBlackMinimumY = Infinity;
   let nearbyBlackMaximumY = -Infinity;
+  let nearbyNeutralStroke = false;
+  let nearbyColoredStroke = false;
   const neutralProbeRadius = Math.min(radius, 2);
   for (let offsetY = -neutralProbeRadius; offsetY <= neutralProbeRadius; offsetY += 1) {
     const y = clamp(Math.round(point.y) + offsetY, 0, height - 1);
@@ -277,6 +626,10 @@ export function sampleRepresentativeColor(rgba, width, height, point, radius = 6
       if (color.a < 32) continue;
       const luminance = 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
       const chroma = Math.max(color.r, color.g, color.b) - Math.min(color.r, color.g, color.b);
+      if (localStrokeContrast(rgba, width, height, x, y, luminance) >= 6) {
+        if (chroma <= 18) nearbyNeutralStroke = true;
+        else nearbyColoredStroke = true;
+      }
       if (luminance <= 72 && chroma <= 18) {
         nearbyBlackCount += 1;
         nearbyBlackMinimumX = Math.min(nearbyBlackMinimumX, offsetX);
@@ -298,7 +651,24 @@ export function sampleRepresentativeColor(rgba, width, height, point, radius = 6
   const nearbyBlackGlyph = nearbyBlackCount >= 3
     && nearbyBlackMaximumX - nearbyBlackMinimumX >= 1
     && nearbyBlackMaximumY - nearbyBlackMinimumY >= 1;
-  const preferNeutralInk = centerIsNeutralInk || nearbyBlackGlyph;
+  if (nearbyNeutralStroke && !nearbyColoredStroke && !centerIsNeutralInk && !nearbyBlackGlyph) {
+    // A white-gap click on a coloured dashed curve can be closer to a black
+    // annotation. Preserve the established coloured-ink preference if a real
+    // coloured stroke exists in the normal picking window (not a flat tint).
+    coloredProbe: for (let y = Math.max(0, Math.round(point.y) - radius); y <= Math.min(height - 1, Math.round(point.y) + radius); y += 1) {
+      for (let x = Math.max(0, Math.round(point.x) - radius); x <= Math.min(width - 1, Math.round(point.x) + radius); x += 1) {
+        const color = pixelAt(rgba, width, x, y);
+        if (color.a < 32 || Math.max(color.r, color.g, color.b) - Math.min(color.r, color.g, color.b) <= 18) continue;
+        const luminance = 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
+        if (localStrokeContrast(rgba, width, height, x, y, luminance) >= 6) {
+          nearbyColoredStroke = true;
+          break coloredProbe;
+        }
+      }
+    }
+  }
+  const preferNeutralInk = centerIsNeutralInk || nearbyBlackGlyph || (nearbyNeutralStroke && !nearbyColoredStroke);
+  const neutralStroke = preferNeutralInk ? nearestNeutralStrokePixels(rgba, width, height, point, radius) : null;
 
   for (let y = Math.max(0, Math.round(point.y) - radius); y <= Math.min(height - 1, Math.round(point.y) + radius); y += 1) {
     for (let x = Math.max(0, Math.round(point.x) - radius); x <= Math.min(width - 1, Math.round(point.x) + radius); x += 1) {
@@ -312,10 +682,12 @@ export function sampleRepresentativeColor(rgba, width, height, point, radius = 6
       const similarityToClickedPixel = Math.sqrt(rgbDistanceSquared(color.r, color.g, color.b, center));
       let score;
       if (preferNeutralInk) {
-        // Stay close to the clicked neutral family, then choose a dark, nearby
-        // antialias sample. The chroma penalty decisively rejects an overlapping
-        // colored curve without forcing all sampling into grayscale mode.
-        score = darkness * 0.7
+        if (neutralStroke && !neutralStroke.has(y * width + x)) continue;
+        // Proximity and local stroke contrast come before raw darkness. A
+        // nearby black grid must not steal a deliberate click on a grey line;
+        // a uniform grey background must not win over a slightly missed line.
+        const strokeContrast = localStrokeContrast(rgba, width, height, x, y, luminance);
+        score = darkness * 0.45 + Math.min(24, strokeContrast) * 1.5
           - chroma * 5
           - centerDistance * 4.5
           - similarityToClickedPixel * 0.05;
@@ -338,15 +710,25 @@ export function sampleRepresentativeColor(rgba, width, height, point, radius = 6
 
 export function estimateColorThreshold(rgba, width, height, point, target, radius = 7) {
   const distances = [];
+  const backgroundDistances = [];
+  const neutralTarget = Math.max(target.r, target.g, target.b) - Math.min(target.r, target.g, target.b) < 36;
+  let sampleCount = 0;
   const centerX = clamp(Math.round(point.x), 0, width - 1);
   const centerY = clamp(Math.round(point.y), 0, height - 1);
   for (let y = Math.max(0, centerY - radius); y <= Math.min(height - 1, centerY + radius); y += 1) {
     for (let x = Math.max(0, centerX - radius); x <= Math.min(width - 1, centerX + radius); x += 1) {
       const color = pixelAt(rgba, width, x, y);
       if (color.a < 32) continue;
+      sampleCount += 1;
+      const distance = compositedColorDistance(color.r, color.g, color.b, target);
+      if (neutralTarget) {
+        const luminance = 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
+        if (distance > 1e-6 && localStrokeContrast(rgba, width, height, x, y, luminance) <= 2) {
+          backgroundDistances.push(distance);
+        }
+      }
       const inkStrength = Math.hypot(255 - color.r, 255 - color.g, 255 - color.b);
       if (inkStrength < 10) continue;
-      const distance = compositedColorDistance(color.r, color.g, color.b, target);
       if (Number.isFinite(distance) && distance <= 36) distances.push(distance);
     }
   }
@@ -355,13 +737,289 @@ export function estimateColorThreshold(rgba, width, height, point, target, radiu
   // The lower part of the local cluster is normally the selected stroke. Nearby
   // grids, markers, or another curve should not be allowed to widen the match.
   const clusterEnd = Math.max(0, Math.floor((distances.length - 1) * 0.6));
-  return Math.round(clamp(distances[clusterEnd] + 5, 9, 15));
+  let threshold = Math.round(clamp(distances[clusterEnd] + 5, 9, 15));
+  // On low-contrast plots, the many background pixels must not enlarge their
+  // own acceptance threshold. Use only spatially flat samples for the cap;
+  // keep white (infinite distance) so a white plot retains its usual tolerance.
+  if (neutralTarget && backgroundDistances.length >= Math.max(8, sampleCount * 0.25)) {
+    backgroundDistances.sort((a, b) => a - b);
+    const backgroundDistance = backgroundDistances[Math.floor((backgroundDistances.length - 1) * 0.25)];
+    if (Number.isFinite(backgroundDistance) && backgroundDistance > 0) {
+      threshold = Math.min(threshold, Math.max(4, Math.floor(backgroundDistance * 0.75)));
+    }
+  }
+  return threshold;
 }
 
-function inclusionMaskAllows(inclusionMask, width, x, y) {
+/**
+ * Snap an approximate target-selection click to the local center of the
+ * sampled stroke. Browser scaling can place the natural-image coordinate a
+ * few pixels beside a steep or thin line even when the pointer visibly sits
+ * on it. Keeping that off-stroke coordinate as the first locked guide gives
+ * the directional tracker a false initial slope and can truncate an otherwise
+ * simple curve.
+ *
+ * This helper is intentionally local: it finds the nearest matching connected
+ * component, estimates its tangent with a small PCA neighborhood, and projects
+ * the click onto the component centerline. Projection preserves position along
+ * near-horizontal or near-vertical curves instead of drifting along them.
+ */
+export function snapTargetPoint({
+  rgba,
+  width,
+  height,
+  rect,
+  point,
+  target,
+  threshold = 15,
+  exclusions = [],
+  inclusionMask = null,
+  searchRadius = 8,
+}) {
+  if (
+    !rgba
+    || rgba.length !== width * height * 4
+    || !point
+    || !target
+    || !Number.isFinite(point.x)
+    || !Number.isFinite(point.y)
+  ) return point;
+  const safeRect = normalizeRect(
+    { x: rect?.left ?? 0, y: rect?.top ?? 0 },
+    { x: rect?.right ?? width - 1, y: rect?.bottom ?? height - 1 },
+    { width, height },
+  );
+  const radius = clamp(Math.round(searchRadius), 1, 16);
+  const left = Math.max(safeRect.left, Math.round(point.x) - radius);
+  const right = Math.min(safeRect.right, Math.round(point.x) + radius);
+  const candidates = [];
+  for (let x = left; x <= right; x += 1) {
+    for (const candidate of clusterColumnCandidates(
+      rgba,
+      width,
+      x,
+      safeRect.top,
+      safeRect.bottom,
+      target,
+      threshold,
+      exclusions,
+      inclusionMask,
+    )) {
+      const nearestY = clamp(point.y, candidate.start, candidate.end);
+      const distance = Math.hypot(x - point.x, nearestY - point.y);
+      if (distance <= radius + 0.5) candidates.push({ x, nearestY, distance, candidate });
+    }
+  }
+  if (!candidates.length) return point;
+  candidates.sort((leftCandidate, rightCandidate) => (
+    leftCandidate.distance - rightCandidate.distance
+    || leftCandidate.candidate.distance - rightCandidate.candidate.distance
+    || Math.abs(leftCandidate.candidate.y - point.y) - Math.abs(rightCandidate.candidate.y - point.y)
+  ));
+  const nearest = candidates[0];
+  const matchesAt = (x, y) => {
+    if (x < safeRect.left || x > safeRect.right || y < safeRect.top || y > safeRect.bottom) return false;
+    if ((exclusions ?? []).some((area) => (
+      x >= area.left && x <= area.right && y >= area.top && y <= area.bottom
+    ))) return false;
+    if (!inclusionMaskAllows(inclusionMask, width, x, y)) return false;
+    const index = (y * width + x) * 4;
+    if (rgba[index + 3] < 32) return false;
+    return compositedColorDistance(rgba[index], rgba[index + 1], rgba[index + 2], target) <= threshold;
+  };
+  const localTop = Math.max(safeRect.top, Math.round(point.y) - radius);
+  const localBottom = Math.min(safeRect.bottom, Math.round(point.y) + radius);
+  const localWidth = right - left + 1;
+  const visited = new Uint8Array(localWidth * (localBottom - localTop + 1));
+  const queue = [[nearest.x, clamp(Math.round(nearest.nearestY), localTop, localBottom)]];
+  const component = [];
+  while (queue.length) {
+    const [x, y] = queue.pop();
+    if (x < left || x > right || y < localTop || y > localBottom) continue;
+    if (Math.hypot(x - point.x, y - point.y) > radius + 0.75) continue;
+    const localIndex = (y - localTop) * localWidth + x - left;
+    if (visited[localIndex]) continue;
+    visited[localIndex] = 1;
+    if (!matchesAt(x, y)) continue;
+    component.push({ x, y });
+    for (let offsetY = -1; offsetY <= 1; offsetY += 1) {
+      for (let offsetX = -1; offsetX <= 1; offsetX += 1) {
+        if (offsetX || offsetY) queue.push([x + offsetX, y + offsetY]);
+      }
+    }
+  }
+  if (component.length < 3) {
+    return { ...point, x: nearest.x, y: nearest.nearestY };
+  }
+  const center = component.reduce((sum, pixel) => ({
+    x: sum.x + pixel.x / component.length,
+    y: sum.y + pixel.y / component.length,
+  }), { x: 0, y: 0 });
+  let covarianceXX = 0;
+  let covarianceXY = 0;
+  let covarianceYY = 0;
+  for (const pixel of component) {
+    const dx = pixel.x - center.x;
+    const dy = pixel.y - center.y;
+    covarianceXX += dx * dx;
+    covarianceXY += dx * dy;
+    covarianceYY += dy * dy;
+  }
+  const tangentAngle = 0.5 * Math.atan2(2 * covarianceXY, covarianceXX - covarianceYY);
+  const tangentX = Math.cos(tangentAngle);
+  const tangentY = Math.sin(tangentAngle);
+  const trace = covarianceXX + covarianceYY;
+  const discriminant = Math.hypot(covarianceXX - covarianceYY, 2 * covarianceXY);
+  const anisotropy = trace > 1e-9 ? discriminant / trace : 0;
+  if (anisotropy < 0.18) {
+    return { ...point, x: center.x, y: center.y };
+  }
+  const tangentOffset = (point.x - center.x) * tangentX + (point.y - center.y) * tangentY;
+  return {
+    ...point,
+    x: clamp(center.x + tangentOffset * tangentX, safeRect.left, safeRect.right),
+    y: clamp(center.y + tangentOffset * tangentY, safeRect.top, safeRect.bottom),
+  };
+}
+
+function localPenGates(pixels, width, region) {
+  // Infer entry/exit directions from the painted geometry, not from the trace
+  // orientation or guide count. Padding also permits thinning at image edges.
+  const localWidth = region.right - region.left + 3;
+  const localHeight = region.bottom - region.top + 3;
+  const mask = new Uint8Array(localWidth * localHeight);
+  for (const index of pixels) {
+    mask[(Math.floor(index / width) - region.top + 1) * localWidth + index % width - region.left + 1] = 1;
+  }
+  const nodes = buildMaskGraph(skeletonizeMask({
+    mask, width: localWidth, height: localHeight, offsetX: region.left - 1, offsetY: region.top - 1,
+  }));
+  // A dab alone has no reliable direction. Keep its local exclusion rectangle
+  // instead of inventing a direction that can block unrelated image regions.
+  if (nodes.length < 3) return null;
+  let endpoints = nodes.map((node, index) => node.neighbors.length === 1 ? index : -1).filter(index => index >= 0);
+  if (endpoints.length > 2) {
+    // Ignore small skeleton spurs caused by uneven brush edges. Only the two
+    // most separated endpoints define how an open painted section continues.
+    const farthest = (start) => {
+      const distance = new Int32Array(nodes.length).fill(-1);
+      const queue = [start];
+      distance[start] = 0;
+      for (let head = 0; head < queue.length; head += 1) {
+        for (const next of nodes[queue[head]].neighbors) {
+          if (distance[next] >= 0) continue;
+          distance[next] = distance[queue[head]] + 1;
+          queue.push(next);
+        }
+      }
+      return endpoints.reduce((best, index) => distance[index] > distance[best] ? index : best, start);
+    };
+    const first = farthest(endpoints[0]);
+    endpoints = [first, farthest(first)];
+  }
+  const support = Math.max(6, Math.min(24, pixels.length / nodes.length * 1.5));
+  return endpoints.map((endpoint) => {
+    let previous = -1;
+    let current = endpoint;
+    let distance = 0;
+    while (distance < support) {
+      const next = nodes[current].neighbors.filter(index => index !== previous);
+      if (next.length !== 1) break;
+      distance += Math.hypot(nodes[next[0]].x - nodes[current].x, nodes[next[0]].y - nodes[current].y);
+      previous = current;
+      current = next[0];
+    }
+    const dx = nodes[endpoint].x - nodes[current].x;
+    const dy = nodes[endpoint].y - nodes[current].y;
+    const length = Math.hypot(dx, dy);
+    if (!length) return null;
+    const nx = dx / length, ny = dy / length;
+    // Put each gate beyond the painted cap, so rounded brush ends are covered
+    // too. Extension is allowed only beyond an entry/exit plane, never beside
+    // the middle of a stroke. A closed corridor has no exit planes.
+    let offset = -Infinity;
+    for (const index of pixels) offset = Math.max(offset, nx * (index % width) + ny * Math.floor(index / width));
+    return { nx, ny, offset };
+  }).filter(Boolean);
+}
+
+/** Build one orientation-independent Pen contract for trace, sampling/export.
+ * Local sections exclude unpainted pixels between their endpoint gates, not
+ * just inside their bounding boxes. Only endwise extension remains available.
+ * Strict mode permits only painted pixels. Manual guides remain authoritative.
+ */
+export function prepareInclusionMask(data, width, height, mode = "local") {
+  if (!data || data.length !== width * height) throw new Error("Invalid Pen raster dimensions");
+  const columns = new Uint8Array(width);
+  const rows = new Uint8Array(height);
+  let activePixels = 0;
+  for (let index = 0; index < data.length; index += 1) {
+    if (!data[index]) continue;
+    columns[index % width] = 1;
+    rows[Math.floor(index / width)] = 1;
+    activePixels += 1;
+  }
+  if (!activePixels) return null;
+  const scope = mode === "strict" ? "strict" : "local";
+  const regions = [];
+  const gates = [];
+  const allowed = scope === "strict" ? data.slice() : new Uint8Array(data.length).fill(1);
+  if (scope === "local") {
+    const unseen = data.slice();
+    const queue = new Int32Array(activePixels);
+    for (let seed = 0; seed < data.length; seed += 1) {
+      if (!unseen[seed]) continue;
+      let head = 0;
+      let tail = 1;
+      queue[0] = seed;
+      unseen[seed] = 0;
+      const region = { left: width, right: 0, top: height, bottom: 0 };
+      while (head < tail) {
+        const index = queue[head++];
+        const x = index % width;
+        const y = Math.floor(index / width);
+        region.left = Math.min(region.left, x);
+        region.right = Math.max(region.right, x);
+        region.top = Math.min(region.top, y);
+        region.bottom = Math.max(region.bottom, y);
+        for (let dy = -1; dy <= 1; dy += 1) {
+          for (let dx = -1; dx <= 1; dx += 1) {
+            const nx = x + dx;
+            const ny = y + dy;
+            if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
+            const next = ny * width + nx;
+            if (!unseen[next]) continue;
+            unseen[next] = 0;
+            queue[tail++] = next;
+          }
+        }
+      }
+      regions.push(region);
+      const ends = localPenGates(queue.subarray(0, tail), width, region);
+      if (ends !== null) {
+        gates.push(...ends);
+        for (let y = 0; y < height; y += 1) {
+          for (let x = 0; x < width; x += 1) {
+            if (!allowed[y * width + x] || data[y * width + x]) continue;
+            if (!ends.some(({ nx, ny, offset }) => nx * x + ny * y > offset + 1e-7)) allowed[y * width + x] = 0;
+          }
+        }
+      }
+      for (let y = region.top; y <= region.bottom; y += 1) {
+        allowed.fill(0, y * width + region.left, y * width + region.right + 1);
+      }
+    }
+    for (let index = 0; index < data.length; index += 1) if (data[index]) allowed[index] = 1;
+  }
+  return { data, columns, rows, allowed, mode: scope, regions, gates, activePixels };
+}
+
+export function inclusionMaskAllows(inclusionMask, width, x, y) {
   if (!inclusionMask?.data || !inclusionMask?.columns) return true;
   const column = Math.round(x);
   const row = Math.round(y);
+  if (column < 0 || column >= width || row < 0 || row >= inclusionMask.data.length / width) return false;
+  if (inclusionMask.allowed) return Boolean(inclusionMask.allowed[row * width + column]);
   if (!inclusionMask.columns[column]) return true;
   return Boolean(inclusionMask.data[row * width + column]);
 }
@@ -369,11 +1027,11 @@ function inclusionMaskAllows(inclusionMask, width, x, y) {
 function inclusionRunsAt(inclusionMask, width, x, top, bottom) {
   if (!inclusionMask?.data || !inclusionMask?.columns) return [];
   const column = Math.round(x);
-  if (!inclusionMask.columns[column]) return [];
+  if (!inclusionMask.allowed && !inclusionMask.columns[column]) return [];
   const runs = [];
   let start = null;
   for (let y = top; y <= bottom; y += 1) {
-    const allowed = Boolean(inclusionMask.data[y * width + column]);
+    const allowed = Boolean((inclusionMask.allowed ?? inclusionMask.data)[y * width + column]);
     if (allowed && start === null) start = y;
     if (!allowed && start !== null) {
       runs.push({ start, end: y - 1, center: (start + y - 1) / 2 });
@@ -385,6 +1043,11 @@ function inclusionRunsAt(inclusionMask, width, x, top, bottom) {
 }
 
 function nearestInclusionRun(inclusionMask, width, x, y, top, bottom) {
+  // Outside a local assistance region, do not bias the curve towards the
+  // centre of the image as though the entire image were a painted stroke.
+  if (inclusionMask?.allowed && inclusionMask.mode === "local"
+    && !inclusionMask.data[Math.round(y) * width + Math.round(x)]
+    && inclusionMaskAllows(inclusionMask, width, x, y)) return null;
   const runs = inclusionRunsAt(inclusionMask, width, x, top, bottom);
   if (!runs.length) return null;
   return runs
@@ -396,6 +1059,61 @@ function nearestInclusionRun(inclusionMask, width, x, y, top, bottom) {
     .sort((left, right) => left.distance - right.distance || left.centerDistance - right.centerDistance)[0];
 }
 
+function inclusionRunsAtRow(inclusionMask, width, row, left, right) {
+  if (!inclusionMask?.data) return [];
+  const runs = [];
+  let start = null;
+  for (let x = left; x <= right; x += 1) {
+    const allowed = Boolean((inclusionMask.allowed ?? inclusionMask.data)[row * width + x]);
+    if (allowed && start === null) start = x;
+    if (!allowed && start !== null) {
+      runs.push({ start, end: x - 1, center: (start + x - 1) / 2 });
+      start = null;
+    }
+  }
+  if (start !== null) runs.push({ start, end: right, center: (start + right) / 2 });
+  return runs;
+}
+
+function nearestInclusionRunAtRow(inclusionMask, width, y, x, left, right) {
+  const runs = inclusionRunsAtRow(inclusionMask, width, y, left, right);
+  if (!runs.length) return null;
+  return runs
+    .map((run) => ({
+      ...run,
+      distance: x < run.start ? run.start - x : x > run.end ? x - run.end : 0,
+      centerDistance: Math.abs(x - run.center),
+    }))
+    .sort((leftRun, rightRun) => (
+      leftRun.distance - rightRun.distance || leftRun.centerDistance - rightRun.centerDistance
+    ))[0];
+}
+
+function nearestInclusionPixel(inclusionMask, width, height, x, y, rect, maximumRadius = 1.5) {
+  const allowed = inclusionMask.allowed ?? inclusionMask.data;
+  const column = Math.round(x);
+  const row = Math.round(y);
+  if (column >= 0 && column < width && row >= 0 && row < height
+    && allowed[row * width + column]) {
+    return { x, y, distance: 0 };
+  }
+  const radius = Math.ceil(maximumRadius);
+  const left = Math.max(0, Math.round(rect.left), column - radius);
+  const right = Math.min(width - 1, Math.round(rect.right), column + radius);
+  const top = Math.max(0, Math.round(rect.top), row - radius);
+  const bottom = Math.min(height - 1, Math.round(rect.bottom), row + radius);
+  let nearest = null;
+  for (let sampleY = top; sampleY <= bottom; sampleY += 1) {
+    for (let sampleX = left; sampleX <= right; sampleX += 1) {
+      if (!allowed[sampleY * width + sampleX]) continue;
+      const distance = Math.hypot(sampleX - x, sampleY - y);
+      if (distance > maximumRadius) continue;
+      if (!nearest || distance < nearest.distance) nearest = { x: sampleX, y: sampleY, distance };
+    }
+  }
+  return nearest;
+}
+
 /**
  * Enforce a user-painted inclusion corridor on every non-anchor path point.
  * Candidate filtering alone is insufficient because inferred gaps, polynomial
@@ -404,25 +1122,69 @@ function nearestInclusionRun(inclusionMask, width, x, y, top, bottom) {
 export function constrainPathToInclusionMask(path, {
   inclusionMask = null,
   width,
+  height = null,
   rect,
+  orientation = "horizontal",
+  maximumCorrection = 1.5,
 } = {}) {
   if (!Array.isArray(path) || !path.length) return [];
   if (!inclusionMask?.data || !inclusionMask?.columns || !Number.isFinite(width) || !rect) return path;
   const top = Math.round(rect.top);
   const bottom = Math.round(rect.bottom);
+  const left = Math.round(rect.left);
+  const right = Math.round(rect.right);
   return path.map((point) => {
-    if (point.anchor || point.userGuided || !Number.isFinite(point.x) || !Number.isFinite(point.y)) return point;
-    const column = Math.round(point.x);
-    if (!inclusionMask.columns[column]) return point;
-    const run = nearestInclusionRun(inclusionMask, width, column, point.y, top, bottom);
-    if (!run || run.distance === 0) return point;
-    const y = clamp(point.y, run.start, run.end);
-    return {
-      ...point,
-      y,
-      corridorConstrained: true,
-      confidence: Math.min(point.confidence ?? 1, 0.55),
+    if (point.anchor || point.userGuided) return point;
+    const clean = { ...point };
+    delete clean.corridorOutside;
+    if (!Number.isFinite(point.x) || !Number.isFinite(point.y)) return { ...clean, corridorOutside: true };
+    const corrected = (x, y) => {
+      const displacement = Math.hypot(x - point.x, y - point.y);
+      if (displacement > maximumCorrection) return { ...clean, corridorOutside: true };
+      return {
+        ...clean, x, y,
+        observed: false,
+        imageObserved: false,
+        centerRefined: false,
+        corridorConstrained: true,
+        corridorCorrectionPx: Math.max(clean.corridorCorrectionPx ?? 0, displacement),
+        uncertaintyPx: Math.max(clean.uncertaintyPx ?? 0, displacement),
+        inferenceUncertainty: Math.max(clean.inferenceUncertainty ?? 0, displacement),
+        confidence: Math.min(clean.confidence ?? 1, 0.45),
+      };
     };
+    if (inclusionMask.allowed || orientation === "parametric") {
+      const maskHeight = Number.isFinite(height) ? height : inclusionMask.data.length / width;
+      const nearest = nearestInclusionPixel(
+        inclusionMask,
+        width,
+        maskHeight,
+        point.x,
+        point.y,
+        rect,
+        maximumCorrection,
+      );
+      if (!nearest) return { ...clean, corridorOutside: true };
+      if (nearest.distance === 0) return clean;
+      return corrected(nearest.x, nearest.y);
+    }
+    if (orientation === "vertical") {
+      const row = Math.round(point.y);
+      if (row < 0 || (Number.isFinite(height) && row >= height)) return clean;
+      const rowConstrained = inclusionMask.rows
+        ? Boolean(inclusionMask.rows[row])
+        : inclusionRunsAtRow(inclusionMask, width, row, left, right).length > 0;
+      if (!rowConstrained) return clean;
+      const run = nearestInclusionRunAtRow(inclusionMask, width, row, point.x, left, right);
+      if (!run || run.distance === 0) return clean;
+      return corrected(clamp(point.x, run.start, run.end), point.y);
+    }
+    const column = Math.round(point.x);
+    if (!inclusionMask.columns[column]) return clean;
+    const run = nearestInclusionRun(inclusionMask, width, column, point.y, top, bottom);
+    if (!run || run.distance === 0) return clean;
+    const y = clamp(point.y, run.start, run.end);
+    return corrected(point.x, y);
   });
 }
 
@@ -501,6 +1263,29 @@ function candidateThicknessPenalty(candidate, targetStyle, scale = 1) {
 function candidateCorridorPenalty(candidate) {
   if (!Number.isFinite(candidate.corridorHalfWidth) || candidate.corridorHalfWidth <= 0) return 0;
   return (candidate.corridorCenterDistance / candidate.corridorHalfWidth) * 0.9;
+}
+
+function exclusionCoversColumn(exclusions, x, y, padding = 2) {
+  return (exclusions ?? []).some((area) => (
+    x >= area.left && x <= area.right
+    && y >= area.top - padding && y <= area.bottom + padding
+  ));
+}
+
+function exclusionBridgeBetween(exclusions, from, to, padding = 3) {
+  if (!from || !to || Math.abs(to.x - from.x) <= 1) return null;
+  const leftX = Math.min(from.x, to.x) + 1;
+  const rightX = Math.max(from.x, to.x) - 1;
+  return (exclusions ?? []).find((area) => {
+    // Candidate columns are integer-valued, while a dragged mask may retain
+    // subpixel edges. Match the same integer coverage used when candidates
+    // are excluded: ceil(left) through floor(right), inclusive.
+    const maskedLeft = Math.ceil(area.left);
+    const maskedRight = Math.floor(area.right);
+    return maskedLeft <= leftX && maskedRight >= rightX
+      && from.y >= area.top - padding && from.y <= area.bottom + padding
+      && to.y >= area.top - padding && to.y <= area.bottom + padding;
+  }) ?? null;
 }
 
 function targetPixelPresent(options, x, y, radius = 2) {
@@ -587,6 +1372,7 @@ function measureStrokePattern(options, point, slope = 0, scanRadius = 64) {
     medianInkLength: median(usefulRuns.length ? usefulRuns : [localRun.length]),
     gapLength: median(gaps),
     gapLengths: gaps,
+    coverage: samples.filter(Boolean).length / samples.length,
   };
 }
 
@@ -648,11 +1434,16 @@ export function inferLineStyle({
   const minimumInk = inkRuns.length ? Math.min(...inkRuns) : medianInk;
   const maximumInk = inkRuns.length ? Math.max(...inkRuns) : medianInk;
   const pattern = { inkRuns, gapRuns, coverage, medianInk, medianGap, minimumInk, maximumInk };
-  if (inkRuns.length < 3 || gapRuns.length < 2 || medianGap < 2 || coverage > 0.82) {
+  const dominantContinuousRun = maximumInk >= scanRadius * 0.7
+    && maximumInk >= Math.max(12, medianInk * 5);
+  if (dominantContinuousRun) {
+    return { style: "line", confidence: 0.68, slope, pattern, reason: "dominant-continuous-run" };
+  }
+  if (inkRuns.length < 3 || gapRuns.length < 2 || medianGap < 1.25 || coverage > 0.82) {
     return { style: "line", confidence: clamp(coverage, 0.55, 0.98), slope, pattern };
   }
   const periodicConfidence = clamp((gapRuns.length / 5) * (1 - coverage) * 2.2, 0.55, 0.97);
-  if (medianInk <= 4 && maximumInk <= 7) {
+  if (medianInk <= 5.5 && maximumInk <= 12) {
     return { style: "dotted", confidence: periodicConfidence, slope, pattern };
   }
   const lengthContrast = maximumInk / Math.max(1, minimumInk);
@@ -698,9 +1489,13 @@ function patternedLinePenalty(options, candidate, x, slope = 0) {
     inkCost = ratioDistance(pattern.inkLength, reference.inkLength);
   }
   const gapCost = ratioDistance(pattern.gapLength, reference.gapLength);
-  const severeMismatch = inkCost > 1.25 || gapCost > 1.5 || structureCost > 1;
+  const coverageExcess = Math.max(0, pattern.coverage - (reference.coverage ?? pattern.coverage));
+  const severeMismatch = inkCost > 1.25
+    || gapCost > 1.5
+    || structureCost > 1
+    || pattern.coverage > Math.max(0.84, (reference.coverage ?? 0) + 0.42);
   if (severeMismatch) return Infinity;
-  return inkCost * 5 + gapCost * 2.4 + structureCost * 5;
+  return inkCost * 5 + gapCost * 2.4 + structureCost * 5 + coverageExcess * 12;
 }
 
 function buildStyleReference(options, point, slope = 0) {
@@ -855,13 +1650,18 @@ function traceDirection({
     }
 
     if (!best) {
-      gap += 1;
+      // A user mask is explicit evidence that missing target pixels are caused
+      // by an occluder. Do not spend the ordinary dash-gap budget while the
+      // predicted trajectory remains inside that mask; resume searching on
+      // its far side instead of terminating the whole tail.
+      if (!exclusionCoversColumn(exclusions, x, predictedY)) gap += 1;
       if (gap > maxGap) break;
       continue;
     }
 
-    if (gap > 0) {
-      const span = Math.abs(x - lastObserved.x);
+    const span = Math.abs(x - lastObserved.x);
+    const occlusionBridge = exclusionBridgeBetween(exclusions, lastObserved, { x, y: best.y });
+    if (span > 1) {
       for (let offset = 1; offset < span; offset += 1) {
         const fraction = offset / span;
         points.push({
@@ -869,6 +1669,7 @@ function traceDirection({
           y: lastObserved.y + (best.y - lastObserved.y) * fraction,
           observed: false,
           confidence: 0.35,
+          occlusionMasked: Boolean(occlusionBridge),
         });
       }
     }
@@ -888,6 +1689,8 @@ function traceDirection({
       candidateCount: candidates.length,
       thickness: best.thickness,
       sharedWithSavedCurve: best.avoidance.overlaps,
+      reconnectedAfterOcclusion: Boolean(occlusionBridge),
+      occlusionBridgeSpan: occlusionBridge ? span - 1 : 0,
     };
     points.push(point);
     previousObserved = lastObserved;
@@ -952,8 +1755,12 @@ export function traceCurve({
   if (Number.isFinite(options.styleReference?.gapLength)) {
     options.maxGap = Math.max(options.maxGap, Math.ceil(options.styleReference.gapLength) + 2);
   }
-  const left = traceDirection({ ...options, direction: -1 }).reverse();
-  const right = traceDirection({ ...options, direction: 1 });
+  // Patterned styles already use a measured dash fingerprint and deliberate
+  // gaps; their specialised directional tracker is more selective. Continuous
+  // and auto modes benefit from keeping whole-tail branch hypotheses.
+  const traceTail = isPatternedLineStyle(options.targetStyle) ? traceDirection : multiHypothesisTraceDirection;
+  const left = traceTail({ ...options, direction: -1 }).reverse();
+  const right = traceTail({ ...options, direction: 1 });
   return [...left, safeSeed, ...right];
 }
 
@@ -969,6 +1776,9 @@ function fillPathGaps(points) {
       continue;
     }
     const span = current.x - previous.x;
+    const occlusionBridge = Boolean(
+      current.reconnectedAfterOcclusion || previous.reconnectedAfterOcclusion,
+    ) && Math.max(current.occlusionBridgeSpan ?? 0, previous.occlusionBridgeSpan ?? 0) >= span - 1;
     for (let offset = 1; offset < span; offset += 1) {
       const fraction = offset / span;
       result.push({
@@ -978,6 +1788,7 @@ function fillPathGaps(points) {
         confidence: 0.25,
         candidateCount: 0,
         thickness: 0,
+        occlusionMasked: occlusionBridge,
       });
     }
     result.push(current);
@@ -1051,7 +1862,219 @@ function candidateToPoint(candidate, x, threshold, candidateCount, targetStyle =
   };
 }
 
-function globalGuidedSegment(options, start, end) {
+function attachCandidateAmbiguity(point, candidates, selectedCandidate, maximumSeparation = Infinity) {
+  if (!point || !Array.isArray(candidates) || candidates.length < 2) return point;
+  const selectedY = Number(selectedCandidate?.y ?? point.y);
+  const selectedThickness = Math.max(1, Number(selectedCandidate?.thickness ?? point.thickness ?? 1));
+  const alternatives = candidates
+    .filter((candidate) => candidate !== selectedCandidate && Number.isFinite(candidate?.y))
+    .map((candidate) => ({
+      y: Number(candidate.y),
+      separation: Math.abs(Number(candidate.y) - selectedY),
+      thickness: Math.max(1, Number(candidate.thickness ?? 1)),
+    }))
+    .filter((candidate) => (
+      candidate.separation > Math.max(2, (selectedThickness + candidate.thickness) * 0.3)
+      && candidate.separation <= maximumSeparation
+    ))
+    .sort((left, right) => left.separation - right.separation)
+    .slice(0, 4);
+  if (!alternatives.length) return point;
+  point.ambiguityAlternatives = alternatives.map((candidate) => candidate.y);
+  point.ambiguitySeparation = alternatives[0].separation;
+  point.ambiguitySpread = Math.max(
+    ...alternatives.map((candidate) => candidate.separation),
+  );
+  return point;
+}
+
+/**
+ * Trace an unconstrained tail with a small Viterbi-style beam. Keeping several
+ * slope histories for the same raster candidate is important at crossings:
+ * the pixels may merge for a few columns, but evidence after the crossing can
+ * still resolve which incoming trajectory should be continued.
+ */
+function globalTraceDirection({
+  rgba,
+  width,
+  rect,
+  seed,
+  target,
+  threshold,
+  maxJump,
+  maxGap,
+  direction,
+  limit = null,
+  exclusions = [],
+  targetStyle = "auto",
+  styleReference = null,
+  strokePatternCache = null,
+  initialSlope = null,
+  avoidanceByX = null,
+  avoidanceRadius = 3,
+  inclusionMask = null,
+}) {
+  const options = {
+    rgba,
+    width,
+    rect,
+    target,
+    threshold,
+    maxJump,
+    maxGap,
+    exclusions,
+    targetStyle,
+    styleReference,
+    strokePatternCache,
+    avoidanceByX,
+    avoidanceRadius,
+    inclusionMask,
+  };
+  const startX = Math.round(seed.x);
+  const xLimit = limit ?? (direction > 0 ? rect.right : rect.left);
+  const noisyMode = targetStyle === "noisy";
+  let states = [{
+    x: startX,
+    y: seed.y,
+    slope: Number.isFinite(initialSlope) ? initialSlope : null,
+    trendSlope: Number.isFinite(initialSlope) ? initialSlope : null,
+    cost: 0,
+    previous: null,
+    point: { ...seed, x: startX, anchor: true },
+  }];
+
+  for (let x = startX + direction; direction > 0 ? x <= xLimit : x >= xLimit; x += direction) {
+    const candidates = clusterColumnCandidates(
+      rgba,
+      width,
+      x,
+      rect.top,
+      rect.bottom,
+      target,
+      threshold,
+      exclusions,
+      inclusionMask,
+    );
+    if (!candidates.length) continue;
+
+    const nextStates = [];
+    for (const candidate of candidates) {
+      const candidateStates = [];
+      for (const previous of states) {
+        const dx = Math.abs(x - previous.x);
+        const occlusionBridge = exclusionBridgeBetween(exclusions, previous, { x, y: candidate.y });
+        if (dx > maxGap + 1 && !occlusionBridge) continue;
+        const slope = (candidate.y - previous.y) / Math.max(1, x - previous.x);
+        const recentSlope = previous.slope ?? slope;
+        const trendSlope = previous.trendSlope ?? recentSlope;
+        const predictionSlope = recentSlope * (noisyMode ? 0.24 : 0.68)
+          + trendSlope * (noisyMode ? 0.08 : 0.32);
+        const predictedY = previous.y + predictionSlope * (x - previous.x);
+        const jump = Math.abs(candidate.y - predictedY);
+        const allowedJump = maxJump * (noisyMode ? 1.6 : 1) * Math.max(1, dx);
+        if (jump > allowedJump) continue;
+
+        const avoidance = candidateAvoidance(options, candidate, x);
+        if (avoidance.overlaps && jump > Math.max(3, maxJump * 0.42 * Math.max(1, dx))) continue;
+        const styleCost = patternedLinePenalty(options, candidate, x, predictionSlope);
+        if (!Number.isFinite(styleCost)) continue;
+        const colorCost = threshold > 0 ? candidate.distance / threshold : 0;
+        const curvature = Math.abs(slope - recentSlope);
+        const trendDeparture = Math.abs(slope - trendSlope);
+        const cost = previous.cost
+          + colorCost * 2.8
+          + candidateThicknessPenalty(candidate, targetStyle, 0.8)
+          + styleCost
+          + candidateCorridorPenalty(candidate)
+          + avoidance.penalty
+          + jump * (noisyMode ? 0.035 : 0.11)
+          + Math.min(20, curvature) * (noisyMode ? 0.1 : 0.64)
+          + Math.min(20, trendDeparture) * (noisyMode ? 0.025 : 0.09)
+          + Math.max(0, dx - 1) * (isPatternedLineStyle(targetStyle) ? 0.1 : 0.22);
+        const point = candidateToPoint(candidate, x, threshold, candidates.length, targetStyle);
+        point.confidence *= candidates.length > 1 ? 0.86 : 1;
+        point.sharedWithSavedCurve = avoidance.overlaps;
+        point.globalHypothesis = true;
+        point.reconnectedAfterOcclusion = Boolean(occlusionBridge);
+        point.occlusionBridgeSpan = occlusionBridge ? dx - 1 : 0;
+        candidateStates.push({
+          x,
+          y: candidate.y,
+          slope,
+          trendSlope: trendSlope * (noisyMode ? 0.7 : 0.94) + slope * (noisyMode ? 0.3 : 0.06),
+          cost,
+          previous,
+          point,
+        });
+      }
+      // Preserve several arrival histories at a merged candidate rather than
+      // collapsing immediately to the locally cheapest branch.
+      candidateStates.sort((left, right) => left.cost - right.cost);
+      nextStates.push(...candidateStates.slice(0, 6));
+    }
+    if (nextStates.length) {
+      const viableCandidates = [...new Map(nextStates.map((state) => [
+        state.y,
+        { y: state.y, thickness: state.point.thickness },
+      ])).values()];
+      for (const state of nextStates) {
+        attachCandidateAmbiguity(
+          state.point,
+          viableCandidates,
+          viableCandidates.find((candidate) => candidate.y === state.y),
+          Math.max(8, maxJump * 2.5),
+        );
+      }
+      nextStates.sort((left, right) => left.cost - right.cost);
+      states = nextStates.slice(0, 180);
+    }
+  }
+
+  if (!states.length) return traceDirection({ ...options, seed, direction, limit, initialSlope });
+  let cursor = states.sort((left, right) => left.cost - right.cost)[0];
+  const points = [];
+  while (cursor?.previous) {
+    points.push(cursor.point);
+    cursor = cursor.previous;
+  }
+  if (!points.length) return traceDirection({ ...options, seed, direction, limit, initialSlope });
+  return fillPathGaps(points.reverse());
+}
+
+function multiHypothesisTraceDirection(options) {
+  const globalPath = globalTraceDirection(options);
+  const limit = options.limit
+    ?? (options.direction > 0 ? options.rect.right : options.rect.left);
+  const globalEnd = globalPath.at(-1)?.x ?? Math.round(options.seed.x);
+  if (Math.abs(limit - globalEnd) <= 1) return globalPath;
+
+  // Highly discontinuous/noisy evidence can exhaust every beam. Preserve the
+  // established local behaviour when it reaches materially farther, rather
+  // than turning a global optimisation failure into a truncated curve.
+  const localPath = traceDirection(options);
+  const localEnd = localPath.at(-1)?.x ?? Math.round(options.seed.x);
+  return Math.abs(limit - localEnd) < Math.abs(limit - globalEnd) ? localPath : globalPath;
+}
+
+function hermiteGuideY(start, end, entrySlope, exitSlope, x) {
+  const span = Math.max(1, end.x - start.x);
+  const t = clamp((x - start.x) / span, 0, 1);
+  const t2 = t * t;
+  const t3 = t2 * t;
+  const h00 = 2 * t3 - 3 * t2 + 1;
+  const h10 = t3 - 2 * t2 + t;
+  const h01 = -2 * t3 + 3 * t2;
+  const h11 = t3 - t2;
+  return h00 * start.y
+    + h10 * span * entrySlope
+    + h01 * end.y
+    + h11 * span * exitSlope;
+}
+
+function globalGuidedSegment(options, start, end, {
+  entrySlope = null,
+  exitSlope = null,
+} = {}) {
   if (start.x === end.x) return [{ ...start, anchor: true }];
   const leftAnchor = start.x < end.x ? start : end;
   const rightAnchor = start.x < end.x ? end : start;
@@ -1060,10 +2083,15 @@ function globalGuidedSegment(options, start, end) {
   const horizontalSpan = Math.max(1, rightX - leftX);
   const guideTolerance = clamp(horizontalSpan * 0.045, 4, 14);
   const noisyMode = options.targetStyle === "noisy";
+  const preserveTrajectoryHistory = !isPatternedLineStyle(options.targetStyle);
+  const chordSlope = (rightAnchor.y - leftAnchor.y) / horizontalSpan;
+  const safeEntrySlope = Number.isFinite(entrySlope) ? entrySlope : chordSlope;
+  const safeExitSlope = Number.isFinite(exitSlope) ? exitSlope : chordSlope;
   let states = [{
     x: leftX,
     y: leftAnchor.y,
-    slope: null,
+    slope: preserveTrajectoryHistory ? safeEntrySlope : null,
+    trendSlope: preserveTrajectoryHistory ? safeEntrySlope : null,
     cost: 0,
     previous: null,
     point: { ...leftAnchor, x: leftX, anchor: true },
@@ -1091,14 +2119,28 @@ function globalGuidedSegment(options, start, end) {
       const candidateStates = [];
       for (const previous of states) {
         const dx = x - previous.x;
+        const occlusionBridge = exclusionBridgeBetween(
+          options.exclusions,
+          previous,
+          { x, y: candidate.y },
+        );
         // Strict mode lets an explicit anchor bridge a gap longer than the
         // ordinary pixel evidence allows. Flexible mode falls back to the
         // bidirectional guided segment, which still retains both anchors.
-        if (dx > options.maxGap + 1 && !(candidate.anchor && options.strictGuideCorridor)) continue;
+        if (
+          dx > options.maxGap + 1
+          && !(candidate.anchor && options.strictGuideCorridor)
+          && !occlusionBridge
+        ) continue;
         const slope = (candidate.y - previous.y) / dx;
+        const recentSlope = previous.slope ?? slope;
+        const trendSlope = previous.trendSlope ?? recentSlope;
+        const predictionSlope = preserveTrajectoryHistory
+          ? recentSlope * (noisyMode ? 0.24 : 0.68) + trendSlope * (noisyMode ? 0.08 : 0.32)
+          : recentSlope;
         const predictedY = previous.slope === null
           ? previous.y
-          : previous.y + previous.slope * dx * (noisyMode ? 0.25 : 1);
+          : previous.y + predictionSlope * dx;
         const avoidance = candidateAvoidance(options, candidate, x);
         if (
           avoidance.overlaps
@@ -1109,13 +2151,22 @@ function globalGuidedSegment(options, start, end) {
           Math.abs(candidate.y - predictedY) > options.maxJump * (noisyMode ? 1.6 : 1) * Math.max(1, dx)
           && !(candidate.anchor && options.strictGuideCorridor)
         ) continue;
-        const curvature = previous.slope === null ? 0 : Math.abs(slope - previous.slope);
+        const curvature = Math.abs(slope - recentSlope);
+        const trendDeparture = Math.abs(slope - trendSlope);
         const colorCost = options.threshold > 0 ? candidate.distance / options.threshold : 0;
         const thicknessCost = candidateThicknessPenalty(candidate, options.targetStyle, 0.75);
         const styleCost = candidate.anchor ? 0 : patternedLinePenalty(options, candidate, x, slope);
         if (!Number.isFinite(styleCost)) continue;
         const guideFraction = (x - leftX) / horizontalSpan;
-        const guideY = leftAnchor.y + guideFraction * (rightAnchor.y - leftAnchor.y);
+        const guideY = options.strictGuideCorridor || preserveTrajectoryHistory
+          ? hermiteGuideY(
+              { ...leftAnchor, x: leftX },
+              { ...rightAnchor, x: rightX },
+              safeEntrySlope,
+              safeExitSlope,
+              x,
+            )
+          : leftAnchor.y + guideFraction * (rightAnchor.y - leftAnchor.y);
         const guideDeviation = Math.abs(candidate.y - guideY);
         // A same-color neighboring branch should be treated as "no target
         // pixels here", not as evidence that the requested curve jumped. The
@@ -1130,11 +2181,15 @@ function globalGuidedSegment(options, start, end) {
           + avoidance.penalty
           + Math.abs(slope) * (noisyMode ? 0.012 : 0.035)
           + Math.min(20, curvature) * (noisyMode ? 0.12 : 0.72)
+          + (preserveTrajectoryHistory ? Math.min(20, trendDeparture) * (noisyMode ? 0.025 : 0.09) : 0)
           + Math.max(0, dx - 1) * 0.11
           // Strict mode rejects remote same-color branches and favors the
           // anchor corridor. Flexible mode still passes through every anchor,
           // but does not linearize naturally curved intervals between them.
-          + (options.strictGuideCorridor ? guideDeviation * 0.28 : 0);
+          + (options.strictGuideCorridor
+            ? guideDeviation * 0.28
+            : guideDeviation * (preserveTrajectoryHistory && candidates.length > 1 ? 0.045 : 0))
+          + (candidate.anchor && preserveTrajectoryHistory ? Math.abs(slope - safeExitSlope) * 0.32 : 0);
         const point = candidate.anchor
           ? { ...rightAnchor, x, anchor: true }
           : candidateToPoint(candidate, x, options.threshold, candidates.length, options.targetStyle);
@@ -1142,21 +2197,39 @@ function globalGuidedSegment(options, start, end) {
           point.confidence *= avoidance.overlaps ? 0.72 : 1;
           point.sharedWithSavedCurve = avoidance.overlaps;
         }
+        point.reconnectedAfterOcclusion = Boolean(occlusionBridge);
+        point.occlusionBridgeSpan = occlusionBridge ? dx - 1 : 0;
         candidateStates.push({
           x,
           y: candidate.y,
           slope,
+          trendSlope: preserveTrajectoryHistory
+            ? trendSlope * (noisyMode ? 0.7 : 0.94) + slope * (noisyMode ? 0.3 : 0.06)
+            : null,
           cost,
           previous,
           point,
         });
       }
       candidateStates.sort((a, b) => a.cost - b.cost);
-      nextStates.push(...candidateStates.slice(0, 3));
+      nextStates.push(...candidateStates.slice(0, preserveTrajectoryHistory ? 6 : 3));
     }
     if (nextStates.length) {
+      const viableCandidates = [...new Map(nextStates.map((state) => [
+        state.y,
+        { y: state.y, thickness: state.point.thickness },
+      ])).values()];
+      for (const state of nextStates) {
+        if (state.point.anchor) continue;
+        attachCandidateAmbiguity(
+          state.point,
+          viableCandidates,
+          viableCandidates.find((candidate) => candidate.y === state.y),
+          Math.max(8, options.maxJump * 2.5),
+        );
+      }
       nextStates.sort((a, b) => a.cost - b.cost);
-      states = nextStates.slice(0, 120);
+      states = nextStates.slice(0, preserveTrajectoryHistory ? 180 : 120);
     }
   }
 
@@ -1171,7 +2244,7 @@ function globalGuidedSegment(options, start, end) {
   return fillPathGaps(points.reverse());
 }
 
-function guidedSegment(options, start, end) {
+function guidedSegment(options, start, end, context = {}) {
   // A manually placed guide with no matching target-colored pixel is an
   // explicit statement about a hidden curve. Automatically constrain only the
   // adjacent segment, so the user does not also have to find the advanced
@@ -1179,8 +2252,43 @@ function guidedSegment(options, start, end) {
   const localOptions = start.occlusionGuide || end.occlusionGuide
     ? { ...options, strictGuideCorridor: true }
     : options;
-  return globalGuidedSegment(localOptions, start, end)
+  return globalGuidedSegment(localOptions, start, end, context)
     ?? greedyGuidedSegment(localOptions, start, end);
+}
+
+function hasPersistentGuideCompetition({
+  rgba,
+  width,
+  rect,
+  anchors,
+  target,
+  threshold,
+  exclusions,
+  inclusionMask,
+}) {
+  const left = Math.max(rect.left, Math.round(Math.min(...anchors.map((anchor) => anchor.x))));
+  const right = Math.min(rect.right, Math.round(Math.max(...anchors.map((anchor) => anchor.x))));
+  const step = Math.max(1, Math.floor((right - left + 1) / 96));
+  let sampledColumns = 0;
+  let competingColumns = 0;
+  for (let x = left; x <= right; x += step) {
+    const candidates = clusterColumnCandidates(
+      rgba,
+      width,
+      x,
+      rect.top,
+      rect.bottom,
+      target,
+      threshold,
+      exclusions,
+      inclusionMask,
+    );
+    sampledColumns += 1;
+    if (candidates.some((candidate, index) => candidates.slice(index + 1).some((other) => (
+      Math.abs(candidate.y - other.y) >= Math.max(3, (candidate.thickness + other.thickness) / 2)
+    )))) competingColumns += 1;
+  }
+  return competingColumns >= Math.max(3, Math.ceil(sampledColumns * 0.08));
 }
 
 export function traceCurveThroughAnchors({
@@ -1273,6 +2381,19 @@ export function traceCurveThroughAnchors({
     });
   }
 
+  const automaticStrictGuidance = isPatternedLineStyle(targetStyle)
+    && uniqueAnchors.length >= 3
+    && hasPersistentGuideCompetition({
+      rgba,
+      width,
+      rect: safeRect,
+      anchors: uniqueAnchors,
+      target,
+      threshold,
+      exclusions,
+      inclusionMask,
+    });
+
   const options = {
     rgba,
     width,
@@ -1283,7 +2404,10 @@ export function traceCurveThroughAnchors({
     maxGap,
     exclusions,
     targetStyle,
-    strictGuideCorridor: Boolean(strictGuideCorridor),
+    strictGuideCorridor: Boolean(
+      strictGuideCorridor
+      || automaticStrictGuidance
+    ),
     avoidanceByX: buildAvoidanceByX(avoidPaths, safeRect),
     avoidanceRadius,
     inclusionMask,
@@ -1323,7 +2447,18 @@ export function traceCurveThroughAnchors({
   let result = [...leftTail];
 
   for (let index = 1; index < uniqueAnchors.length; index += 1) {
-    const segment = guidedSegment(options, uniqueAnchors[index - 1], uniqueAnchors[index]);
+    const start = uniqueAnchors[index - 1];
+    const end = uniqueAnchors[index];
+    const before = uniqueAnchors[index - 2];
+    const after = uniqueAnchors[index + 1];
+    const chordSlope = (end.y - start.y) / Math.max(1, end.x - start.x);
+    const entrySlope = before
+      ? (end.y - before.y) / Math.max(1, end.x - before.x)
+      : chordSlope;
+    const exitSlope = after
+      ? (after.y - start.y) / Math.max(1, after.x - start.x)
+      : chordSlope;
+    const segment = guidedSegment(options, start, end, { entrySlope, exitSlope });
     if (result.length && segment.length && result.at(-1).x === segment[0].x) segment.shift();
     result.push(...segment);
   }
@@ -1651,7 +2786,55 @@ function createGapModels({
         + (3 * fraction ** 2 - 2 * fraction) * gapSpan * rightModel.slope) / gapSpan;
     },
   };
-  const models = [linear, hermite];
+  const supportSpan = Math.max(1, Math.min(
+    leftBoundary.x - support[0].x,
+    support.at(-1).x - rightBoundary.x,
+  ));
+  const supportReliability = clamp(supportSpan / Math.max(4, gapSpan * 0.7), 0, 1)
+    * clamp(1 - Math.max(leftModel.residual, rightModel.residual) / 4, 0.2, 1);
+  const tangentWeight = clamp(0.3 + supportReliability * 0.62, 0.3, 0.92);
+  // Shrink only the slope departure from the endpoint chord. This preserves
+  // the exact boundary values and the broad trend while preventing noisy
+  // one-sided slopes from creating a large cubic overshoot in a long gap.
+  const maximumSlopeDeparture = Math.max(0.35, Math.abs(chordSlope) * 1.5, 30 / gapSpan);
+  const regularizedLeftSlope = chordSlope + clamp(
+    (leftModel.slope - chordSlope) * tangentWeight,
+    -maximumSlopeDeparture,
+    maximumSlopeDeparture,
+  );
+  const regularizedRightSlope = chordSlope + clamp(
+    (rightModel.slope - chordSlope) * tangentWeight,
+    -maximumSlopeDeparture,
+    maximumSlopeDeparture,
+  );
+  const regularizedSmooth = {
+    name: "regularized-smooth",
+    // Prefer the regularized bridge when endpoint evidence is short or noisy;
+    // on long, clean support it remains a conservative alternative without
+    // diluting a clearly superior Hermite/quadratic continuation.
+    prior: supportReliability < 0.72 ? 1.12 : 0.2,
+    predict(x) {
+      return hermiteGuideY(
+        leftBoundary,
+        rightBoundary,
+        regularizedLeftSlope,
+        regularizedRightSlope,
+        x,
+      );
+    },
+    slope(x) {
+      const fraction = fractionAt(x);
+      return ((6 * fraction ** 2 - 6 * fraction) * leftBoundary.y
+        + (3 * fraction ** 2 - 4 * fraction + 1) * gapSpan * regularizedLeftSlope
+        + (-6 * fraction ** 2 + 6 * fraction) * rightBoundary.y
+        + (3 * fraction ** 2 - 2 * fraction) * gapSpan * regularizedRightSlope) / gapSpan;
+    },
+  };
+  // Short missing runs are normally antialiasing or dash gaps; the extra
+  // regularization is intended for genuinely unsupported occlusion spans.
+  const models = gapSpan >= 16
+    ? [linear, regularizedSmooth, hermite]
+    : [linear, hermite];
   const center = (leftBoundary.x + rightBoundary.x) / 2;
   const scale = Math.max(gapSpan / 2, 1);
   const quadraticTrend = robustQuadraticTrend(support, center, scale);
@@ -1703,10 +2886,10 @@ function scoreGapModel(model, support, {
 
 /**
  * Replace only pixel-unobserved gaps with an evidence-weighted local model
- * ensemble. A conservative line, slope-constrained Hermite curve, and robust
- * quadratic trend compete against reliable pixels on both sides. Disagreement
- * between viable models is propagated into the pixel uncertainty instead of
- * being hidden behind one polynomial choice.
+ * ensemble. A conservative line, regularized smooth bridge, unconstrained
+ * Hermite curve, and robust quadratic trend compete against reliable pixels
+ * on both sides. Disagreement and distance from observed evidence are
+ * propagated into uncertainty instead of being hidden behind one fit.
  */
 export function fitInferredPathGaps(path, {
   rect = null,
@@ -1835,23 +3018,34 @@ export function fitInferredPathGaps(path, {
       const fittedY = prediction.linearY + (prediction.ensembleY - prediction.linearY) * blend;
       const centerWeight = 4 * prediction.fraction * (1 - prediction.fraction);
       const modelResidual = Math.max(leftModel.residual, rightModel.residual);
+      const unsupportedDistance = Math.min(
+        point.x - leftBoundary.x,
+        rightBoundary.x - point.x,
+      );
+      const distanceUncertainty = Math.sqrt(Math.max(0, unsupportedDistance)) * 0.22
+        + unsupportedDistance * (0.012 + modelResidual * 0.008);
       const inferenceUncertainty = clamp(
         typicalThickness * 0.5
           + modelResidual
+          + distanceUncertainty
           + centerWeight * (
             prediction.modelDisagreement * Math.max(0.6, blend)
             + (1 - blend) * allowedDeviation * 0.45
-            + gapSpan * 0.015
+            + gapSpan * 0.012
           ),
         1,
-        18,
+        24,
       );
       refined[prediction.cursor] = {
         ...point,
         y: rect ? clamp(fittedY, rect.top, rect.bottom) : fittedY,
         imageObserved: Boolean(point.observed || point.imageObserved),
         observed: false,
-        confidence: clamp(0.2 + blend * 0.25 / (1 + prediction.modelDisagreement * 0.18), 0.2, 0.45),
+        confidence: clamp(
+          0.5 + blend * 0.08 - inferenceUncertainty * 0.035,
+          0.16,
+          0.45,
+        ),
         occlusionInferred: true,
         inferenceMethod: "adaptive-local-ensemble",
         inferenceModel: dominantModel.name,
@@ -1863,6 +3057,8 @@ export function fitInferredPathGaps(path, {
         modelDisagreement: prediction.modelDisagreement,
         fitBlend: blend,
         fitSupport: leftSupport.length + rightSupport.length,
+        unsupportedDistance,
+        boundedByGuide: Boolean(leftBoundary.anchor || rightBoundary.anchor),
         inferenceUncertainty,
       };
     }
@@ -2435,6 +3631,473 @@ export function extractMarkerCenters({
   return markerCenters;
 }
 
+function consolidateMarkerSeriesCandidates(candidates, seed, seedThickness) {
+  const mergeRadiusX = Math.max(2.5, seedThickness * 0.58);
+  const mergeRadiusY = Math.max(3, seedThickness * 0.9);
+  const ranked = [...candidates].sort((left, right) => {
+    const score = (point) => {
+      const thicknessAgreement = Math.exp(-Math.abs(Math.log(
+        Math.max(0.25, (point.thickness ?? seedThickness) / seedThickness),
+      )) * 1.7);
+      const seedDistance = Math.hypot(point.x - seed.x, point.y - seed.y);
+      const seedBonus = seedDistance <= Math.max(3, seedThickness * 0.8) ? 0.45 : 0;
+      return (point.confidence ?? 0.5) * 0.75 + thicknessAgreement * 0.4 + seedBonus;
+    };
+    return score(right) - score(left) || left.x - right.x;
+  });
+  const selected = [];
+  for (const candidate of ranked) {
+    if (selected.some((point) => (
+      Math.abs(point.x - candidate.x) <= mergeRadiusX
+      && Math.abs(point.y - candidate.y) <= mergeRadiusY
+    ))) continue;
+    selected.push(candidate);
+  }
+  return selected.sort((left, right) => left.x - right.x);
+}
+
+/**
+ * Conservatively decide whether one target click belongs to a repeated marker
+ * series. The clicked marker supplies a local size fingerprint; repeated
+ * candidates must also form a smooth, well-spaced path across the plot. This
+ * keeps ordinary lines on the established line tracer when evidence is weak.
+ */
+export function inferMarkerSeries({
+  rgba,
+  width,
+  height,
+  rect,
+  seed,
+  target,
+  threshold = 42,
+  exclusions = [],
+  inclusionMask = null,
+} = {}) {
+  if (!rgba || rgba.length !== width * height * 4 || !rect || !seed || !target) {
+    return { detected: false, confidence: 0, markers: [], reason: "insufficient-input" };
+  }
+  const rawMarkers = extractMarkerCenters({
+    rgba,
+    width,
+    height,
+    rect,
+    target,
+    threshold,
+    exclusions,
+    anchors: [seed],
+    strictGuideCorridor: false,
+    inclusionMask,
+  });
+  if (rawMarkers.length < 5) {
+    return {
+      detected: false,
+      confidence: 0,
+      markers: [],
+      reason: "too-few-marker-candidates",
+      evidence: { rawCandidates: rawMarkers.length },
+    };
+  }
+  const seedCandidate = [...rawMarkers].sort((left, right) => (
+    Math.hypot(left.x - seed.x, left.y - seed.y) - Math.hypot(right.x - seed.x, right.y - seed.y)
+  ))[0];
+  const seedThickness = Number(seedCandidate?.thickness);
+  const seedDistance = seedCandidate
+    ? Math.hypot(seedCandidate.x - seed.x, seedCandidate.y - seed.y)
+    : Infinity;
+  const strokeDiagnosis = inferLineStyle({
+    rgba,
+    width,
+    height,
+    rect,
+    seed,
+    target,
+    threshold,
+    exclusions,
+  });
+  if (
+    !Number.isFinite(seedThickness)
+    || seedThickness < 7
+    || seedDistance > Math.max(4, seedThickness * 1.05)
+    || strokeDiagnosis.style === "line"
+  ) {
+    return {
+      detected: false,
+      confidence: 0.15,
+      markers: [],
+      reason: "clicked-object-is-not-a-marker-core",
+      evidence: {
+        rawCandidates: rawMarkers.length,
+        seedDistance,
+        seedThickness,
+        strokeFingerprint: strokeDiagnosis.style,
+      },
+    };
+  }
+
+  const boundaryMargin = Math.max(3, seedThickness * 0.42);
+  const shapeFiltered = rawMarkers.filter((point) => (
+    (point.confidence ?? 0) >= 0.76
+    && (point.thickness ?? 0) >= Math.max(3, seedThickness * 0.72)
+    && (point.thickness ?? Infinity) <= seedThickness * 2.05
+    && point.x > rect.left + boundaryMargin
+    && point.x < rect.right - boundaryMargin
+    && point.y > rect.top + boundaryMargin
+    && point.y < rect.bottom - boundaryMargin
+  ));
+  const markers = consolidateMarkerSeriesCandidates(shapeFiltered, seed, seedThickness);
+  if (markers.length < 5) {
+    return {
+      detected: false,
+      confidence: 0.3,
+      markers: [],
+      reason: "too-few-shape-matched-candidates",
+      evidence: { rawCandidates: rawMarkers.length, shapeCandidates: markers.length, seedThickness },
+    };
+  }
+
+  const gaps = markers.slice(1).map((point, index) => point.x - markers[index].x);
+  const medianGap = median(gaps);
+  const regularGapFraction = gaps.filter((gap) => (
+    gap >= medianGap * 0.52 && gap <= medianGap * 1.72
+  )).length / Math.max(1, gaps.length);
+  const slopes = markers.slice(1).map((point, index) => (
+    (point.y - markers[index].y) / Math.max(1, point.x - markers[index].x)
+  ));
+  const slopeChanges = slopes.slice(1).map((slope, index) => Math.abs(slope - slopes[index]));
+  const medianSlopeChange = median(slopeChanges) ?? 0;
+  const smoothness = 1 - clamp(medianSlopeChange / 1.35, 0, 1);
+  const horizontalSpan = (markers.at(-1).x - markers[0].x) / Math.max(1, rect.width);
+  const shapeAgreement = markers.reduce((sum, point) => (
+    sum + Math.exp(-Math.abs(Math.log(
+      Math.max(0.25, (point.thickness ?? seedThickness) / seedThickness),
+    )) * 1.5)
+  ), 0) / markers.length;
+  const countScore = clamp((markers.length - 4) / 7, 0, 1);
+  const spanScore = clamp(horizontalSpan / 0.55, 0, 1);
+  const seedSupport = markers.some((point) => (
+    Math.hypot(point.x - seed.x, point.y - seed.y) <= Math.max(4, seedThickness * 1.05)
+  ));
+  const confidence = clamp(
+    0.12
+      + countScore * 0.18
+      + spanScore * 0.14
+      + regularGapFraction * 0.2
+      + smoothness * 0.15
+      + shapeAgreement * 0.16
+      + (seedSupport ? 0.08 : 0),
+    0,
+    0.98,
+  );
+  const detected = confidence >= 0.78
+    && seedSupport
+    && horizontalSpan >= 0.22
+    && regularGapFraction >= 0.68
+    && smoothness >= 0.7;
+  return {
+    detected,
+    confidence,
+    markers: detected ? markers : [],
+    reason: detected ? "repeated-marker-geometry" : "marker-series-evidence-too-weak",
+    evidence: {
+      rawCandidates: rawMarkers.length,
+      shapeCandidates: markers.length,
+      seedThickness,
+      seedDistance,
+      strokeFingerprint: strokeDiagnosis.style,
+      horizontalSpan,
+      medianGap,
+      regularGapFraction,
+      smoothness,
+      shapeAgreement,
+    },
+  };
+}
+
+function rgbHue(red, green, blue) {
+  const maximum = Math.max(red, green, blue);
+  const minimum = Math.min(red, green, blue);
+  const delta = maximum - minimum;
+  if (delta < 1e-8) return 0;
+  let hue;
+  if (maximum === red) hue = ((green - blue) / delta) % 6;
+  else if (maximum === green) hue = (blue - red) / delta + 2;
+  else hue = (red - green) / delta + 4;
+  return (hue * 60 + 360) % 360;
+}
+
+function circularHueDistance(left, right) {
+  const difference = Math.abs(left - right) % 360;
+  return Math.min(difference, 360 - difference);
+}
+
+function coloredSeriesPixel(red, green, blue, alpha) {
+  if (alpha < 64) return false;
+  const maximum = Math.max(red, green, blue);
+  const minimum = Math.min(red, green, blue);
+  const chroma = maximum - minimum;
+  const luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue;
+  return chroma >= 30
+    && chroma / Math.max(1, maximum) >= 0.18
+    && luminance <= 242;
+}
+
+function insideAnyRectangle(rectangles, x, y, padding = 0) {
+  return (rectangles ?? []).some((rectangle) => (
+    x >= rectangle.left - padding
+    && x <= rectangle.right + padding
+    && y >= rectangle.top - padding
+    && y <= rectangle.bottom + padding
+  ));
+}
+
+function mergeColoredSeriesBins(bins, plotWidth) {
+  const groups = [];
+  const claimed = new Set();
+  for (let start = 0; start < bins.length; start += 1) {
+    if (claimed.has(start)) continue;
+    const indices = [start];
+    claimed.add(start);
+    for (let cursor = 0; cursor < indices.length; cursor += 1) {
+      const sourceIndex = indices[cursor];
+      const source = bins[sourceIndex];
+      for (let candidateIndex = 0; candidateIndex < bins.length; candidateIndex += 1) {
+        if (claimed.has(candidateIndex)) continue;
+        const candidate = bins[candidateIndex];
+        const neighboringHue = circularHueDistance(source.hue, candidate.hue) <= 18;
+        const colorDistance = compositedColorDistance(
+          source.color.r,
+          source.color.g,
+          source.color.b,
+          candidate.color,
+        );
+        if (!neighboringHue || colorDistance > 58) continue;
+        claimed.add(candidateIndex);
+        indices.push(candidateIndex);
+      }
+    }
+    const members = indices.map((index) => bins[index]);
+    const weight = members.reduce((sum, member) => sum + member.weight, 0);
+    const columns = new Uint8Array(plotWidth);
+    for (const member of members) {
+      member.columns.forEach((present, index) => {
+        if (present) columns[index] = 1;
+      });
+    }
+    groups.push({
+      count: members.reduce((sum, member) => sum + member.count, 0),
+      weight,
+      color: {
+        r: Math.round(members.reduce((sum, member) => sum + member.color.r * member.weight, 0) / weight),
+        g: Math.round(members.reduce((sum, member) => sum + member.color.g * member.weight, 0) / weight),
+        b: Math.round(members.reduce((sum, member) => sum + member.color.b * member.weight, 0) / weight),
+        a: 255,
+      },
+      hue: members.reduce((sum, member) => sum + member.hue * member.weight, 0) / weight,
+      minX: Math.min(...members.map((member) => member.minX)),
+      maxX: Math.max(...members.map((member) => member.maxX)),
+      columns,
+    });
+  }
+  return groups;
+}
+
+function reliableColoredSeriesSeed({
+  rgba,
+  width,
+  plotRect,
+  color,
+  exclusions,
+}) {
+  const left = Math.max(0, Math.ceil(plotRect.left + Math.max(3, plotRect.width * 0.025)));
+  const right = Math.min(width - 1, Math.floor(plotRect.right - Math.max(3, plotRect.width * 0.025)));
+  const top = Math.ceil(plotRect.top + Math.max(3, plotRect.height * 0.025));
+  const bottom = Math.floor(plotRect.bottom - Math.max(3, plotRect.height * 0.025));
+  const targetHue = rgbHue(color.r, color.g, color.b);
+  const columnStep = Math.max(1, Math.floor(plotRect.width / 700));
+  let best = null;
+  for (let x = left; x <= right; x += columnStep) {
+    const runs = [];
+    let run = null;
+    const closeRun = () => {
+      if (!run) return;
+      runs.push(run);
+      run = null;
+    };
+    for (let y = top; y <= bottom; y += 1) {
+      const index = (y * width + x) * 4;
+      const red = rgba[index];
+      const green = rgba[index + 1];
+      const blue = rgba[index + 2];
+      const alpha = rgba[index + 3];
+      const matches = !insideAnyRectangle(exclusions, x, y, 2)
+        && coloredSeriesPixel(red, green, blue, alpha)
+        && circularHueDistance(rgbHue(red, green, blue), targetHue) <= 13
+        && compositedColorDistance(red, green, blue, color) <= 70;
+      if (!matches) {
+        closeRun();
+        continue;
+      }
+      const chroma = Math.max(red, green, blue) - Math.min(red, green, blue);
+      const darkness = 255 - (0.2126 * red + 0.7152 * green + 0.0722 * blue);
+      const pixelScore = chroma * 0.78 + darkness * 0.22;
+      if (!run) run = { start: y, end: y, bestY: y, pixelScore };
+      else {
+        run.end = y;
+        if (pixelScore > run.pixelScore) {
+          run.bestY = y;
+          run.pixelScore = pixelScore;
+        }
+      }
+    }
+    closeRun();
+    const plausibleRuns = runs.filter((candidate) => (
+      candidate.end - candidate.start + 1 <= Math.max(12, plotRect.height * 0.08)
+    ));
+    for (const candidate of plausibleRuns) {
+      const normalizedCenterDistance = Math.abs(
+        x - (plotRect.left + plotRect.right) / 2,
+      ) / Math.max(1, plotRect.width / 2);
+      const thickness = candidate.end - candidate.start + 1;
+      const ambiguityPenalty = Math.max(0, plausibleRuns.length - 1) * 18;
+      const thicknessPenalty = Math.max(0, thickness - 6) * 2.5;
+      const score = candidate.pixelScore
+        + (1 - normalizedCenterDistance) * 34
+        - ambiguityPenalty
+        - thicknessPenalty;
+      if (!best || score > best.score) {
+        best = { x, y: candidate.bestY, score, localRuns: plausibleRuns.length, thickness };
+      }
+    }
+  }
+  return best;
+}
+
+/**
+ * Find only high-confidence, horizontally persistent coloured curve families.
+ * The result is review-only: each candidate contains a representative colour
+ * and a reliable on-curve seed, but this function never changes masks, axes,
+ * calibration, or extracted data.
+ */
+export function discoverColoredSeries({
+  rgba,
+  width,
+  height,
+  plotRect,
+  exclusions = [],
+  maxResults = 8,
+} = {}) {
+  if (!rgba || rgba.length !== width * height * 4 || !plotRect) return [];
+  const left = clamp(Math.ceil(plotRect.left + 2), 0, width - 1);
+  const right = clamp(Math.floor(plotRect.right - 2), 0, width - 1);
+  const top = clamp(Math.ceil(plotRect.top + 2), 0, height - 1);
+  const bottom = clamp(Math.floor(plotRect.bottom - 2), 0, height - 1);
+  const plotWidth = right - left + 1;
+  if (plotWidth < 12 || bottom - top < 8) return [];
+  const hueBinSize = 15;
+  const bins = new Map();
+  for (let y = top; y <= bottom; y += 1) {
+    for (let x = left; x <= right; x += 1) {
+      if (insideAnyRectangle(exclusions, x, y)) continue;
+      const index = (y * width + x) * 4;
+      const red = rgba[index];
+      const green = rgba[index + 1];
+      const blue = rgba[index + 2];
+      const alpha = rgba[index + 3];
+      if (!coloredSeriesPixel(red, green, blue, alpha)) continue;
+      const hue = rgbHue(red, green, blue);
+      const key = Math.round(hue / hueBinSize) % Math.round(360 / hueBinSize);
+      const chroma = Math.max(red, green, blue) - Math.min(red, green, blue);
+      const darkness = 255 - (0.2126 * red + 0.7152 * green + 0.0722 * blue);
+      const weight = chroma * (0.65 + darkness / 510);
+      let bin = bins.get(key);
+      if (!bin) {
+        bin = {
+          count: 0,
+          weight: 0,
+          weightedRed: 0,
+          weightedGreen: 0,
+          weightedBlue: 0,
+          weightedHue: 0,
+          minX: x,
+          maxX: x,
+          columns: new Uint8Array(plotWidth),
+        };
+        bins.set(key, bin);
+      }
+      bin.count += 1;
+      bin.weight += weight;
+      bin.weightedRed += red * weight;
+      bin.weightedGreen += green * weight;
+      bin.weightedBlue += blue * weight;
+      bin.weightedHue += hue * weight;
+      bin.minX = Math.min(bin.minX, x);
+      bin.maxX = Math.max(bin.maxX, x);
+      bin.columns[x - left] = 1;
+    }
+  }
+  const normalizedBins = [...bins.values()]
+    .filter((bin) => bin.count >= Math.max(8, plotWidth * 0.08))
+    .map((bin) => ({
+      ...bin,
+      color: {
+        r: Math.round(bin.weightedRed / bin.weight),
+        g: Math.round(bin.weightedGreen / bin.weight),
+        b: Math.round(bin.weightedBlue / bin.weight),
+        a: 255,
+      },
+      hue: bin.weightedHue / bin.weight,
+    }));
+  const groups = mergeColoredSeriesBins(normalizedBins, plotWidth);
+  const candidates = [];
+  const persistentGroups = groups.map((group) => {
+    const coveredColumns = group.columns.reduce((sum, present) => sum + present, 0);
+    const horizontalSpan = (group.maxX - group.minX + 1) / plotWidth;
+    const columnCoverage = coveredColumns / plotWidth;
+    return { ...group, coveredColumns, horizontalSpan, columnCoverage };
+  }).filter((group) => (
+    group.count >= Math.max(18, plotWidth * 0.16)
+      && group.horizontalSpan >= 0.32
+      && group.columnCoverage >= 0.18
+  )).sort((leftGroup, rightGroup) => (
+    rightGroup.horizontalSpan * rightGroup.columnCoverage
+      - leftGroup.horizontalSpan * leftGroup.columnCoverage
+  )).slice(0, clamp(Math.round(maxResults) * 2, 2, 16));
+  for (const group of persistentGroups) {
+    const seed = reliableColoredSeriesSeed({
+      rgba,
+      width,
+      plotRect,
+      color: group.color,
+      exclusions,
+    });
+    if (!seed) continue;
+    const spanScore = clamp((group.horizontalSpan - 0.32) / 0.5, 0, 1);
+    const coverageScore = clamp((group.columnCoverage - 0.18) / 0.55, 0, 1);
+    const ambiguityScore = seed.localRuns <= 1 ? 1 : seed.localRuns === 2 ? 0.72 : 0.45;
+    const confidence = clamp(
+      0.57 + spanScore * 0.16 + coverageScore * 0.17 + ambiguityScore * 0.08,
+      0,
+      0.98,
+    );
+    if (confidence < 0.72) continue;
+    candidates.push({
+      color: group.color,
+      seed: { x: seed.x, y: seed.y },
+      confidence,
+      horizontalSpan: group.horizontalSpan,
+      columnCoverage: group.columnCoverage,
+      pixelCount: group.count,
+    });
+  }
+  return candidates
+    .sort((leftCandidate, rightCandidate) => (
+      rightCandidate.confidence - leftCandidate.confidence
+      || rightCandidate.horizontalSpan - leftCandidate.horizontalSpan
+      || rightCandidate.columnCoverage - leftCandidate.columnCoverage
+    ))
+    .slice(0, clamp(Math.round(maxResults), 1, 12));
+}
+
 function darkestBandPresence(rgba, width, height, axis, coordinate, threshold, tolerance = 2) {
   const length = axis === "row" ? width : height;
   const crossLength = axis === "row" ? height : width;
@@ -2625,7 +4288,22 @@ export function detectPlotRects(rgba, width, height, { darkThreshold = 135, maxR
             if (coverage >= 0.92) internalDividers += 1;
           }
           const structurePenalty = Math.min(0.14, internalDividers * 0.032);
-          const score = meanCoverage * 0.68 + weakestEdge * 0.28 + Math.sqrt(areaFraction) * 0.04 - structurePenalty;
+          // Screenshots and exported figures sometimes carry a one-pixel
+          // border around the entire bitmap in addition to the real axes
+          // frame. Without a small prior against that exact image boundary,
+          // its perfect coverage always outranks the inset plot rectangle and
+          // sends titles, tick labels, and page furniture into curve tracing.
+          // Keep it as a valid fallback when no inset frame exists.
+          const fullImageBorder = left <= 1
+            && top <= 1
+            && right >= width - 2
+            && bottom >= height - 2;
+          const imageBorderPenalty = fullImageBorder ? 0.075 : 0;
+          const score = meanCoverage * 0.68
+            + weakestEdge * 0.28
+            + Math.sqrt(areaFraction) * 0.04
+            - structurePenalty
+            - imageBorderPenalty;
           if (weakestEdge < 0.28 || meanCoverage < 0.42) continue;
           const topStroke = frameStrokeExtent(rgba, width, height, {
             axis: "row", coordinate: top, start: left, end: right, darkThreshold,
@@ -2679,13 +4357,255 @@ export function detectPlotRect(rgba, width, height, options = {}) {
   return detectPlotRects(rgba, width, height, { ...options, maxResults: 1 })[0] ?? null;
 }
 
+function annotationInkPixel(rgba, index) {
+  if (rgba[index + 3] < 32) return false;
+  const red = rgba[index];
+  const green = rgba[index + 1];
+  const blue = rgba[index + 2];
+  const luminance = red * 0.2126 + green * 0.7152 + blue * 0.0722;
+  const chroma = Math.max(red, green, blue) - Math.min(red, green, blue);
+  const distanceFromWhite = Math.hypot(255 - red, 255 - green, 255 - blue);
+  return luminance <= 178 || (chroma >= 24 && distanceFromWhite >= 88);
+}
+
+function boundedExpandedRect(rect, plotRect, padding = 4) {
+  const left = Math.max(plotRect.left + 2, Math.floor(rect.left - padding));
+  const top = Math.max(plotRect.top + 2, Math.floor(rect.top - padding));
+  const right = Math.min(plotRect.right - 2, Math.ceil(rect.right + padding));
+  const bottom = Math.min(plotRect.bottom - 2, Math.ceil(rect.bottom + padding));
+  return {
+    left,
+    top,
+    right,
+    bottom,
+    width: right - left + 1,
+    height: bottom - top + 1,
+  };
+}
+
+function horizontalOverlapFraction(left, right) {
+  const overlap = Math.max(0, Math.min(left.right, right.right) - Math.max(left.left, right.left) + 1);
+  return overlap / Math.max(1, Math.min(left.width, right.width));
+}
+
+function annotationLineBands(rgba, width, height, plotRect) {
+  const marginX = Math.max(4, Math.round(plotRect.width * 0.012));
+  const marginY = Math.max(4, Math.round(plotRect.height * 0.012));
+  const left = clamp(plotRect.left + marginX, 0, width - 1);
+  const right = clamp(plotRect.right - marginX, 0, width - 1);
+  const top = clamp(plotRect.top + marginY, 0, height - 1);
+  const bottom = clamp(plotRect.bottom - marginY, 0, height - 1);
+  const minimumRuns = Math.max(5, Math.round(plotRect.width / 115));
+  const activeRows = [];
+  for (let y = top; y <= bottom; y += 1) {
+    let runs = 0;
+    let ink = 0;
+    let insideRun = false;
+    for (let x = left; x <= right; x += 1) {
+      const active = annotationInkPixel(rgba, (y * width + x) * 4);
+      if (active) {
+        ink += 1;
+        if (!insideRun) runs += 1;
+      }
+      insideRun = active;
+    }
+    activeRows.push({
+      y,
+      active: runs >= minimumRuns
+        && ink >= Math.max(8, plotRect.width * 0.014)
+        && ink <= plotRect.width * 0.58,
+    });
+  }
+
+  const bands = [];
+  let start = null;
+  let lastActive = null;
+  for (const row of activeRows) {
+    if (row.active) {
+      start ??= row.y;
+      lastActive = row.y;
+    } else if (start !== null && row.y - lastActive > 1) {
+      bands.push({ top: start, bottom: lastActive });
+      start = null;
+      lastActive = null;
+    }
+  }
+  if (start !== null) bands.push({ top: start, bottom: lastActive });
+
+  const maximumBandHeight = Math.max(24, plotRect.height * 0.08);
+  const joinGap = Math.max(5, Math.round(plotRect.width * 0.012));
+  const minimumLineWidth = Math.max(14, plotRect.width * 0.055);
+  const lines = [];
+  for (const band of bands) {
+    if (band.bottom - band.top + 1 > maximumBandHeight) continue;
+    const occupied = [];
+    for (let x = left; x <= right; x += 1) {
+      let count = 0;
+      for (let y = band.top; y <= band.bottom; y += 1) {
+        if (annotationInkPixel(rgba, (y * width + x) * 4)) count += 1;
+      }
+      occupied.push(count > 0);
+    }
+    let segmentStart = null;
+    let lastInk = null;
+    for (let offset = 0; offset < occupied.length; offset += 1) {
+      if (occupied[offset]) {
+        segmentStart ??= offset;
+        lastInk = offset;
+      }
+      const gapExceeded = segmentStart !== null && lastInk !== null && offset - lastInk > joinGap;
+      const atEnd = offset === occupied.length - 1;
+      if (!gapExceeded && !atEnd) continue;
+      const end = atEnd && occupied[offset] ? offset : lastInk;
+      const segmentWidth = end - segmentStart + 1;
+      if (segmentWidth >= minimumLineWidth) {
+        lines.push({
+          left: left + segmentStart,
+          right: left + end,
+          top: band.top,
+          bottom: band.bottom,
+          width: segmentWidth,
+          height: band.bottom - band.top + 1,
+        });
+      }
+      segmentStart = null;
+      lastInk = null;
+    }
+  }
+  return lines;
+}
+
+function annotationInkDensity(rgba, width, rect) {
+  let ink = 0;
+  for (let y = rect.top; y <= rect.bottom; y += 1) {
+    for (let x = rect.left; x <= rect.right; x += 1) {
+      if (annotationInkPixel(rgba, (y * width + x) * 4)) ink += 1;
+    }
+  }
+  return ink / Math.max(1, rect.width * rect.height);
+}
+
+/**
+ * Suggest likely in-plot legends or annotation blocks without applying them.
+ * The detector deliberately favours boxed regions and repeated text-like rows;
+ * ordinary one-pixel curves do not create enough horizontal ink transitions.
+ */
+export function suggestInterferenceMasks({
+  rgba,
+  width,
+  height,
+  plotRect,
+  exclusions = [],
+  maxResults = 5,
+} = {}) {
+  if (!rgba || rgba.length !== width * height * 4 || !plotRect) return [];
+  const plotArea = Math.max(1, plotRect.width * plotRect.height);
+  const proposals = [];
+
+  for (const framed of detectPlotRects(rgba, width, height, { darkThreshold: 178, maxResults: 32 })) {
+    const safelyInside = framed.left > plotRect.left + 3
+      && framed.right < plotRect.right - 3
+      && framed.top > plotRect.top + 3
+      && framed.bottom < plotRect.bottom - 3;
+    const areaFraction = (framed.width * framed.height) / plotArea;
+    if (!safelyInside || areaFraction < 0.006 || areaFraction > 0.28) continue;
+    if (framed.width < plotRect.width * 0.08 || framed.width > plotRect.width * 0.56) continue;
+    if (framed.height < plotRect.height * 0.055 || framed.height > plotRect.height * 0.46) continue;
+    proposals.push({
+      ...boundedExpandedRect(framed, plotRect, 3),
+      kind: "legend",
+      confidence: clamp(0.7 + framed.confidence * 0.25, 0, 0.97),
+      evidence: { framed: true, textLines: 0, inkDensity: null },
+    });
+  }
+
+  const lineGroups = [];
+  const maximumLineGap = Math.max(12, plotRect.height * 0.045);
+  for (const line of annotationLineBands(rgba, width, height, plotRect).sort((a, b) => a.top - b.top)) {
+    const group = lineGroups.find((candidate) => (
+      line.top - candidate.bottom <= maximumLineGap
+      && horizontalOverlapFraction(candidate, line) >= 0.22
+    ));
+    if (group) {
+      group.left = Math.min(group.left, line.left);
+      group.right = Math.max(group.right, line.right);
+      group.top = Math.min(group.top, line.top);
+      group.bottom = Math.max(group.bottom, line.bottom);
+      group.width = group.right - group.left + 1;
+      group.height = group.bottom - group.top + 1;
+      group.lines += 1;
+    } else {
+      lineGroups.push({ ...line, lines: 1 });
+    }
+  }
+
+  for (const group of lineGroups) {
+    const padded = boundedExpandedRect(group, plotRect, 5);
+    const areaFraction = (padded.width * padded.height) / plotArea;
+    if (areaFraction < 0.003 || areaFraction > 0.24) continue;
+    if (padded.width > plotRect.width * 0.56 || padded.height > plotRect.height * 0.44) continue;
+    const centerX = (padded.left + padded.right) / 2;
+    const centerY = (padded.top + padded.bottom) / 2;
+    const horizontalEdge = 1 - Math.min(
+      centerX - plotRect.left,
+      plotRect.right - centerX,
+    ) / Math.max(1, plotRect.width / 2);
+    const verticalEdge = 1 - Math.min(
+      centerY - plotRect.top,
+      plotRect.bottom - centerY,
+    ) / Math.max(1, plotRect.height / 2);
+    const cornerScore = clamp((horizontalEdge + verticalEdge) / 2, 0, 1);
+    if (group.lines < 2 && cornerScore < 0.72) continue;
+    const inkDensity = annotationInkDensity(rgba, width, padded);
+    if (inkDensity < 0.018 || inkDensity > 0.48) continue;
+    const confidence = clamp(
+      0.35 + Math.min(4, group.lines) * 0.09 + cornerScore * 0.2 + Math.min(0.12, inkDensity * 0.7),
+      0,
+      0.92,
+    );
+    if (confidence < 0.62) continue;
+    proposals.push({
+      ...padded,
+      kind: group.lines >= 2 ? "legend-or-annotation" : "annotation",
+      confidence,
+      evidence: { framed: false, textLines: group.lines, inkDensity },
+    });
+  }
+
+  proposals.sort((left, right) => right.confidence - left.confidence);
+  const selected = [];
+  for (const proposal of proposals) {
+    if ((exclusions ?? []).some((area) => rectangleIoU(area, proposal) > 0.2)) continue;
+    const duplicateIndex = selected.findIndex((candidate) => rectangleIoU(candidate, proposal) > 0.24);
+    if (duplicateIndex >= 0) {
+      if (proposal.confidence > selected[duplicateIndex].confidence) selected[duplicateIndex] = proposal;
+      continue;
+    }
+    selected.push(proposal);
+    if (selected.length >= maxResults) break;
+  }
+  return selected;
+}
+
 export function pathToData(path, xCalibration, yCalibration) {
   if (!validateCalibration(xCalibration) || !validateCalibration(yCalibration)) return [];
-  return path.map((point) => ({
-    ...point,
-    dataX: pixelToValue(point.x, xCalibration),
-    dataY: pixelToValue(point.y, yCalibration),
-  }));
+  return path.map((point) => {
+    const xUncertainty = calibrationUncertaintyAtPixel(point.x, xCalibration);
+    const yUncertainty = calibrationUncertaintyAtPixel(
+      point.y,
+      yCalibration,
+      point.inferenceUncertainty ?? 0,
+    );
+    return {
+      ...point,
+      dataX: pixelToValue(point.x, xCalibration),
+      dataY: pixelToValue(point.y, yCalibration),
+      dataXUncertainty: xUncertainty?.valueSigma ?? null,
+      dataYUncertainty: yUncertainty?.valueSigma ?? null,
+      calibrationXPixelUncertainty: xUncertainty?.pixelSigma ?? null,
+      calibrationYPixelUncertainty: yUncertainty?.pixelSigma ?? null,
+    };
+  });
 }
 
 export function resamplePixelPath(path, count) {
@@ -2702,6 +4622,155 @@ export function resamplePixelPath(path, count) {
     sampleXs.push(minimumX + (index / (sampleCount - 1)) * (maximumX - minimumX));
   }
   return interpolatePixelPath(sorted, sampleXs);
+}
+
+function interpolateOrderedPathPoint(left, right, fraction, parametricOrder) {
+  if (fraction <= 1e-9) return { ...left, parametricOrder };
+  if (fraction >= 1 - 1e-9) return { ...right, parametricOrder };
+  const nearest = fraction <= 0.5 ? left : right;
+  const point = {
+    ...nearest,
+    x: left.x + (right.x - left.x) * fraction,
+    y: left.y + (right.y - left.y) * fraction,
+    observed: Boolean(left.observed && right.observed),
+    confidence: (left.confidence ?? 0) + ((right.confidence ?? 0) - (left.confidence ?? 0)) * fraction,
+    candidateCount: Math.max(left.candidateCount ?? 0, right.candidateCount ?? 0),
+    thickness: (left.thickness ?? 0) + ((right.thickness ?? 0) - (left.thickness ?? 0)) * fraction,
+    parametricOrder,
+  };
+  delete point.pointId;
+  delete point.anchorId;
+  point.anchor = false;
+  point.userGuided = false;
+  const occlusionInferred = Boolean(left.occlusionInferred || right.occlusionInferred);
+  const patternInferred = Boolean(left.patternInferred || right.patternInferred);
+  if (occlusionInferred || patternInferred) {
+    point.occlusionInferred = occlusionInferred;
+    point.patternInferred = patternInferred;
+    point.imageObserved = Boolean(left.imageObserved ?? left.observed)
+      && Boolean(right.imageObserved ?? right.observed);
+    point.inferenceMethod = left.inferenceMethod ?? right.inferenceMethod;
+    point.inferenceModel = fraction <= 0.5
+      ? (left.inferenceModel ?? right.inferenceModel)
+      : (right.inferenceModel ?? left.inferenceModel);
+    point.inferenceUncertainty = (left.inferenceUncertainty ?? 0)
+      + ((right.inferenceUncertainty ?? 0) - (left.inferenceUncertainty ?? 0)) * fraction;
+    for (const field of ["inferenceModelScore", "modelDisagreement", "unsupportedDistance"]) {
+      const leftValue = Number(left[field]);
+      const rightValue = Number(right[field]);
+      if (Number.isFinite(leftValue) && Number.isFinite(rightValue)) {
+        point[field] = leftValue + (rightValue - leftValue) * fraction;
+      } else if (Number.isFinite(leftValue)) point[field] = leftValue;
+      else if (Number.isFinite(rightValue)) point[field] = rightValue;
+    }
+  }
+  return point;
+}
+
+/**
+ * Resample an already ordered 2D path by screen-space arc length. A closed
+ * path includes the last-to-first segment but never duplicates its first point,
+ * so CSV rows retain one unambiguous traversal of the loop.
+ */
+export function resamplePixelPathArcLength(path, count, { closed = false } = {}) {
+  const ordered = (path ?? []).filter((point) => (
+    Number.isFinite(point?.x) && Number.isFinite(point?.y)
+  ));
+  if (!ordered.length) return [];
+  if (ordered.length === 1) return [{ ...ordered[0], parametricOrder: 0 }];
+  const numericCount = Number(count);
+  const sampleCount = Math.max(2, Number.isFinite(numericCount) ? Math.round(numericCount) : 100);
+  const segmentCount = closed ? ordered.length : ordered.length - 1;
+  const cumulative = [0];
+  for (let segment = 0; segment < segmentCount; segment += 1) {
+    const left = ordered[segment];
+    const right = ordered[(segment + 1) % ordered.length];
+    cumulative.push(cumulative.at(-1) + Math.hypot(right.x - left.x, right.y - left.y));
+  }
+  const total = cumulative.at(-1);
+  if (!(total > 0)) return [{ ...ordered[0], parametricOrder: 0 }];
+  const result = [];
+  let segment = 0;
+  for (let sample = 0; sample < sampleCount; sample += 1) {
+    const fraction = closed ? sample / sampleCount : sample / (sampleCount - 1);
+    const target = fraction * total;
+    while (segment < segmentCount - 1 && cumulative[segment + 1] < target) segment += 1;
+    const leftDistance = cumulative[segment];
+    const rightDistance = cumulative[segment + 1];
+    const localFraction = rightDistance === leftDistance
+      ? 0
+      : (target - leftDistance) / (rightDistance - leftDistance);
+    result.push(interpolateOrderedPathPoint(
+      ordered[segment],
+      ordered[(segment + 1) % ordered.length],
+      localFraction,
+      segment + localFraction,
+    ));
+  }
+  return result;
+}
+
+export function includeMandatoryParametricPoints(
+  sampledPath,
+  mandatoryPoints,
+  count = sampledPath?.length,
+) {
+  const sampled = (sampledPath ?? []).map((point) => ({ point: { ...point }, mandatory: false }));
+  const mandatory = (mandatoryPoints ?? []).filter((point) => (
+    Number.isFinite(point?.x) && Number.isFinite(point?.y)
+  )).map((point) => ({
+    ...point,
+    anchor: true,
+    userGuided: true,
+    origin: "guide",
+  }));
+  if (!mandatory.length) return sampled.map((entry) => entry.point);
+  const requested = Number.isFinite(Number(count)) ? Math.max(2, Math.round(Number(count))) : sampled.length;
+  const targetCount = Math.max(requested, mandatory.length);
+  for (const guide of mandatory) {
+    let nearestIndex = -1;
+    let nearestDistance = Infinity;
+    sampled.forEach((entry, index) => {
+      if (entry.mandatory) return;
+      const orderDistance = Number.isFinite(guide.parametricOrder) && Number.isFinite(entry.point.parametricOrder)
+        ? Math.abs(guide.parametricOrder - entry.point.parametricOrder)
+        : Math.hypot(guide.x - entry.point.x, guide.y - entry.point.y);
+      if (orderDistance < nearestDistance) {
+        nearestIndex = index;
+        nearestDistance = orderDistance;
+      }
+    });
+    if (nearestIndex >= 0) sampled.splice(nearestIndex, 1);
+    sampled.push({ point: guide, mandatory: true });
+  }
+  while (sampled.length > targetCount) {
+    sampled.sort((left, right) => (
+      (left.point.parametricOrder ?? Infinity) - (right.point.parametricOrder ?? Infinity)
+    ));
+    let removalIndex = -1;
+    let smallestSpacing = Infinity;
+    for (let index = 0; index < sampled.length; index += 1) {
+      if (sampled[index].mandatory) continue;
+      const previous = sampled[(index - 1 + sampled.length) % sampled.length].point;
+      const next = sampled[(index + 1) % sampled.length].point;
+      const spacing = Math.min(
+        Math.hypot(sampled[index].point.x - previous.x, sampled[index].point.y - previous.y),
+        Math.hypot(next.x - sampled[index].point.x, next.y - sampled[index].point.y),
+      );
+      if (spacing < smallestSpacing) {
+        smallestSpacing = spacing;
+        removalIndex = index;
+      }
+    }
+    if (removalIndex < 0) break;
+    sampled.splice(removalIndex, 1);
+  }
+  return sampled
+    .map((entry) => entry.point)
+    .sort((left, right) => (
+      (left.parametricOrder ?? Infinity) - (right.parametricOrder ?? Infinity)
+    ))
+    .map((point, index) => ({ ...point, parametricOrder: index }));
 }
 
 export function includeMandatoryPoints(sampledPath, mandatoryPoints, count = sampledPath?.length) {
@@ -2823,9 +4892,17 @@ function interpolatePixelPath(sortedPath, sampleXs) {
       candidateCount: Math.max(left.candidateCount ?? 0, right.candidateCount ?? 0),
       thickness: (left.thickness ?? 0) + localFraction * ((right.thickness ?? 0) - (left.thickness ?? 0)),
     };
+    const ambiguitySource = localFraction <= 0.5 ? left : right;
+    if (Array.isArray(ambiguitySource.ambiguityAlternatives)) {
+      sampledPoint.ambiguityAlternatives = [...ambiguitySource.ambiguityAlternatives];
+      sampledPoint.ambiguitySeparation = ambiguitySource.ambiguitySeparation;
+      sampledPoint.ambiguitySpread = ambiguitySource.ambiguitySpread;
+    }
     const occlusionInferred = Boolean(left.occlusionInferred || right.occlusionInferred);
-    if (occlusionInferred) {
-      sampledPoint.occlusionInferred = true;
+    const patternInferred = Boolean(left.patternInferred || right.patternInferred);
+    if (occlusionInferred || patternInferred) {
+      sampledPoint.occlusionInferred = occlusionInferred;
+      sampledPoint.patternInferred = patternInferred;
       sampledPoint.imageObserved = Boolean(left.imageObserved ?? left.observed)
         && Boolean(right.imageObserved ?? right.observed);
       sampledPoint.inferenceMethod = left.inferenceMethod ?? right.inferenceMethod;
@@ -2842,11 +4919,14 @@ function interpolatePixelPath(sortedPath, sampleXs) {
         "modelDisagreement",
         "fitBlend",
         "fitSupport",
+        "unsupportedDistance",
         "inferenceUncertainty",
       ]) {
         const value = interpolateOptionalNumber(left[field], right[field], localFraction);
         if (value !== null) sampledPoint[field] = value;
       }
+      sampledPoint.boundedByGuide = Boolean(left.boundedByGuide || right.boundedByGuide);
+      sampledPoint.occlusionMasked = Boolean(left.occlusionMasked || right.occlusionMasked);
     }
     if (left.centerRefined || right.centerRefined) {
       sampledPoint.centerRefined = true;
@@ -3037,11 +5117,7 @@ export function resamplePixelPathRoughness(path, count, options = {}) {
 
 export function resamplePath(path, xCalibration, yCalibration, count) {
   if (!validateCalibration(xCalibration) || !validateCalibration(yCalibration)) return [];
-  return resamplePixelPath(path, count).map((point) => ({
-    ...point,
-    dataX: pixelToValue(point.x, xCalibration),
-    dataY: pixelToValue(point.y, yCalibration),
-  }));
+  return pathToData(resamplePixelPath(path, count), xCalibration, yCalibration);
 }
 
 function longestConsecutiveRun(path, predicate) {
@@ -3093,17 +5169,104 @@ function pathPointReviewRisk(point, rect, markerSeries) {
     score += Math.min(0.7, (modelDisagreement - 1.25) * 0.18 + 0.2);
     reasons.push("model-disagreement");
   }
-  if ((point.candidateCount ?? 0) >= 3 && confidence < 0.7) {
+  const explicitAlternatives = Array.isArray(point.ambiguityAlternatives)
+    ? point.ambiguityAlternatives.filter(Number.isFinite).length
+    : 0;
+  if (explicitAlternatives > 0) {
+    score += Math.min(0.8, 0.5 + explicitAlternatives * 0.1);
+    reasons.push("ambiguous");
+  } else if ((point.candidateCount ?? 0) >= 3 && confidence < 0.7) {
     score += Math.min(0.45, ((point.candidateCount ?? 0) - 2) * 0.09 + 0.12);
     reasons.push("ambiguous");
   }
-  if (!markerSeries && rect && (
-    Math.abs(point.y - rect.top) <= 2 || Math.abs(point.y - rect.bottom) <= 2
-  )) {
+  const verticalTrace = point.traceOrientation === "vertical";
+  const parametricTrace = point.traceOrientation === "parametric";
+  const followsBoundary = parametricTrace
+    ? Math.abs(point.x - rect.left) <= 2
+      || Math.abs(point.x - rect.right) <= 2
+      || Math.abs(point.y - rect.top) <= 2
+      || Math.abs(point.y - rect.bottom) <= 2
+    : verticalTrace
+      ? Math.abs(point.x - rect.left) <= 2 || Math.abs(point.x - rect.right) <= 2
+      : Math.abs(point.y - rect.top) <= 2 || Math.abs(point.y - rect.bottom) <= 2;
+  if (!markerSeries && rect && followsBoundary) {
     score += 0.8;
     reasons.push("boundary");
   }
   return { score, reasons };
+}
+
+/**
+ * Select the single click that should reduce branch uncertainty the most.
+ * A useful click is placed after competing same-colour paths have separated
+ * enough to distinguish visually, but before they become unreachable from the
+ * current trajectory. Existing guides suppress nearby suggestions because the
+ * user has already supplied authoritative information there.
+ */
+export function findMostInformativeAmbiguity(path, rect, anchors = []) {
+  if (!Array.isArray(path) || !path.length || !rect) return null;
+  const width = Math.max(1, Number(rect.width ?? rect.right - rect.left));
+  const height = Math.max(1, Number(rect.height ?? rect.bottom - rect.top));
+  const anchorSpacing = Math.max(5, width * 0.015);
+  const supportRadius = Math.max(6, width * 0.02);
+  const idealSeparation = clamp(height * 0.035, 5, 13);
+  const maximumUsefulSeparation = clamp(height * 0.22, 14, 22);
+  const validAnchors = (anchors ?? []).filter((anchor) => Number.isFinite(anchor?.x));
+
+  const entries = path.flatMap((point, index) => {
+    if (!point || point.anchor || point.userEdited || point.origin === "manual") return [];
+    if (validAnchors.some((anchor) => Math.abs(anchor.x - point.x) < anchorSpacing)) return [];
+    const alternatives = [...new Set((point.ambiguityAlternatives ?? [])
+      .filter(Number.isFinite)
+      .map(Number))]
+      .filter((y) => (
+        y >= rect.top && y <= rect.bottom
+        && Math.abs(y - point.y) > 2
+        && Math.abs(y - point.y) <= maximumUsefulSeparation
+      ))
+      .sort((left, right) => Math.abs(left - point.y) - Math.abs(right - point.y));
+    if (!alternatives.length) return [];
+    const separation = Math.abs(alternatives[0] - point.y);
+    const clarity = clamp(separation / idealSeparation, 0, 1);
+    const reachability = clamp(
+      (maximumUsefulSeparation - separation) / Math.max(1, maximumUsefulSeparation - idealSeparation),
+      0,
+      1,
+    );
+    const localSupport = path.filter((candidate) => (
+      Math.abs(candidate.x - point.x) <= supportRadius
+      && Array.isArray(candidate.ambiguityAlternatives)
+      && candidate.ambiguityAlternatives.length
+    )).length;
+    const edgeDistance = Math.min(point.x - rect.left, rect.right - point.x);
+    const edgeFactor = clamp(edgeDistance / Math.max(8, width * 0.04), 0.35, 1);
+    const confidence = clamp(Number(point.confidence ?? 1), 0, 1);
+    const informationScore = (
+      2.2
+      + clarity * 1.4
+      + reachability * 0.7
+      + Math.min(1.2, localSupport * 0.12)
+      + Math.min(0.6, (alternatives.length - 1) * 0.2)
+      + (1 - confidence) * 0.45
+    ) * edgeFactor;
+    return [{
+      pointIndex: index,
+      x: point.x,
+      y: point.y,
+      alternatives,
+      candidateYs: [point.y, ...alternatives].sort((left, right) => left - right),
+      separation,
+      localSupport,
+      informationScore,
+      kind: "branch",
+    }];
+  });
+
+  return entries.sort((left, right) => (
+    right.informationScore - left.informationScore
+    || right.separation - left.separation
+    || left.pointIndex - right.pointIndex
+  ))[0] ?? null;
 }
 
 /**
@@ -3210,19 +5373,68 @@ export function assessPathQuality(path, rect) {
   const lowConfidenceFraction = path.filter((point) => (point.confidence ?? 0) < 0.5).length / path.length;
   const ambiguousFraction = path.filter((point) => (point.candidateCount ?? 0) > 1).length / path.length;
   const markerSeries = path.every((point) => point.marker);
+  const topologyReviewRequired = path.some((point) => point.topologyReview);
+  const parametricTrace = !markerSeries
+    && path.filter((point) => point.traceOrientation === "parametric").length > path.length / 2;
+  const closedParametricTrace = parametricTrace
+    && path.filter((point) => point.closedPath).length > path.length / 2;
+  const verticalTrace = !markerSeries
+    && !parametricTrace
+    && path.filter((point) => point.traceOrientation === "vertical").length > path.length / 2;
   const boundaryFraction = path.filter((point) => (
-    Math.abs(point.y - rect.top) <= 2 || Math.abs(point.y - rect.bottom) <= 2
+    parametricTrace
+      ? Math.abs(point.x - rect.left) <= 2
+        || Math.abs(point.x - rect.right) <= 2
+        || Math.abs(point.y - rect.top) <= 2
+        || Math.abs(point.y - rect.bottom) <= 2
+      : verticalTrace
+      ? Math.abs(point.x - rect.left) <= 2 || Math.abs(point.x - rect.right) <= 2
+      : Math.abs(point.y - rect.top) <= 2 || Math.abs(point.y - rect.bottom) <= 2
   )).length / path.length;
-  const minimumX = Math.min(...path.map((point) => point.x));
-  const maximumX = Math.max(...path.map((point) => point.x));
-  const spanFraction = clamp((maximumX - minimumX + 1) / Math.max(1, rect.width), 0, 1);
+  const scanValues = path.map((point) => verticalTrace ? point.y : point.x);
+  const minimumScanCoordinate = Math.min(...scanValues);
+  const maximumScanCoordinate = Math.max(...scanValues);
+  const scanDimension = parametricTrace
+    ? Math.hypot(rect.width, rect.height)
+    : verticalTrace ? rect.height : rect.width;
+  // Closed paths have no privileged scan axis. Their topology establishes a
+  // complete traversal, while their bounding-box extent remains available as
+  // a diagnostic instead of incorrectly penalising a legitimate small loop.
+  const parametricXSpan = parametricTrace
+    ? (Math.max(...path.map((point) => point.x)) - Math.min(...path.map((point) => point.x)) + 1)
+      / Math.max(1, rect.width)
+    : null;
+  const parametricYSpan = parametricTrace
+    ? (Math.max(...path.map((point) => point.y)) - Math.min(...path.map((point) => point.y)) + 1)
+      / Math.max(1, rect.height)
+    : null;
+  const parametricArcLength = parametricTrace
+    ? path.slice(1).reduce((length, point, index) => (
+        length + Math.hypot(point.x - path[index].x, point.y - path[index].y)
+      ), 0)
+    : null;
+  const spanFraction = parametricTrace
+    ? closedParametricTrace ? 1 : clamp(parametricArcLength / Math.max(1, scanDimension), 0, 1)
+    : clamp(
+        (maximumScanCoordinate - minimumScanCoordinate + 1) / Math.max(1, scanDimension),
+        0,
+        1,
+      );
   const longestInferredGap = longestConsecutiveRun(path, (point) => !point.observed);
   const warnings = [];
 
-  if (spanFraction < 0.8) warnings.push({
+  if (topologyReviewRequired) warnings.push({
+    code: "topology-review",
+    severity: "warning",
+    message: "路径经过自交节点；已优先保持切向连续，请复核交叉前后的连接顺序",
+  });
+
+  if ((!parametricTrace || !closedParametricTrace) && spanFraction < 0.8) warnings.push({
     code: "short-span",
     severity: "warning",
-    message: `路径只覆盖绘图区宽度的 ${(spanFraction * 100).toFixed(0)}%；可增加虚线间隔或添加引导点`,
+    message: parametricTrace
+      ? `开放二维路径弧长只达到绘图区对角线的 ${(spanFraction * 100).toFixed(0)}%；可能只识别了局部片段`
+      : `路径只覆盖绘图区${verticalTrace ? "高度" : "宽度"}的 ${(spanFraction * 100).toFixed(0)}%；可增加虚线间隔或添加引导点`,
   });
   if (observedFraction < 0.75) warnings.push({
     code: "low-observation",
@@ -3237,7 +5449,7 @@ export function assessPathQuality(path, rect) {
   if (ambiguousFraction > 0.65) warnings.push({
     code: "many-candidates",
     severity: "warning",
-    message: `${(ambiguousFraction * 100).toFixed(0)}% 的列存在多个同色候选；黑白图或曲线族应重点核对引导点`,
+    message: `${(ambiguousFraction * 100).toFixed(0)}% 的扫描线存在多个同色候选；黑白图或曲线族应重点核对引导点`,
   });
   const boundaryWarningThreshold = markerSeries ? 0.3 : 0.12;
   if (boundaryFraction > boundaryWarningThreshold) warnings.push({
@@ -3245,9 +5457,9 @@ export function assessPathQuality(path, rect) {
     severity: markerSeries ? "warning" : "error",
     message: markerSeries
       ? `${(boundaryFraction * 100).toFixed(0)}% 的 marker 贴近绘图区边界；请确认这些实验点确实位于坐标轴上`
-      : `路径有 ${(boundaryFraction * 100).toFixed(0)}% 贴近上下边框，可能误追了坐标轴`,
+      : `路径有 ${(boundaryFraction * 100).toFixed(0)}% 贴近${parametricTrace ? "绘图区" : verticalTrace ? "左右" : "上下"}边框，可能误追了坐标轴`,
   });
-  if (longestInferredGap > Math.max(12, rect.width * 0.08)) warnings.push({
+  if (longestInferredGap > Math.max(12, scanDimension * 0.08)) warnings.push({
     code: "long-gap",
     severity: "warning",
     message: `最长连续插值 ${longestInferredGap} px；该区间的信息可能已被图例或遮挡破坏`,
@@ -3258,13 +5470,16 @@ export function assessPathQuality(path, rect) {
       - (1 - observedFraction) * 32
       - lowConfidenceFraction * 28
       - ambiguousFraction * 8
+      - (topologyReviewRequired ? 10 : 0)
       - (1 - spanFraction) * 30
       - boundaryFraction * (markerSeries ? 8 : 35)
-      - Math.min(0.12, longestInferredGap / Math.max(1, rect.width)) * 80,
+      - Math.min(0.12, longestInferredGap / Math.max(1, scanDimension)) * 80,
     0,
     100,
   ));
-  const grade = score >= 85 && !warnings.some((warning) => warning.severity === "error")
+  const grade = score >= 85
+    && !topologyReviewRequired
+    && !warnings.some((warning) => warning.severity === "error")
     ? "good"
     : score >= 65 && !warnings.some((warning) => warning.severity === "error") ? "review" : "poor";
   return {
@@ -3276,10 +5491,30 @@ export function assessPathQuality(path, rect) {
       ambiguousFraction,
       boundaryFraction,
       spanFraction,
+      parametricXSpan,
+      parametricYSpan,
+      parametricArcLength,
+      topologyReviewRequired,
       longestInferredGap,
+      traceOrientation: parametricTrace ? "parametric" : verticalTrace ? "vertical" : "horizontal",
     },
     warnings,
   };
+}
+
+export function preferOrdinaryTraceFallback(patternedPath, ordinaryPath, rect, {
+  autoConfidence = 1,
+} = {}) {
+  if (!Array.isArray(patternedPath) || !patternedPath.length
+    || !Array.isArray(ordinaryPath) || !ordinaryPath.length || !rect) return false;
+  const patterned = assessPathQuality(patternedPath, rect);
+  const ordinary = assessPathQuality(ordinaryPath, rect);
+  if (ordinary.metrics.spanFraction >= patterned.metrics.spanFraction + 0.15) return true;
+  if (!Number.isFinite(autoConfidence) || autoConfidence > 0.65) return false;
+  const observedGain = ordinary.metrics.observedFraction - patterned.metrics.observedFraction;
+  const confidenceGain = patterned.metrics.lowConfidenceFraction - ordinary.metrics.lowConfidenceFraction;
+  return ordinary.score >= patterned.score + 12
+    && (observedGain >= 0.18 || confidenceGain >= 0.18);
 }
 
 export function formatNumber(value, precision = 8) {

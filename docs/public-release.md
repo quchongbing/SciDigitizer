@@ -31,3 +31,12 @@ git push
 ```
 
 The public repository must use the GitHub-provided `noreply` author address. The synchronization command deliberately does not commit or push, so every public change remains reviewable.
+
+## Immutable release rule
+
+Every source or desktop-package change receives a new version and matching
+`v<package-version>` tag, even for a very small patch. Run
+`npm run release:verify` before upload. Do not move a published tag or replace
+existing release assets: one tag must always identify one reproducible set of
+bytes and SHA-256 checksums. Release-note-only corrections may edit the text
+without changing the attached files.

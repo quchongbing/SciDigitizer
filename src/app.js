@@ -2,34 +2,44 @@ import {
   assessCalibrationQuality,
   assessPathQuality,
   buildPairedCurveRows,
+  calibrationUncertaintyAtPixel,
   calibrationError,
   clamp,
   compositedColorDistance,
-  constrainPathToInclusionMask,
   csvEscape,
   detectPlotRects,
   estimateColorThreshold,
-  extractMarkerCenters,
+  findMostInformativeAmbiguity,
   findPathReviewRegions,
   formatNumber,
-  fitInferredPathGaps,
-  includeMandatoryPoints,
-  inferLineStyle,
+  inclusionMaskAllows,
   normalizeRect,
+  prepareInclusionMask,
   pathToData,
   pixelToValue,
-  refinePathCenterline,
-  resamplePixelPath,
-  resamplePixelPathAdaptive,
-  resamplePixelPathGeometry,
-  resamplePixelPathRoughness,
-  resamplePath,
   sampleRepresentativeColor,
-  traceCurveThroughAnchors,
+  snapCalibrationPoint,
+  snapTargetPoint,
+  suggestInterferenceMasks,
   validateCalibration,
   valueStepForPixelNudge,
   valueToPixel,
-} from "./core.js?v=0.20.0-preview.3.1";
+} from "./core.js?v=0.20.0-preview.3.21";
+
+import {
+  isDuplicateGuidePoint,
+  prepareRestoredTrace,
+  prepareTraceOutput,
+} from "./trace-output.js?v=0.20.0-preview.3.21";
+
+import { runComputeOperation } from "./compute-engine.js?v=0.20.0-preview.3.21";
+import { createComputeClient } from "./compute-client.js?v=0.20.0-preview.3.21";
+
+import {
+  pickRasterImageFile,
+  rasterImageDisplayName,
+  validateRasterImageFile,
+} from "./image-import.js?v=0.20.0-preview.3.21";
 
 import {
   alignmentCorrectionDegrees,
@@ -37,29 +47,41 @@ import {
   normalizeRotationDegrees,
   renderRotatedImage,
   splitRotationDegrees,
-} from "./image-transform.js?v=0.20.0-preview.3.1";
+} from "./image-transform.js?v=0.20.0-preview.3.21";
 
 import {
   cloneSerializable,
   createEditSession,
   fingerprintImageData,
-} from "./edit-session.js?v=0.20.0-preview.3.1";
+} from "./edit-session.js?v=0.20.0-preview.3.21";
 
 import {
   detectFrameQuadrilateral,
   detectPerspectiveFrame,
   estimateAxisSkew,
   warpPerspectiveRgba,
-} from "./image-geometry.js?v=0.20.0-preview.3.1";
+} from "./image-geometry.js?v=0.20.0-preview.3.21";
 
 import {
   initializeI18n,
   refreshTranslations,
   setLanguage,
   translateMessage,
-} from "./i18n.js?v=0.20.0-preview.3.1";
+} from "./i18n.js?v=0.20.0-preview.3.21";
 
 initializeI18n();
+
+const minimumCalibrationReferences = 2;
+const maximumCalibrationReferences = 5;
+
+function emptyCalibrationPoints() {
+  return Object.fromEntries(
+    ["x", "y"].flatMap((axis) => Array.from(
+      { length: maximumCalibrationReferences },
+      (_, index) => [`${axis}${index + 1}`, null],
+    )),
+  );
+}
 
 const $ = (selector) => document.querySelector(selector);
 const canvas = $("#plot-canvas");
@@ -78,15 +100,22 @@ const state = {
   plotRect: null,
   draftRect: null,
   exclusions: [],
+  exclusionSuggestions: [],
+  exclusionSuggestionIndex: 0,
+  colorSuggestions: [],
   draftExclusion: null,
   traceCorridorOperations: [],
   draftTraceCorridor: null,
-  calibrationPoints: { x1: null, x2: null, x3: null, y1: null, y2: null, y3: null },
+  calibrationPoints: emptyCalibrationPoints(),
+  calibrationReferenceCounts: { x: 2, y: 2 },
   seed: null,
   seedColor: null,
+  automaticMarkerSeries: false,
+  automaticMarkerConfidence: 0,
   anchors: [],
   rawPath: [],
   path: [],
+  traceOrientation: "horizontal",
   series: [],
   editingSeriesId: null,
   mode: null,
@@ -120,25 +149,67 @@ const state = {
   rotationAlignmentPoints: [],
   rotationPendingCommit: null,
   rotationPreviewFrame: null,
+  ambiguityResolutionTarget: null,
+  computeBusy: null,
+  traceStale: false,
+  traceError: null,
 };
 
 const seriesPalette = ["#087f8c", "#d1495b", "#6a4c93", "#e07a1f", "#3a7d44", "#2069c3", "#b34b9b", "#66717e"];
+const builtInSamplePath = "images/fig1.png";
+const supportedProjectSchemaVersions = new Set([1, 2, 3, 4, 5, 6, 7, 8]);
 const defaultTracePointCount = 100;
 const maximumTracePointCount = 2000;
 const draftStoragePrefix = "scidigitizer:draft:v1:";
 let pointIdSequence = 0;
 let guideIdSequence = 0;
 let editSession = null;
+let draftRecoveryAvailable = false;
+let plotDetectionSequence = 0;
 let traceCorridorRevision = 0;
 let traceCorridorCache = null;
+let interferenceScanSequence = 0;
+let colorDiscoverySequence = 0;
+let targetSelectionSequence = 0;
+let traceTaskSequence = 0;
+
+const computeClient = createComputeClient({
+  workerUrl: new URL("src/trace-worker.js?v=0.20.0-preview.3.21", document.baseURI).href,
+});
+
+function currentComputeImage() {
+  if (!state.imageData) return null;
+  return {
+    rgba: state.imageData.data,
+    width: state.imageData.width,
+    height: state.imageData.height,
+  };
+}
+
+function runBackgroundOperation(operation, payload) {
+  const image = currentComputeImage();
+  if (!image) return Promise.reject(new Error("工作图像尚未准备完成"));
+  // Display canvases are not structured-cloneable. Only send the numerical
+  // Pen contract to the Worker (file:// uses the exact same payload).
+  const mask = payload.inclusionMask;
+  const numericalPayload = { ...payload, inclusionMask: mask ? {
+    data: mask.data, columns: mask.columns, rows: mask.rows,
+    allowed: mask.allowed, mode: mask.mode,
+  } : null };
+  return computeClient.run(
+    operation,
+    numericalPayload,
+    () => runComputeOperation(operation, numericalPayload, image),
+  );
+}
 
 const editableControlSelectors = [
-  "#x-scale", "#y-scale", "#x-value-1", "#x-value-2", "#x-value-3",
-  "#y-value-1", "#y-value-2", "#y-value-3", "#x-label", "#y-label",
+  "#x-scale", "#y-scale", "#x-value-1", "#x-value-2", "#x-value-3", "#x-value-4", "#x-value-5",
+  "#y-value-1", "#y-value-2", "#y-value-3", "#y-value-4", "#y-value-5", "#x-label", "#y-label",
   "#series-label", "#color-threshold", "#max-jump", "#max-gap", "#sampling-mode",
   "#peak-density", "#peak-width", "#noise-density", "#noise-window", "#strict-guide",
-  "#target-style", "#path-refinement", "#trace-point-count", "#export-density",
-  "#trace-corridor-width",
+  "#target-style", "#trace-orientation", "#path-refinement", "#trace-point-count", "#export-density",
+  "#trace-corridor-width", "#trace-corridor-mode", "#calibration-snap",
 ];
 
 let imageLoadSequence = 0;
@@ -155,7 +226,7 @@ function formatAngleDegrees(value) {
 }
 
 function seriesTargetColor(series, index = 0) {
-  return colorToCss(series?.seedColor, series?.overlayColor ?? seriesPalette[index % seriesPalette.length]);
+  return colorToCss(series?.seedColor, seriesPalette[index % seriesPalette.length]);
 }
 
 function colorDistance(left, right) {
@@ -211,14 +282,18 @@ const pickButtonByMode = {
   x1: $("#pick-x-1"),
   x2: $("#pick-x-2"),
   x3: $("#pick-x-3"),
+  x4: $("#pick-x-4"),
+  x5: $("#pick-x-5"),
   y1: $("#pick-y-1"),
   y2: $("#pick-y-2"),
   y3: $("#pick-y-3"),
+  y4: $("#pick-y-4"),
+  y5: $("#pick-y-5"),
 };
 const calibrationPointKeys = Object.keys(pickButtonByMode);
 
 function calibrationPointLabel(key) {
-  const suffix = { 1: "₁", 2: "₂", 3: "₃" }[key?.at(-1)] ?? "";
+  const suffix = { 1: "₁", 2: "₂", 3: "₃", 4: "₄", 5: "₅" }[key?.at(-1)] ?? "";
   return `${key?.startsWith("x") ? "x" : "y"}${suffix}`;
 }
 
@@ -227,7 +302,35 @@ function calibrationCoordinate(key) {
 }
 
 function calibrationPointVisible(key) {
-  return !key?.endsWith("3") || $(`#${calibrationCoordinate(key)}-scale`).value === "piecewise";
+  const axis = calibrationCoordinate(key);
+  return Number(key?.at(-1)) <= activeCalibrationReferenceCount(axis);
+}
+
+function activeCalibrationReferenceCount(axis) {
+  const scaleMinimum = $(`#${axis}-scale`)?.value === "piecewise" ? 3 : minimumCalibrationReferences;
+  return clamp(
+    Math.max(scaleMinimum, Number(state.calibrationReferenceCounts?.[axis]) || minimumCalibrationReferences),
+    scaleMinimum,
+    maximumCalibrationReferences,
+  );
+}
+
+function setCalibrationReferenceCount(axis, count, { clearRemoved = true } = {}) {
+  const minimum = $(`#${axis}-scale`)?.value === "piecewise" ? 3 : minimumCalibrationReferences;
+  const next = clamp(Math.round(Number(count) || minimum), minimum, maximumCalibrationReferences);
+  const previous = activeCalibrationReferenceCount(axis);
+  state.calibrationReferenceCounts[axis] = next;
+  if (clearRemoved && next < previous) {
+    for (let index = next + 1; index <= maximumCalibrationReferences; index += 1) {
+      state.calibrationPoints[`${axis}${index}`] = null;
+      const input = $(`#${axis}-value-${index}`);
+      if (input) input.value = "";
+    }
+  }
+  if (state.selectedCalibrationKey && !calibrationPointVisible(state.selectedCalibrationKey)) {
+    state.selectedCalibrationKey = null;
+  }
+  return next;
 }
 
 function showToast(message) {
@@ -353,21 +456,35 @@ function captureEditableSnapshot() {
     if (!element) continue;
     controls[selector] = element.type === "checkbox" ? Boolean(element.checked) : element.value;
   }
+  const targetStyle = $("#target-style");
   return {
-    version: 1,
+    version: 2,
     sourceFingerprint: state.source.imageFingerprint,
     rotationDegrees: state.rotationCommitted.degrees,
     perspectiveCommitted: cloneSerializable(state.perspectiveCommitted),
+    targetStyleDataset: {
+      autoDetected: targetStyle.dataset.autoDetected ?? null,
+      autoConfidence: targetStyle.dataset.autoConfidence ?? null,
+      autoFallback: targetStyle.dataset.autoFallback ?? null,
+    },
     geometry: cloneSerializable({
       plotRect: state.plotRect,
       exclusions: state.exclusions,
+      exclusionSuggestions: state.exclusionSuggestions,
+      exclusionSuggestionIndex: state.exclusionSuggestionIndex,
       traceCorridorOperations: state.traceCorridorOperations,
       calibrationPoints: state.calibrationPoints,
+      calibrationReferenceCounts: state.calibrationReferenceCounts,
       seed: state.seed,
       seedColor: state.seedColor,
+      automaticMarkerSeries: state.automaticMarkerSeries,
+      automaticMarkerConfidence: state.automaticMarkerConfidence,
       anchors: state.anchors,
       rawPath: state.rawPath,
       path: state.path,
+      traceOrientation: state.traceOrientation,
+      traceStale: state.traceStale,
+      traceError: state.traceError,
       series: state.series,
       editingSeriesId: state.editingSeriesId,
       calibrationBeforeSeriesEdit: state.calibrationBeforeSeriesEdit,
@@ -404,16 +521,40 @@ function resetHistorySession() {
   editSession?.reset();
 }
 
+function syncDraftRecovery() {
+  const button = $("#restore-draft");
+  button.hidden = !draftRecoveryAvailable;
+  button.disabled = !draftRecoveryAvailable || Boolean(state.computeBusy) || state.rotationPreviewActive;
+}
+
 function commitHistory(label, options = {}) {
   return editSession?.commit(label, options) ?? false;
 }
 
 function restoreEditableSnapshot(snapshot) {
+  plotDetectionSequence += 1;
+  interferenceScanSequence += 1;
+  colorDiscoverySequence += 1;
+  targetSelectionSequence += 1;
+  traceTaskSequence += 1;
+  state.computeBusy = null;
+  delete $("#suggest-exclusions").dataset.scanning;
   if (
     !snapshot
     || !snapshot.geometry
     || typeof snapshot.geometry !== "object"
     || snapshot.sourceFingerprint !== state.source.imageFingerprint
+    || (snapshot.controls !== null && snapshot.controls !== undefined && !isPlainRecord(snapshot.controls))
+  ) return false;
+  if (!validateEditableGeometry(snapshot.geometry)) return false;
+  if (
+    snapshot.version >= 2
+    && (!isPlainRecord(snapshot.targetStyleDataset)
+      || !["autoDetected", "autoConfidence", "autoFallback"].every((key) => (
+        snapshot.targetStyleDataset[key] === null
+        || snapshot.targetStyleDataset[key] === undefined
+        || typeof snapshot.targetStyleDataset[key] === "string"
+      )))
   ) return false;
   const degrees = normalizeRotationDegrees(snapshot.rotationDegrees ?? 0);
   const perspectiveChanged = JSON.stringify(snapshot.perspectiveCommitted ?? null) !== JSON.stringify(state.perspectiveCommitted ?? null);
@@ -428,7 +569,21 @@ function restoreEditableSnapshot(snapshot) {
     state.source.workingHeight = state.image.height;
   }
   const geometry = cloneSerializable(snapshot.geometry);
-  Object.assign(state, geometry, {
+  for (const key of [
+    "plotRect", "exclusions", "exclusionSuggestions", "exclusionSuggestionIndex",
+    "traceCorridorOperations", "calibrationPoints", "calibrationReferenceCounts",
+    "seed", "seedColor", "automaticMarkerSeries", "automaticMarkerConfidence",
+    "anchors", "rawPath", "path", "series", "editingSeriesId",
+    "calibrationBeforeSeriesEdit", "plotSuggestions", "plotSuggestionIndex",
+  ]) {
+    if (Object.hasOwn(geometry, key)) state[key] = geometry[key];
+  }
+  state.traceOrientation = ["horizontal", "vertical", "parametric"].includes(geometry.traceOrientation)
+    ? geometry.traceOrientation
+    : resolvedTraceOrientation(null, geometry.rawPath?.length ? geometry.rawPath : geometry.path);
+  state.traceStale = Boolean(geometry.traceStale);
+  state.traceError = typeof geometry.traceError === "string" ? geometry.traceError : null;
+  Object.assign(state, {
     mode: null,
     draftRect: null,
     draftExclusion: null,
@@ -443,17 +598,63 @@ function restoreEditableSnapshot(snapshot) {
     draggedCalibrationKey: null,
     calibrationDragMoved: false,
     reviewRegionIndex: 0,
+    ambiguityResolutionTarget: null,
     hoveredAnchorIndex: null,
     selectedAnchorIndex: geometry.anchors?.length ? 0 : null,
     draggedAnchorIndex: null,
   });
   state.traceCorridorOperations ??= [];
+  state.automaticMarkerSeries = Boolean(state.automaticMarkerSeries);
+  state.automaticMarkerConfidence = Number(state.automaticMarkerConfidence) || 0;
+  state.exclusionSuggestions ??= [];
+  state.exclusionSuggestionIndex = clamp(
+    Number(state.exclusionSuggestionIndex) || 0,
+    0,
+    Math.max(0, state.exclusionSuggestions.length - 1),
+  );
+  state.calibrationPoints = { ...emptyCalibrationPoints(), ...(state.calibrationPoints ?? {}) };
+  state.calibrationReferenceCounts = {
+    x: Math.max(2, Number(state.calibrationReferenceCounts?.x) || 2),
+    y: Math.max(2, Number(state.calibrationReferenceCounts?.y) || 2),
+  };
   invalidateTraceCorridor();
+  $("#trace-corridor-mode").value = snapshot.controls?.["#trace-corridor-mode"]
+    ?? (state.traceOrientation === "parametric" ? "strict" : "local");
   for (const [selector, value] of Object.entries(snapshot.controls ?? {})) {
     const element = $(selector);
     if (!element) continue;
     if (element.type === "checkbox") element.checked = Boolean(value);
     else element.value = value;
+  }
+  const targetStyle = $("#target-style");
+  delete targetStyle.dataset.autoDetected;
+  delete targetStyle.dataset.autoConfidence;
+  delete targetStyle.dataset.autoFallback;
+  if (snapshot.version >= 2) {
+    for (const key of ["autoDetected", "autoConfidence", "autoFallback"]) {
+      const value = snapshot.targetStyleDataset[key];
+      if (typeof value === "string") targetStyle.dataset[key] = value;
+    }
+  } else if (state.automaticMarkerSeries && targetStyle.value === "markers") {
+    targetStyle.dataset.autoDetected = "markers";
+    targetStyle.dataset.autoConfidence = String(state.automaticMarkerConfidence);
+  }
+  if (!Object.hasOwn(geometry, "traceStale")) {
+    // Old autosaved drafts bypass project-file import. Validate them once as
+    // well, instead of displaying/exporting their old out-of-Pen results as current.
+    const restored = prepareRestoredTrace(state, {
+      orientation: state.traceOrientation, inclusionMask: traceCorridorMask(),
+      width: canvas.width, height: canvas.height, rect: state.plotRect,
+    });
+    for (const key of ["path", "rawPath", "traceStale", "traceError"]) state[key] = restored[key];
+    state.series = state.series.map((series) => {
+      const orientation = resolvedTraceOrientation(series.parameters, series.path);
+      const corridorMode = series.parameters?.corridorMode ?? (orientation === "parametric" ? "strict" : "local");
+      return prepareRestoredTrace({ ...series, parameters: { ...series.parameters, corridorMode } }, {
+        orientation, inclusionMask: buildTraceCorridorMask(series.traceCorridorOperations, corridorMode),
+        width: canvas.width, height: canvas.height, rect: state.plotRect,
+      });
+    });
   }
   syncRangeOutputs();
   updateUi();
@@ -461,11 +662,12 @@ function restoreEditableSnapshot(snapshot) {
   return true;
 }
 
-function restoreAutosavedDraft() {
+function restorePreviousDraft() {
+  if (!draftRecoveryAvailable) return false;
   const restored = editSession?.restoreDraft() ?? false;
-  if (restored) {
-    showToast("已自动恢复这张图片上次未导出的编辑草稿");
-  }
+  showToast(restored
+    ? "已恢复这张图片的上次草稿"
+    : "无法恢复这张图片的草稿；草稿未删除，可尝试载入已保存的项目文件");
   return restored;
 }
 
@@ -481,6 +683,12 @@ editSession = createEditSession({
   maximumEntries: 60,
   onHistoryChange: syncHistoryControls,
   onSaveStatus(status) {
+    // Recovery is offered before the first new edit. From then on autosave
+    // belongs to the new session, not the previous one.
+    if (["saving", "saved", "restored", "cleared"].includes(status)) {
+      draftRecoveryAvailable = false;
+      syncDraftRecovery();
+    }
     const element = $("#autosave-status");
     if (!element) return;
     element.textContent = {
@@ -492,6 +700,9 @@ editSession = createEditSession({
     }[status] ?? element.textContent;
   },
 });
+
+// Persist actual pending edits before a refresh, never an untouched new view.
+window.addEventListener("pagehide", () => editSession?.flushPendingSave());
 
 function syncModeControls() {
   for (const [key, button] of Object.entries(pickButtonByMode)) {
@@ -538,6 +749,7 @@ function syncModeControls() {
 function setMode(mode) {
   if (state.rotationPreviewActive && mode && !mode.startsWith("align-")) return;
   state.mode = state.mode === mode ? null : mode;
+  if (state.mode !== "guide") state.ambiguityResolutionTarget = null;
   if (state.mode && !calibrationPointKeys.includes(state.mode)) {
     state.selectedCalibrationKey = null;
   }
@@ -553,9 +765,9 @@ function setMode(mode) {
     y3: "点击 Y 轴分段映射的第三个已知刻度位置",
     seed: "点击目标曲线的清晰位置以采样颜色；这会开始一条新的追踪路径",
     guide: "点击目标曲线应经过的位置；遮挡处也可按趋势放置，右键菱形可删除",
-    exclude: "拖拽框住遮挡、图例、文字或其他不应参与追踪的区域；框内将由引导点和两侧趋势恢复",
-    "corridor-pen": "按住左键沿目标曲线涂画；只在画过的横向区段内限制自动追踪",
-    "corridor-erase": "按住左键擦除 Pen 走廊；完全擦空的横向区段会恢复普通搜索",
+    exclude: "拖拽框住遮挡、图例、文字或其他不应参与追踪的区域；程序会在远端自动重连，并用两侧趋势恢复框内路径",
+    "corridor-pen": "按住左键沿目标曲线涂画；折返或横竖混合曲线需要涂完整路径，引导点添加顺序不限",
+    "corridor-erase": "按住左键擦除 Pen 走廊；范围遵循上方 Pen 设置，与追踪方向无关",
     "align-horizontal": "校水平：把十字中心对准同一条水平参考线，依次点击相距较远的 R1、R2",
     "align-vertical": "校垂直：把十字中心对准同一条垂直参考线，依次点击相距较远的 R1、R2",
   };
@@ -567,19 +779,35 @@ function setMode(mode) {
 }
 
 function resetExtraction({ keepCalibrationValues = true } = {}) {
+  plotDetectionSequence += 1;
+  state.traceStale = false;
+  state.traceError = null;
+  $("#trace-corridor-mode").value = "strict";
+  interferenceScanSequence += 1;
+  colorDiscoverySequence += 1;
+  targetSelectionSequence += 1;
+  traceTaskSequence += 1;
+  state.computeBusy = null;
+  delete $("#suggest-exclusions").dataset.scanning;
   state.plotRect = null;
   state.draftRect = null;
   state.exclusions = [];
+  state.exclusionSuggestions = [];
+  state.exclusionSuggestionIndex = 0;
+  state.colorSuggestions = [];
   state.draftExclusion = null;
   state.traceCorridorOperations = [];
   state.draftTraceCorridor = null;
   invalidateTraceCorridor();
-  state.calibrationPoints = { x1: null, x2: null, x3: null, y1: null, y2: null, y3: null };
+  state.calibrationPoints = emptyCalibrationPoints();
   state.seed = null;
   state.seedColor = null;
+  state.automaticMarkerSeries = false;
+  state.automaticMarkerConfidence = 0;
   state.anchors = [];
   $("#strict-guide").checked = false;
   $("#target-style").value = "auto";
+  $("#trace-orientation").value = "auto";
   delete $("#target-style").dataset.autoDetected;
   delete $("#target-style").dataset.autoConfidence;
   delete $("#target-style").dataset.autoFallback;
@@ -587,6 +815,7 @@ function resetExtraction({ keepCalibrationValues = true } = {}) {
   $("#path-refinement").value = "full";
   state.rawPath = [];
   state.path = [];
+  state.traceOrientation = "horizontal";
   state.series = [];
   state.editingSeriesId = null;
   state.mode = null;
@@ -609,15 +838,17 @@ function resetExtraction({ keepCalibrationValues = true } = {}) {
   state.calibrationDragMoved = false;
   state.calibrationBeforeSeriesEdit = null;
   state.reviewRegionIndex = 0;
+  state.ambiguityResolutionTarget = null;
   if (!keepCalibrationValues) {
-    $("#x-value-1").value = "";
-    $("#x-value-2").value = "";
-    $("#x-value-3").value = "";
-    $("#y-value-1").value = "";
-    $("#y-value-2").value = "";
-    $("#y-value-3").value = "";
-    $("#x-scale").value = "linear";
-    $("#y-scale").value = "linear";
+    for (const selector of editableControlSelectors) {
+      const element = $(selector);
+      if (element.type === "checkbox") element.checked = element.defaultChecked;
+      else if (element.tagName === "SELECT") {
+        element.value = [...element.options].find((option) => option.defaultSelected)?.value ?? element.options[0].value;
+      } else element.value = element.defaultValue;
+    }
+    state.calibrationReferenceCounts = { x: 2, y: 2 };
+    syncRangeOutputs();
   }
   updateUi();
 }
@@ -690,23 +921,29 @@ function traceCorridorMask() {
     && traceCorridorCache.revision === traceCorridorRevision
     && traceCorridorCache.width === canvas.width
     && traceCorridorCache.height === canvas.height
+    && traceCorridorCache.mode === $("#trace-corridor-mode").value
   ) return traceCorridorCache.activePixels ? traceCorridorCache : null;
 
+  traceCorridorCache = buildTraceCorridorMask(state.traceCorridorOperations, $("#trace-corridor-mode").value);
+  if (traceCorridorCache) traceCorridorCache.revision = traceCorridorRevision;
+  return traceCorridorCache;
+}
+
+function buildTraceCorridorMask(operations, mode = "local") {
+  if (!operations?.length) return null;
   const maskCanvas = document.createElement("canvas");
   maskCanvas.width = canvas.width;
   maskCanvas.height = canvas.height;
   const maskContext = maskCanvas.getContext("2d", { willReadFrequently: true });
-  renderTraceCorridorOperations(maskContext, state.traceCorridorOperations);
+  renderTraceCorridorOperations(maskContext, operations);
   const rgba = maskContext.getImageData(0, 0, canvas.width, canvas.height).data;
   const data = new Uint8Array(canvas.width * canvas.height);
-  const columns = new Uint8Array(canvas.width);
-  let activePixels = 0;
   for (let index = 0; index < data.length; index += 1) {
     if (rgba[index * 4 + 3] < 32) continue;
     data[index] = 1;
-    columns[index % canvas.width] = 1;
-    activePixels += 1;
   }
+  const mask = prepareInclusionMask(data, canvas.width, canvas.height, mode);
+  if (!mask) return null;
 
   const displayCanvas = document.createElement("canvas");
   displayCanvas.width = canvas.width;
@@ -718,16 +955,12 @@ function traceCorridorMask() {
   displayContext.fillRect(0, 0, canvas.width, canvas.height);
   displayContext.globalCompositeOperation = "source-over";
 
-  traceCorridorCache = {
-    revision: traceCorridorRevision,
+  return {
+    ...mask,
     width: canvas.width,
     height: canvas.height,
-    data,
-    columns,
-    activePixels,
     displayCanvas,
   };
-  return activePixels ? traceCorridorCache : null;
 }
 
 function traceCorridorColumnCount(mask = traceCorridorMask()) {
@@ -735,14 +968,6 @@ function traceCorridorColumnCount(mask = traceCorridorMask()) {
   let count = 0;
   for (const covered of mask.columns) count += covered ? 1 : 0;
   return count;
-}
-
-function constrainToCurrentTraceCorridor(path, inclusionMask = traceCorridorMask()) {
-  return constrainPathToInclusionMask(path, {
-    inclusionMask,
-    width: canvas.width,
-    rect: state.plotRect,
-  });
 }
 
 function boundedPlotPoint(point) {
@@ -805,6 +1030,23 @@ function drawTraceCorridor(drawingContext = context, focus = null) {
     );
   } else {
     drawingContext.drawImage(mask.displayCanvas, 0, 0);
+    drawingContext.strokeStyle = "rgba(0, 130, 130, 0.55)";
+    drawingContext.lineWidth = 1 / state.zoom;
+    drawingContext.setLineDash([4 / state.zoom, 4 / state.zoom]);
+    // Show actual entry/exit planes rather than bounding boxes: unpainted
+    // pixels beside a local stroke are no longer unrestricted outside a box.
+    const bounds = state.plotRect ?? { left: 0, top: 0, width: canvas.width, height: canvas.height };
+    drawingContext.beginPath();
+    drawingContext.rect(bounds.left, bounds.top, bounds.width, bounds.height);
+    drawingContext.clip();
+    const extent = Math.hypot(canvas.width, canvas.height) * 2;
+    for (const { nx, ny, offset } of mask.gates ?? []) {
+      const x = nx * offset, y = ny * offset;
+      drawingContext.beginPath();
+      drawingContext.moveTo(x - ny * extent, y + nx * extent);
+      drawingContext.lineTo(x + ny * extent, y - nx * extent);
+      drawingContext.stroke();
+    }
   }
   drawingContext.restore();
 }
@@ -980,7 +1222,14 @@ function drawGuideAnchors(drawingContext = context, transform = null) {
 }
 
 function pathReviewRegions() {
+  if (state.traceStale) return [];
   return findPathReviewRegions(state.path, state.plotRect);
+}
+
+function pathAmbiguityTarget() {
+  if (state.traceStale) return null;
+  const evidencePath = state.rawPath.length ? state.rawPath : state.path;
+  return findMostInformativeAmbiguity(evidencePath, state.plotRect, state.anchors);
 }
 
 function currentPathReviewRegion(regions = pathReviewRegions()) {
@@ -1041,6 +1290,54 @@ function drawCurrentReviewRegion(drawingContext = context, transform = null) {
     drawingContext.fillRect(labelX, labelY - fontSize, labelWidth, fontSize + padding);
     drawingContext.strokeRect(labelX, labelY - fontSize, labelWidth, fontSize + padding);
     drawingContext.fillStyle = "#8f1730";
+    drawingContext.fillText(label, labelX + padding, labelY);
+  }
+  drawingContext.restore();
+}
+
+function drawAmbiguityResolutionTarget(drawingContext = context, transform = null) {
+  if (state.traceStale) return;
+  const target = state.ambiguityResolutionTarget;
+  if (!target || state.mode !== "guide") return;
+  const candidateYs = [...new Set(target.candidateYs ?? [target.y])].filter(Number.isFinite);
+  if (!candidateYs.length) return;
+  const unit = transform ? 1 : 1 / state.zoom;
+  const positions = candidateYs.map((y) => (
+    transform ? transform({ x: target.x, y }) : { x: target.x, y }
+  ));
+  drawingContext.save();
+  drawingContext.strokeStyle = "#006f78";
+  drawingContext.fillStyle = "rgb(255 255 255 / 78%)";
+  drawingContext.lineWidth = transform ? 2 : Math.max(1.4, 1.8 * unit);
+  drawingContext.setLineDash(transform ? [4, 3] : [4 * unit, 3 * unit]);
+  if (positions.length > 1) {
+    drawingContext.beginPath();
+    drawingContext.moveTo(positions[0].x, Math.min(...positions.map((point) => point.y)));
+    drawingContext.lineTo(positions[0].x, Math.max(...positions.map((point) => point.y)));
+    drawingContext.stroke();
+  }
+  drawingContext.setLineDash([]);
+  for (const position of positions) {
+    drawingContext.beginPath();
+    drawingContext.arc(position.x, position.y, transform ? 7 : Math.max(4.5, 6 * unit), 0, Math.PI * 2);
+    drawingContext.fill();
+    drawingContext.stroke();
+  }
+  if (!transform) {
+    const label = translateMessage("请点击正确分支");
+    const fontSize = Math.max(10, 11 * unit);
+    const padding = 4 * unit;
+    drawingContext.font = `700 ${fontSize}px ui-sans-serif`;
+    const labelWidth = drawingContext.measureText(label).width + padding * 2;
+    const maximumY = Math.max(...candidateYs);
+    const labelX = clamp(target.x + 10 * unit, padding, drawingContext.canvas.width - labelWidth - padding);
+    const labelY = clamp(maximumY + 18 * unit, fontSize + padding, drawingContext.canvas.height - padding);
+    drawingContext.fillStyle = "rgb(236 253 252 / 96%)";
+    drawingContext.strokeStyle = "#006f78";
+    drawingContext.lineWidth = Math.max(1, unit);
+    drawingContext.fillRect(labelX, labelY - fontSize, labelWidth, fontSize + padding);
+    drawingContext.strokeRect(labelX, labelY - fontSize, labelWidth, fontSize + padding);
+    drawingContext.fillStyle = "#00545b";
     drawingContext.fillText(label, labelX + padding, labelY);
   }
   drawingContext.restore();
@@ -1120,6 +1417,7 @@ function drawMagnifier(point = state.magnifierPoint, { includeAllSaved = false }
   if (!state.rotationPreviewActive) {
     drawTraceCorridor(magnifierContext, point);
     drawCurrentReviewRegion(magnifierContext, magnifierTransform);
+    drawAmbiguityResolutionTarget(magnifierContext, magnifierTransform);
     for (const series of state.series) {
       if (series.id === state.editingSeriesId || !(includeAllSaved || series.visible)) continue;
       drawDataPoints(series.path, {
@@ -1173,11 +1471,13 @@ function activeSamplingParameters() {
   };
 }
 
-function samplePixelPath(path, count, parameters = activeSamplingParameters()) {
-  if (parameters.samplingMode === "peak") return resamplePixelPathAdaptive(path, count, parameters);
-  if (parameters.samplingMode === "noise") return resamplePixelPathRoughness(path, count, parameters);
-  if (parameters.samplingMode === "geometry") return resamplePixelPathGeometry(path, count);
-  return resamplePixelPath(path, count);
+function resolvedTraceOrientation(parameters, path = []) {
+  const explicit = parameters?.resolvedOrientation;
+  if (["horizontal", "vertical", "parametric"].includes(explicit)) return explicit;
+  if (path.some((point) => point.traceOrientation === "parametric" || point.closedPath)) {
+    return "parametric";
+  }
+  return path.some((point) => point.traceOrientation === "vertical") ? "vertical" : "horizontal";
 }
 
 function drawDataPoints(path, {
@@ -1187,6 +1487,7 @@ function drawDataPoints(path, {
   color = "#111111",
 } = {}) {
   if (!path?.length) return;
+  if (active && state.traceStale) return;
   for (const point of path) drawDataPointCircle(point, drawingContext, transform, { active, color });
 }
 
@@ -1231,12 +1532,43 @@ function draw({ includeAllSaved = false, includeGuides = true, includeCorridor =
     context.restore();
   }
 
+  const suggestedExclusion = state.exclusionSuggestions[state.exclusionSuggestionIndex];
+  if (suggestedExclusion) {
+    context.save();
+    context.strokeStyle = "#e09124";
+    context.fillStyle = "rgba(232, 151, 38, 0.13)";
+    context.lineWidth = Math.max(1.4, 2 / state.zoom);
+    context.setLineDash([7 / state.zoom, 4 / state.zoom]);
+    context.fillRect(
+      suggestedExclusion.left,
+      suggestedExclusion.top,
+      suggestedExclusion.width,
+      suggestedExclusion.height,
+    );
+    context.strokeRect(
+      suggestedExclusion.left,
+      suggestedExclusion.top,
+      suggestedExclusion.width,
+      suggestedExclusion.height,
+    );
+    context.setLineDash([]);
+    context.fillStyle = "#9a5b08";
+    context.font = `${Math.max(9, 11 / state.zoom)}px system-ui, sans-serif`;
+    context.fillText(
+      `建议 ${state.exclusionSuggestionIndex + 1}`,
+      suggestedExclusion.left + 4 / state.zoom,
+      Math.max(12 / state.zoom, suggestedExclusion.top - 4 / state.zoom),
+    );
+    context.restore();
+  }
+
   if (includeCorridor) {
     drawTraceCorridor();
     drawDraftTraceCorridor();
   }
 
   if (!includeAllSaved) drawCurrentReviewRegion();
+  if (!includeAllSaved) drawAmbiguityResolutionTarget();
   drawPointLayers({ includeAllSaved });
   if (includeGuides) drawGuideAnchors();
   drawCalibrationPoints();
@@ -1284,18 +1616,22 @@ function scheduleInteractiveDraw() {
 }
 
 function xCalibration() {
+  const points = axisCalibrationPointKeys("x").map((key, index) => ({
+    key,
+    pixel: state.calibrationPoints[key]?.x,
+    value: numericInputValue(`#x-value-${index + 1}`),
+    uncertaintyPx: state.calibrationPoints[key]?.uncertaintyPx,
+    snapped: Boolean(state.calibrationPoints[key]?.snapped),
+    snapConfidence: state.calibrationPoints[key]?.snapConfidence,
+  }));
   const calibration = {
     scale: $("#x-scale").value,
-    point1: state.calibrationPoints.x1?.x,
-    point2: state.calibrationPoints.x2?.x,
-    value1: numericInputValue("#x-value-1"),
-    value2: numericInputValue("#x-value-2"),
+    point1: points[0]?.pixel,
+    point2: points[1]?.pixel,
+    value1: points[0]?.value,
+    value2: points[1]?.value,
+    points,
   };
-  calibration.points = [
-    { pixel: state.calibrationPoints.x1?.x, value: numericInputValue("#x-value-1") },
-    { pixel: state.calibrationPoints.x2?.x, value: numericInputValue("#x-value-2") },
-    { pixel: state.calibrationPoints.x3?.x, value: numericInputValue("#x-value-3") },
-  ];
   return calibration;
 }
 
@@ -1305,27 +1641,33 @@ function numericInputValue(selector) {
 }
 
 function yCalibration() {
+  const points = axisCalibrationPointKeys("y").map((key, index) => ({
+    key,
+    pixel: state.calibrationPoints[key]?.y,
+    value: numericInputValue(`#y-value-${index + 1}`),
+    uncertaintyPx: state.calibrationPoints[key]?.uncertaintyPx,
+    snapped: Boolean(state.calibrationPoints[key]?.snapped),
+    snapConfidence: state.calibrationPoints[key]?.snapConfidence,
+  }));
   const calibration = {
     scale: $("#y-scale").value,
-    point1: state.calibrationPoints.y1?.y,
-    point2: state.calibrationPoints.y2?.y,
-    value1: numericInputValue("#y-value-1"),
-    value2: numericInputValue("#y-value-2"),
+    point1: points[0]?.pixel,
+    point2: points[1]?.pixel,
+    value1: points[0]?.value,
+    value2: points[1]?.value,
+    points,
   };
-  calibration.points = [
-    { pixel: state.calibrationPoints.y1?.y, value: numericInputValue("#y-value-1") },
-    { pixel: state.calibrationPoints.y2?.y, value: numericInputValue("#y-value-2") },
-    { pixel: state.calibrationPoints.y3?.y, value: numericInputValue("#y-value-3") },
-  ];
   return calibration;
 }
 
 function currentCalibrationSnapshot() {
   return cloneSerializable({
-    version: 1,
+    version: 2,
     x: xCalibration(),
     y: yCalibration(),
     points: state.calibrationPoints,
+    referenceCounts: state.calibrationReferenceCounts,
+    snapEnabled: Boolean($("#calibration-snap")?.checked),
     labels: {
       x: $("#x-label").value.trim(),
       y: $("#y-label").value.trim(),
@@ -1337,7 +1679,7 @@ function projectCalibrationSnapshot(project) {
   const xAxis = project?.axes?.x ?? {};
   const yAxis = project?.axes?.y ?? {};
   return cloneSerializable({
-    version: 1,
+    version: 2,
     x: {
       scale: xAxis.scale ?? "linear",
       point1: xAxis.point1,
@@ -1354,9 +1696,9 @@ function projectCalibrationSnapshot(project) {
       value2: yAxis.value2,
       points: yAxis.points ?? [],
     },
-    points: project?.calibrationPoints ?? {
-      x1: null, x2: null, x3: null, y1: null, y2: null, y3: null,
-    },
+    points: { ...emptyCalibrationPoints(), ...(project?.calibrationPoints ?? {}) },
+    referenceCounts: project?.calibrationReferenceCounts,
+    snapEnabled: project?.calibrationSnapEnabled,
     labels: {
       x: xAxis.label ?? "",
       y: yAxis.label ?? "",
@@ -1370,21 +1712,33 @@ function curveCalibrationSnapshot(series) {
 
 function applyCalibrationSnapshot(snapshot) {
   if (!snapshot?.x || !snapshot?.y) return false;
-  state.calibrationPoints = cloneSerializable(snapshot.points ?? {
-    x1: null, x2: null, x3: null, y1: null, y2: null, y3: null,
-  });
+  state.calibrationPoints = cloneSerializable({ ...emptyCalibrationPoints(), ...(snapshot.points ?? {}) });
   for (const axis of ["x", "y"]) {
     const calibration = snapshot[axis] ?? {};
     $(`#${axis}-scale`).value = calibration.scale ?? "linear";
-    $(`#${axis}-value-1`).value = calibration.value1 !== null && calibration.value1 !== undefined
-      && Number.isFinite(Number(calibration.value1)) ? String(calibration.value1) : "";
-    $(`#${axis}-value-2`).value = calibration.value2 !== null && calibration.value2 !== undefined
-      && Number.isFinite(Number(calibration.value2)) ? String(calibration.value2) : "";
-    const thirdValue = calibration.points?.[2]?.value;
-    $(`#${axis}-value-3`).value = thirdValue !== null && thirdValue !== undefined
-      && Number.isFinite(Number(thirdValue)) ? String(thirdValue) : "";
+    const populatedPointCount = Math.max(
+      2,
+      ...(calibration.points ?? []).map((point, index) => (
+        point && (
+          (point.pixel !== null && point.pixel !== undefined && point.pixel !== "" && Number.isFinite(Number(point.pixel)))
+          || (point.value !== null && point.value !== undefined && point.value !== "" && Number.isFinite(Number(point.value)))
+        ) ? index + 1 : 0
+      )),
+    );
+    state.calibrationReferenceCounts[axis] = clamp(
+      Number(snapshot.referenceCounts?.[axis]) || populatedPointCount || (calibration.scale === "piecewise" ? 3 : 2),
+      calibration.scale === "piecewise" ? 3 : 2,
+      maximumCalibrationReferences,
+    );
+    for (let index = 1; index <= maximumCalibrationReferences; index += 1) {
+      const legacyValue = index === 1 ? calibration.value1 : index === 2 ? calibration.value2 : undefined;
+      const pointValue = calibration.points?.[index - 1]?.value ?? legacyValue;
+      $(`#${axis}-value-${index}`).value = pointValue !== null && pointValue !== undefined
+        && Number.isFinite(Number(pointValue)) ? String(pointValue) : "";
+    }
     $(`#${axis}-label`).value = snapshot.labels?.[axis] ?? "";
   }
+  if (typeof snapshot.snapEnabled === "boolean") $("#calibration-snap").checked = snapshot.snapEnabled;
   state.selectedCalibrationKey = null;
   state.draggedCalibrationKey = null;
   state.calibrationDragMoved = false;
@@ -1408,8 +1762,7 @@ function syncCalibrationValidation() {
   const xError = calibrationError(xCalibration(), "X 轴");
   const yError = calibrationError(yCalibration(), "Y 轴");
   for (const axis of ["x", "y"]) {
-    const scale = $(`#${axis}-scale`).value;
-    const ids = [`#${axis}-value-1`, `#${axis}-value-2`, ...(scale === "piecewise" ? [`#${axis}-value-3`] : [])];
+    const ids = axisCalibrationPointKeys(axis).map((_, index) => `#${axis}-value-${index + 1}`);
     const error = axis === "x" ? xError : yError;
     const valueError = Boolean(error && /(刻度值|Log10)/.test(error));
     for (const selector of ids) {
@@ -1429,7 +1782,7 @@ function syncCalibrationValidation() {
 }
 
 function axisCalibrationPointKeys(axis) {
-  return [`${axis}1`, `${axis}2`, ...($(`#${axis}-scale`).value === "piecewise" ? [`${axis}3`] : [])];
+  return Array.from({ length: activeCalibrationReferenceCount(axis) }, (_, index) => `${axis}${index + 1}`);
 }
 
 function calibrationAxisAudit(axis) {
@@ -1438,7 +1791,7 @@ function calibrationAxisAudit(axis) {
     ? (state.plotRect?.width ?? canvas.width)
     : (state.plotRect?.height ?? canvas.height);
   const quality = assessCalibrationQuality(calibration, axisSpan);
-  if (!quality) return { axis, valid: false, quality: null, orthogonalSpread: null, warnings: [] };
+  if (!quality) return { axis, valid: false, quality: null, orthogonalSpread: null, uncertainty: null, warnings: [] };
   const coordinate = axis === "x" ? "y" : "x";
   const points = axisCalibrationPointKeys(axis)
     .map((key) => state.calibrationPoints[key])
@@ -1454,7 +1807,10 @@ function calibrationAxisAudit(axis) {
   if (orthogonalSpread > Math.max(2, orthogonalSpan * 0.01)) {
     warnings.push(`${axis.toUpperCase()} 标定点未落在同一${axis === "x" ? "水平" : "垂直"}刻度线上（偏差 ${formatNumber(orthogonalSpread, 4)} px）`);
   }
-  return { axis, valid: true, quality, orthogonalSpread, warnings };
+  const plotStart = axis === "x" ? state.plotRect?.left : state.plotRect?.top;
+  const midpoint = Number.isFinite(plotStart) ? plotStart + axisSpan / 2 : axisSpan / 2;
+  const uncertainty = calibrationUncertaintyAtPixel(midpoint, calibration);
+  return { axis, valid: true, quality, orthogonalSpread, uncertainty, warnings };
 }
 
 function calibrationAudit() {
@@ -1472,8 +1828,15 @@ function describeCalibrationAudit(audit) {
   const sensitivity = quality.sensitivityKind === "ratio"
     ? `1 px 约 ×/÷${formatNumber(quality.sensitivity, 6)}`
     : `1 px ≈ ${formatNumber(quality.sensitivity, 6)} 坐标单位`;
+  const referenceText = `${quality.referenceCount ?? 2} 个参考点`;
+  const residualText = (quality.referenceCount ?? 2) > 2
+    ? ` · 拟合 RMS ${formatNumber(quality.residualRmsPx ?? 0, 4)} px`
+    : "";
+  const uncertaintyText = Number.isFinite(audit.uncertainty?.valueSigma)
+    ? ` · 中部约 ±${formatNumber(audit.uncertainty.valueSigma, 4)} 坐标单位`
+    : "";
   const warning = audit.warnings.length ? ` · ${audit.warnings.join("；")}` : " · 基准跨度良好";
-  return `${axis}：跨度 ${formatNumber(quality.pixelSpan, 6)} px（轴宽 ${span}） · ${sensitivity}${warning}`;
+  return `${axis}：${referenceText} · 跨度 ${formatNumber(quality.pixelSpan, 6)} px（轴宽 ${span}） · ${sensitivity}${residualText}${uncertaintyText}${warning}`;
 }
 
 function syncCalibrationQuality() {
@@ -1485,7 +1848,21 @@ function syncCalibrationQuality() {
   const hasPoor = validAudits.some((entry) => entry.quality.grade === "poor");
   const hasReview = validAudits.some((entry) => entry.quality.grade === "review" || entry.warnings.length);
   element.className = `calibration-quality ${hasPoor ? "poor" : hasReview ? "review" : validAudits.length === 2 ? "good" : "waiting"}`;
+  const outlierKeys = new Set(validAudits.flatMap((entry) => entry.quality.outliers?.map((point) => point.key) ?? []));
+  for (const [key, button] of Object.entries(pickButtonByMode)) {
+    button.classList.toggle("calibration-outlier", outlierKeys.has(key));
+    if (outlierKeys.has(key)) button.title = "此参考点与其他点的稳健拟合偏差较大，建议复核";
+    else if (button.title === "此参考点与其他点的稳健拟合偏差较大，建议复核") button.title = "";
+  }
   return audit;
+}
+
+function markCalibrationPointManuallyAdjusted(point) {
+  if (!point) return;
+  point.snapped = false;
+  point.snapConfidence = 0;
+  point.snapShift = 0;
+  point.uncertaintyPx = 0.35;
 }
 
 function setCalibrationPixel(key, value) {
@@ -1494,6 +1871,7 @@ function setCalibrationPixel(key, value) {
   const coordinate = calibrationCoordinate(key);
   const maximum = coordinate === "x" ? canvas.width - 1 : canvas.height - 1;
   point[coordinate] = clamp(Number(value), 0, maximum);
+  markCalibrationPointManuallyAdjusted(point);
   state.selectedCalibrationKey = key;
   state.magnifierPoint = { ...point };
   state.cursor = null;
@@ -1509,6 +1887,7 @@ function setCalibrationPointPosition(key, x, y) {
   if (!point || !Number.isFinite(x) || !Number.isFinite(y)) return false;
   point.x = clamp(x, 0, canvas.width - 1);
   point.y = clamp(y, 0, canvas.height - 1);
+  markCalibrationPointManuallyAdjusted(point);
   state.selectedCalibrationKey = key;
   state.selectedPointId = null;
   state.selectedAnchorIndex = null;
@@ -1583,12 +1962,13 @@ function renderSeriesList() {
       ? objectLabel
       : objectLabel ? `${objectLabel} · ${samplingLabel}` : samplingLabel;
     const safeLabel = escapeHtml(series.label || `Curve ${index + 1}`);
+    const safeSeriesId = escapeHtml(series.id);
     const color = seriesTargetColor(series, index);
     const editing = series.id === state.editingSeriesId;
     const visibilityLabel = series.visible ? "隐藏" : "显示";
     const visibilityStatus = series.visible ? "画布已显示" : "画布已隐藏";
     return `
-      <div class="series-item ${editing ? "editing" : ""} ${series.visible ? "visible" : ""}" data-series-id="${series.id}">
+      <div class="series-item ${editing ? "editing" : ""} ${series.visible ? "visible" : ""}" data-series-id="${safeSeriesId}">
         <span class="series-color" style="background:${color}" title="目标曲线采样颜色"></span>
         <div class="series-copy">
           <strong data-i18n-skip>${safeLabel}</strong>
@@ -1627,6 +2007,7 @@ function dataPointById(pointId) {
 }
 
 function dataPointAt(position) {
+  if (state.traceStale) return null;
   if (!position || !state.path.length) return null;
   const hitRadius = Math.max(6, 8 / state.zoom);
   let bestId = null;
@@ -1642,6 +2023,7 @@ function dataPointAt(position) {
 }
 
 function nearestDeletableDataPoint(position, screenRadius = 28) {
+  if (state.traceStale) return null;
   if (!position || !state.path.length) return null;
   const maximumDistance = Math.max(2, screenRadius / state.zoom);
   let bestId = null;
@@ -1688,9 +2070,8 @@ function deleteGuideAnchor(index) {
   else if (state.selectedAnchorIndex > index) state.selectedAnchorIndex -= 1;
   state.draggedAnchorIndex = null;
 
-  const minimumAnchors = $("#target-style").value === "markers" ? 3 : 1;
-  if (state.path.length && state.anchors.length >= minimumAnchors) {
-    traceCurrentCurve();
+  const minimumAnchors = minimumTraceAnchorCount();
+  if (retraceIfReady()) {
     showToast(`已删除引导点 ${removedLabel}；已用剩余 ${state.anchors.length} 个引导点重新追踪`);
   } else if (state.path.length) {
     state.rawPath = [];
@@ -1713,7 +2094,62 @@ function deleteGuideAnchor(index) {
 }
 
 function sortDataPoints() {
-  state.path.sort((a, b) => a.x - b.x);
+  if (state.traceOrientation === "parametric") {
+    // The array itself is the editable traversal. Sorting a loop by X or Y
+    // would split it into two branches and corrupt export order.
+  } else if (state.traceOrientation === "vertical") {
+    state.path.sort((a, b) => a.y - b.y || a.x - b.x);
+  } else {
+    state.path.sort((a, b) => a.x - b.x || a.y - b.y);
+  }
+  state.path.forEach((point, index) => {
+    point.parametricOrder = index;
+    point.traceOrientation = state.traceOrientation;
+  });
+}
+
+function squaredDistanceToSegment(point, left, right) {
+  const deltaX = right.x - left.x;
+  const deltaY = right.y - left.y;
+  const denominator = deltaX * deltaX + deltaY * deltaY;
+  if (!(denominator > 0)) return (point.x - left.x) ** 2 + (point.y - left.y) ** 2;
+  const fraction = clamp(
+    ((point.x - left.x) * deltaX + (point.y - left.y) * deltaY) / denominator,
+    0,
+    1,
+  );
+  const projectedX = left.x + deltaX * fraction;
+  const projectedY = left.y + deltaY * fraction;
+  return (point.x - projectedX) ** 2 + (point.y - projectedY) ** 2;
+}
+
+function nearestParametricSegmentIndex(path, point) {
+  if (!path?.length) return -1;
+  const closed = path.some((candidate) => candidate.closedPath);
+  const segmentCount = closed ? path.length : path.length - 1;
+  if (segmentCount <= 0) return path.length - 1;
+  let bestIndex = 0;
+  let bestDistance = Infinity;
+  for (let index = 0; index < segmentCount; index += 1) {
+    const next = path[(index + 1) % path.length];
+    const distance = squaredDistanceToSegment(point, path[index], next);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestIndex = index;
+    }
+  }
+  return bestIndex;
+}
+
+function automaticMarkerSeriesActive() {
+  return $("#target-style").value === "markers"
+    && state.automaticMarkerSeries
+    && state.automaticMarkerConfidence >= 0.78;
+}
+
+function minimumTraceAnchorCount() {
+  if ($("#target-style").value !== "markers") return 1;
+  return automaticMarkerSeriesActive() ? 1 : 3;
 }
 
 function syncPointCountInput() {
@@ -1757,6 +2193,18 @@ function pointCoordinateInputStep(point, coordinate) {
     : String(pixelStep);
 }
 
+function pointCoordinateUncertaintyText(point) {
+  if (!calibrationsValid()) return "";
+  const xUncertainty = calibrationUncertaintyAtPixel(point.x, xCalibration());
+  const yUncertainty = calibrationUncertaintyAtPixel(
+    point.y,
+    yCalibration(),
+    Number(point.inferenceUncertainty) || 0,
+  );
+  if (!Number.isFinite(xUncertainty?.valueSigma) || !Number.isFinite(yUncertainty?.valueSigma)) return "";
+  return ` · 坐标估计约 ±${formatNumber(xUncertainty.valueSigma, 4)}, ±${formatNumber(yUncertainty.valueSigma, 4)}`;
+}
+
 function updatePointListRow(point) {
   const row = [...document.querySelectorAll(".data-point-row")]
     .find((candidate) => candidate.dataset.pointId === point.pointId);
@@ -1775,10 +2223,13 @@ function updatePointListRow(point) {
     : "";
   const inferenceModel = point.inferenceModel ? ` · 遮挡恢复 ${point.inferenceModel}` : "";
   const corridorLabel = point.corridorConstrained ? " · Pen 边界修正" : "";
-  row.title = `pixel (${formatNumber(point.x, 8)}, ${formatNumber(point.y, 8)}) · ${originLabel}${inferenceModel}${uncertainty}${corridorLabel}`;
+  const coordinateUncertainty = pointCoordinateUncertaintyText(point);
+  row.title = `pixel (${formatNumber(point.x, 8)}, ${formatNumber(point.y, 8)}) · ${originLabel}${inferenceModel}${uncertainty}${coordinateUncertainty}${corridorLabel}`;
 }
 
 function renderPointList() {
+  $("#point-list").inert = state.traceStale;
+  $("#point-list-stale").hidden = !state.traceStale || !state.path.length;
   $("#point-count").textContent = `${state.path.length} 点`;
   const calibrated = calibrationsValid();
   $("#point-x-heading").textContent = calibrated ? ($("#x-label").value.trim() || "x") : "x (px)";
@@ -1819,7 +2270,8 @@ function renderPointList() {
       : "";
     const reviewLabel = reviewPointIndices.has(index) ? " · 当前智能复核区" : "";
     const corridorLabel = point.corridorConstrained ? " · Pen 边界修正" : "";
-    const title = `pixel (${formatNumber(point.x, 8)}, ${formatNumber(point.y, 8)}) · ${originLabel}${inferenceModel}${uncertainty}${corridorLabel}${reviewLabel}`;
+    const coordinateUncertainty = pointCoordinateUncertaintyText(point);
+    const title = `pixel (${formatNumber(point.x, 8)}, ${formatNumber(point.y, 8)}) · ${originLabel}${inferenceModel}${uncertainty}${coordinateUncertainty}${corridorLabel}${reviewLabel}`;
     return `<div class="${classes}" data-point-id="${escapeHtml(point.pointId)}" title="${escapeHtml(title)}">
       <span class="point-list-index">${index + 1}</span>
       <input class="point-coordinate-input" data-coordinate="x" type="number" step="${escapeHtml(xStep)}" value="${escapeHtml(formatNumber(xValue, 12))}" title="上下箭头每次约移动 0.1 px" aria-label="第 ${index + 1} 点 x 坐标" />
@@ -1846,8 +2298,13 @@ function activeTraceParameters() {
     pointCount: state.path.length || activeTracePointCount(),
     strictGuidance: $("#strict-guide").checked,
     targetStyle: $("#target-style").value,
+    automaticMarkerSeries: automaticMarkerSeriesActive(),
+    automaticMarkerConfidence: state.automaticMarkerConfidence,
+    orientationMode: $("#trace-orientation").value,
+    resolvedOrientation: state.traceOrientation,
     refinementMode: $("#path-refinement").value,
     corridorWidth: traceCorridorWidth(),
+    corridorMode: $("#trace-corridor-mode").value,
     ...activeSamplingParameters(),
   };
 }
@@ -1866,6 +2323,7 @@ function curvesForExport() {
         rawPath: state.rawPath,
         traceCorridorOperations: state.traceCorridorOperations,
         parameters: activeTraceParameters(),
+        traceStale: state.traceStale,
         calibration: currentCalibrationSnapshot(),
       }];
   });
@@ -1913,17 +2371,29 @@ function syncReviewAssistant() {
   const element = $("#review-assistant");
   const regions = pathReviewRegions();
   const region = currentPathReviewRegion(regions);
-  $("#review-region-count").textContent = `${regions.length} 处`;
-  $("#review-focus").disabled = !region;
+  const ambiguityTarget = pathAmbiguityTarget();
+  const issueCount = Math.max(regions.length, ambiguityTarget ? 1 : 0);
+  $("#review-region-count").textContent = `${issueCount} 处`;
+  $("#review-resolve").disabled = !(ambiguityTarget || region);
+  $("#review-next").hidden = Boolean(ambiguityTarget);
   $("#review-next").disabled = regions.length <= 1;
   if (!state.path.length) {
+    element.hidden = true;
     element.className = "review-assistant waiting";
     $("#review-region-status").textContent = "追踪后自动标出最需要检查的位置";
     return regions;
   }
-  if (!region) {
+  if (!region && !ambiguityTarget) {
+    element.hidden = true;
     element.className = "review-assistant good";
     $("#review-region-status").textContent = "未发现需要重点复核的局部区间；用户修正点和引导基准已自动排除";
+    return regions;
+  }
+  element.hidden = false;
+  if (ambiguityTarget) {
+    element.className = "review-assistant review";
+    $("#review-region-status").textContent = "检测到同色候选分支。点击下方按钮后，在高亮列点击正确曲线；这个引导点会立即触发全局重追踪。";
+    $("#review-resolve").textContent = "定位并确认分支";
     return regions;
   }
   element.className = `review-assistant ${region.severity}`;
@@ -1931,6 +2401,7 @@ function syncReviewAssistant() {
     .map((reason) => `${reason.label} ${reason.count} 点`)
     .join("、");
   $("#review-region-status").textContent = `当前 ${state.reviewRegionIndex + 1}/${regions.length} · ${reviewRegionRangeLabel(region)} · ${reasonText}`;
+  $("#review-resolve").textContent = "定位并添加基准";
   return regions;
 }
 
@@ -1968,7 +2439,53 @@ function focusReviewRegion(offset = 0) {
   return true;
 }
 
+function beginReviewResolution() {
+  const ambiguityTarget = pathAmbiguityTarget();
+  const regions = pathReviewRegions();
+  const region = currentPathReviewRegion(regions);
+  const fallbackPoint = region ? state.path[region.representativeIndex] : null;
+  const target = ambiguityTarget ?? (fallbackPoint ? {
+    x: fallbackPoint.x,
+    y: fallbackPoint.y,
+    candidateYs: [fallbackPoint.y],
+    kind: "review",
+  } : null);
+  if (!target) return false;
+  state.ambiguityResolutionTarget = { ...target };
+  const candidateYs = target.candidateYs?.length ? target.candidateYs : [target.y];
+  state.magnifierPoint = {
+    x: target.x,
+    y: candidateYs.reduce((sum, y) => sum + y, 0) / candidateYs.length,
+  };
+  state.cursor = null;
+  const nearestDataPoint = [...state.path].sort((left, right) => (
+    Math.abs(left.x - target.x) - Math.abs(right.x - target.x)
+    || Math.abs(left.y - target.y) - Math.abs(right.y - target.y)
+  ))[0];
+  state.selectedPointId = nearestDataPoint?.pointId ?? null;
+  state.hoveredPointId = null;
+  state.pointHoverSource = null;
+  syncPointListSelection();
+  syncPointCursor();
+  if (state.mode !== "guide") setMode("guide");
+  else {
+    updateUi();
+    draw();
+  }
+  window.requestAnimationFrame(() => {
+    if (nearestDataPoint) revealPointInList(nearestDataPoint.pointId);
+    revealPointOnCanvas(target);
+  });
+  showToast(ambiguityTarget
+    ? "已定位最有信息量的分叉；请在高亮候选中点击正确曲线，随后将自动全局重追踪"
+    : "已定位需要复核的位置；请点击曲线应经过的位置，随后将自动重新追踪");
+  return true;
+}
+
 function updateUi() {
+  document.documentElement.dataset.computeMode = computeClient.mode();
+  document.documentElement.dataset.computeBusy = state.computeBusy ?? "idle";
+  document.documentElement.dataset.traceState = state.traceStale ? "stale" : "current";
   if (state.selectedCalibrationKey && !calibrationPointVisible(state.selectedCalibrationKey)) {
     state.selectedCalibrationKey = null;
   }
@@ -1978,14 +2495,25 @@ function updateUi() {
       ? "左键空白处新增 · 拖动圆圈/菱形 · 右键删除附近最近的普通点"
       : "可继续标定或调整追踪参数";
   }
-  $("#x-piecewise-row").hidden = $("#x-scale").value !== "piecewise";
-  $("#y-piecewise-row").hidden = $("#y-scale").value !== "piecewise";
+  for (const axis of ["x", "y"]) {
+    const referenceCount = activeCalibrationReferenceCount(axis);
+    state.calibrationReferenceCounts[axis] = referenceCount;
+    for (let index = 3; index <= maximumCalibrationReferences; index += 1) {
+      $(`#${axis}-reference-row-${index}`).hidden = index > referenceCount;
+    }
+    $(`#${axis}-reference-count`).textContent = `${referenceCount} 个参考点`;
+    $(`#add-${axis}-reference`).disabled = referenceCount >= maximumCalibrationReferences;
+    $(`#remove-${axis}-reference`).disabled = referenceCount <= ($(`#${axis}-scale`).value === "piecewise" ? 3 : 2);
+  }
   const rect = state.plotRect;
   const suggestionSuffix = state.plotSuggestions.length
     ? ` · 建议 ${state.plotSuggestionIndex + 1}/${state.plotSuggestions.length}`
     : "";
+  const interferenceSuggestionSuffix = state.exclusionSuggestions.length
+    ? ` · 待复核干扰建议 ${state.exclusionSuggestions.length}`
+    : "";
   $("#plot-status").textContent = rect
-    ? `x ${rect.left}–${rect.right} · y ${rect.top}–${rect.bottom} · ${rect.width}×${rect.height} px${suggestionSuffix} · 屏蔽区 ${state.exclusions.length}`
+    ? `x ${rect.left}–${rect.right} · y ${rect.top}–${rect.bottom} · ${rect.width}×${rect.height} px${suggestionSuffix} · 屏蔽区 ${state.exclusions.length}${interferenceSuggestionSuffix}`
     : "尚未框选";
   $("#auto-plot").textContent = state.plotSuggestions.length ? "下一个建议" : "自动建议";
   for (const [key, button] of Object.entries(pickButtonByMode)) {
@@ -1993,7 +2521,7 @@ function updateUi() {
     button.classList.toggle("complete", Boolean(point));
     button.classList.toggle("selected", key === state.selectedCalibrationKey && state.mode !== key);
     button.textContent = point
-      ? `${key} @ ${formatNumber(key.startsWith("x") ? point.x : point.y, 6)} px`
+      ? `${key} @ ${formatNumber(key.startsWith("x") ? point.x : point.y, 6)} px${point.snapped ? " · 吸附" : ""}`
       : `点击刻度 ${key.at(-1)}`;
   }
 
@@ -2013,9 +2541,18 @@ function updateUi() {
       noisy: "实验噪声线",
       markers: "marker 中心",
     }[$("#target-style").value] ?? "自动线型";
-    $("#seed-status").textContent = state.path.length
-      ? `RGB(${r}, ${g}, ${b}) · ${styleText} · ${guideText} · ${state.path.length} 个数据点`
-      : `RGB(${r}, ${g}, ${b}) · ${styleText} · ${guideText} · 等待自动追踪`;
+    const orientationText = {
+      horizontal: "横向追踪",
+      vertical: "纵向追踪",
+      parametric: "二维路径追踪",
+    }[state.traceOrientation] ?? "横向追踪";
+    $("#seed-status").textContent = state.computeBusy
+      ? `RGB(${r}, ${g}, ${b}) · 正在后台${state.computeBusy === "classify" ? "识别目标" : "追踪曲线"}…`
+      : state.traceStale
+        ? `RGB(${r}, ${g}, ${b}) · ${guideText} · ${translateMessage("追踪未完成")}`
+      : state.path.length
+        ? `RGB(${r}, ${g}, ${b}) · ${styleText} · ${orientationText} · ${guideText} · ${state.path.length} 个数据点`
+        : `RGB(${r}, ${g}, ${b}) · ${styleText} · ${guideText} · 等待自动追踪`;
   } else {
     $("#seed-swatch").removeAttribute("style");
     $("#seed-status").textContent = "尚未选择曲线";
@@ -2024,6 +2561,10 @@ function updateUi() {
   syncPointCursor();
 
   const markerMode = $("#target-style").value === "markers";
+  const requestedOrientation = $("#trace-orientation").value;
+  const parametricMode = !markerMode && (requestedOrientation === "parametric"
+    || (requestedOrientation === "auto" && state.traceOrientation === "parametric"));
+  $("#trace-2d-settings-help").hidden = !parametricMode;
   const hasTarget = Boolean(state.seedColor);
   $("#trace-primary-action").classList.toggle("has-target", hasTarget);
   $("#trace-refinement-tools").hidden = !hasTarget;
@@ -2031,6 +2572,8 @@ function updateUi() {
   $("#trace-current-actions").hidden = !hasTarget && !state.editingSeriesId;
   $("#save-series").hidden = !state.path.length && !state.series.length;
   $("#restart-session").disabled = !state.image;
+  syncDraftRecovery();
+  $("#pick-seed").disabled = Boolean(state.computeBusy);
   $("#pick-seed").textContent = state.mode === "seed"
     ? "请在图中点击曲线"
     : hasTarget
@@ -2038,31 +2581,51 @@ function updateUi() {
       : "选择目标曲线";
   $("#target-style-summary").textContent = $("#target-style").selectedOptions[0]?.textContent ?? "自动 / 普通曲线";
   $("#trace-point-count-summary").textContent = `${$("#trace-point-count").value} 点`;
-  const minimumAnchors = markerMode ? 3 : 1;
-  $("#trace-curve").disabled = !(state.imageData && state.plotRect && state.seedColor && state.anchors.length >= minimumAnchors);
-  $("#add-guide").disabled = !(state.plotRect && state.seedColor);
-  $("#undo-guide").disabled = state.anchors.length <= 1;
+  const minimumAnchors = minimumTraceAnchorCount();
+  $("#trace-curve").disabled = Boolean(state.computeBusy)
+    || !(state.imageData && state.plotRect && state.seedColor && state.anchors.length >= minimumAnchors);
+  $("#retry-trace").disabled = $("#trace-curve").disabled;
+  $("#trace-error").hidden = !state.traceStale;
+  $("#trace-error-title").textContent = state.computeBusy ? "正在重新追踪…" : "追踪未完成";
+  $("#trace-error-history").hidden = !state.path.length;
+  $("#trace-error-message").textContent = state.traceStale
+    ? translateMessage(state.traceError ?? "正在按当前设置计算，请稍候")
+    : "";
+  if (state.traceStale && state.traceError) {
+    const mask = traceCorridorMask();
+    if (mask?.mode === "strict") {
+      const outside = state.anchors.flatMap((point, index) => inclusionMaskAllows(mask, canvas.width, point.x, point.y) ? [] : [`A${index + 1}`]);
+      if (outside.length) $("#trace-error-message").textContent = `${outside.join(", ")} · ${translateMessage("引导点在 Pen 外；请补涂完整路径，或选择局部辅助。引导点不会被移动或删除。")}`;
+    }
+  }
+  $("#add-guide").disabled = Boolean(state.computeBusy) || !(state.plotRect && state.seedColor);
+  $("#undo-guide").disabled = Boolean(state.computeBusy) || state.anchors.length <= 1;
   const markerStrictReady = !markerMode || state.anchors.length >= 4;
   if (markerMode && !markerStrictReady && $("#strict-guide").checked) $("#strict-guide").checked = false;
-  $("#strict-guide").disabled = !state.seedColor || !markerStrictReady;
+  $("#strict-guide").disabled = !state.seedColor || !markerStrictReady || parametricMode;
   $("#strict-guide-help").textContent = markerMode
     ? (markerStrictReady
       ? "已有至少 4 个引导点；仅当附近还有同色 marker 分支时开启"
       : "marker 默认使用柔性引导；添加到至少 4 个引导点后才可强约束")
     : "拒绝偏离引导走廊的同色分支；普通曲线无需开启";
   const patternedLineMode = ["dashed", "dashdot", "dotted"].includes($("#target-style").value);
-  $("#trace-point-count").disabled = false;
-  $("#sampling-mode").disabled = markerMode;
-  $("#peak-density").disabled = markerMode;
-  $("#peak-width").disabled = markerMode;
-  $("#noise-density").disabled = markerMode;
-  $("#noise-window").disabled = markerMode;
+  $("#trace-point-count").disabled = Boolean(state.computeBusy) || state.traceStale;
+  $("#sampling-mode").disabled = markerMode || parametricMode;
+  $("#peak-density").disabled = markerMode || parametricMode;
+  $("#peak-width").disabled = markerMode || parametricMode;
+  $("#noise-density").disabled = markerMode || parametricMode;
+  $("#noise-window").disabled = markerMode || parametricMode;
+  $("#max-jump").disabled = markerMode || parametricMode;
+  $("#max-gap").disabled = markerMode || parametricMode;
+  $("#trace-orientation").disabled = markerMode;
   $("#path-refinement").disabled = markerMode;
   $("#trace-point-count-hint").textContent = markerMode
     ? "marker 数量由图像决定；可输入更小数量，仅保留真实中心"
     : "自动追踪生成，可继续增删修改";
   $("#target-style-hint").textContent = markerMode
-    ? "选择孤立圆点，再在点列的弯曲处和另一端各加 1 个引导点。保持柔性引导；程序会识别粘在线上的局部圆核和规则间距。右键菱形可删除。"
+    ? (automaticMarkerSeriesActive()
+      ? "已从一次点击识别重复 marker；请直接复核中心。只有附近存在同色点列时才需要补引导点。"
+      : "选择孤立圆点，再在点列的弯曲处和另一端各加 1 个引导点。保持柔性引导；程序会识别粘在线上的局部圆核和规则间距。右键菱形可删除。")
     : patternedLineMode
       ? "在清晰、孤立且较平缓的目标划线上取色；程序会学习划线长度和间隔。交叉或陡峭处仍需添加引导点；右键菱形可删除。"
       : $("#target-style").value === "noisy"
@@ -2070,17 +2633,20 @@ function updateUi() {
       : "普通曲线只需选择目标即可；分叉、重叠或遮挡时再添加引导点并打开可选辅助工具。";
   $("#clear-curve").disabled = !(state.path.length || state.seedColor || state.editingSeriesId);
   $("#clear-all-points").disabled = state.path.length === 0;
-  $("#save-series").disabled = !state.path.length && !state.series.length;
+  $("#save-series").disabled = Boolean(state.computeBusy) || state.traceStale || (!state.path.length && !state.series.length);
   $("#add-exclusion").disabled = !state.plotRect;
   $("#exclude-trace").disabled = !state.plotRect;
   $("#undo-exclusion").disabled = state.exclusions.length === 0;
+  $("#suggest-exclusions").disabled = !state.plotRect || Boolean($("#suggest-exclusions").dataset.scanning);
+  syncExclusionSuggestionUi();
+  syncColorSuggestionUi();
   const corridorMask = traceCorridorMask();
   const corridorColumns = traceCorridorColumnCount(corridorMask);
   $("#draw-trace-corridor").disabled = !state.plotRect;
   $("#erase-trace-corridor").disabled = !state.plotRect || !corridorMask;
   $("#clear-trace-corridor").disabled = !corridorMask;
   $("#trace-corridor-status").textContent = corridorMask
-    ? `已约束 ${corridorColumns} 列 · 未画区段照常搜索`
+    ? (corridorMask.mode === "strict" ? "仅搜索涂画区域" : "涂画区段内约束 · 两端允许延伸")
     : "未绘制 · 全绘图区搜索";
   if (corridorMask || $("#strict-guide").checked) $("#trace-assist-tools").open = true;
   $("#save-series").textContent = state.path.length
@@ -2088,13 +2654,22 @@ function updateUi() {
     : "开始下一条曲线";
   const exportCurves = curvesForExport();
   const exportCalibrationErrors = exportCurves.flatMap(curveCalibrationErrors);
-  const canExportData = Boolean(exportCurves.length && exportCalibrationErrors.length === 0);
+  const staleSavedCurve = exportCurves.find((curve) => curve.traceStale);
+  const outdated = Boolean(state.computeBusy) || state.traceStale || Boolean(staleSavedCurve);
+  const canExportData = Boolean(exportCurves.length && exportCalibrationErrors.length === 0 && !outdated);
   $("#export-csv").disabled = !canExportData;
   $("#export-txt").disabled = !canExportData;
   $("#export-project").disabled = !state.image;
-  $("#export-overlay").disabled = !exportCurves.length;
+  $("#export-overlay").disabled = !exportCurves.length || outdated;
   const exportStatus = $("#export-status");
-  if (!exportCurves.length) {
+  if (outdated) {
+    exportStatus.className = "export-status blocked";
+    exportStatus.textContent = state.computeBusy
+      ? "正在计算；完成后可导出"
+      : staleSavedCurve && !state.traceStale
+        ? `${translateMessage("请编辑并重新追踪此已存曲线")}: ${staleSavedCurve.label}`
+        : "当前结果尚未按新设置更新；请重新追踪，或撤销本次调整";
+  } else if (!exportCurves.length) {
     exportStatus.className = "export-status waiting";
     exportStatus.textContent = "完成至少一条曲线后可导出数据";
   } else if (exportCalibrationErrors.length) {
@@ -2190,7 +2765,201 @@ function fitZoom() {
   setZoom(Math.max(20, Math.floor(fit * 100)));
 }
 
+function isPlainRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isFinitePixelPoint(point) {
+  return isPlainRecord(point) && Number.isFinite(point.x) && Number.isFinite(point.y);
+}
+
+function assertPointArray(value, label) {
+  if (value === null || value === undefined) return;
+  if (!Array.isArray(value)) throw new Error(`${label}必须是数组`);
+  if (!value.every(isFinitePixelPoint)) throw new Error(`${label}包含非法像素点`);
+}
+
+function isFiniteRect(rect) {
+  return isPlainRecord(rect)
+    && ["left", "top", "right", "bottom", "width", "height"].every((key) => Number.isFinite(rect[key]));
+}
+
+function assertRectArray(value, label) {
+  if (value === null || value === undefined) return;
+  if (!Array.isArray(value)) throw new Error(`${label}必须是数组`);
+  if (!value.every(isFiniteRect)) throw new Error(`${label}包含非法矩形`);
+}
+
+function validateCalibrationPayload(calibration, label) {
+  if (calibration === null || calibration === undefined) return;
+  if (!isPlainRecord(calibration)) throw new Error(`${label}格式无效`);
+  if (calibration.points !== null && calibration.points !== undefined) {
+    if (!isPlainRecord(calibration.points)) throw new Error(`${label}的标定点格式无效`);
+    for (const point of Object.values(calibration.points)) {
+      if (point !== null && !isFinitePixelPoint(point)) throw new Error(`${label}包含非法标定点`);
+    }
+  }
+  for (const axis of ["x", "y"]) {
+    const axisRecord = calibration[axis];
+    if (axisRecord === null || axisRecord === undefined) continue;
+    if (!isPlainRecord(axisRecord)) throw new Error(`${label}的 ${axis.toUpperCase()} 轴格式无效`);
+    if (axisRecord.points !== null && axisRecord.points !== undefined) {
+      if (!Array.isArray(axisRecord.points)) throw new Error(`${label}的 ${axis.toUpperCase()} 轴参考点必须是数组`);
+      for (const point of axisRecord.points) {
+        if (point === null || point === undefined) continue;
+        if (!isPlainRecord(point)) throw new Error(`${label}的 ${axis.toUpperCase()} 轴包含非法参考点`);
+        for (const key of ["pixel", "value"]) {
+          const value = point[key];
+          if (value !== null && value !== undefined && value !== "" && !Number.isFinite(Number(value))) {
+            throw new Error(`${label}的 ${axis.toUpperCase()} 轴包含非法参考点`);
+          }
+        }
+      }
+    }
+  }
+}
+
+function validateTraceCorridorPayload(operations, label) {
+  if (operations === null || operations === undefined) return;
+  if (!Array.isArray(operations)) throw new Error(`${label}必须是数组`);
+  for (const operation of operations) {
+    if (!isPlainRecord(operation)) throw new Error(`${label}包含非法笔画`);
+    assertPointArray(operation.points, `${label}的笔画点`);
+    if (operation.width !== null && operation.width !== undefined && !Number.isFinite(Number(operation.width))) {
+      throw new Error(`${label}包含非法笔宽`);
+    }
+  }
+}
+
+function validateCurvePayload(curve, label) {
+  if (!isPlainRecord(curve)) throw new Error(`${label}格式无效`);
+  assertPointArray(curve.path, `${label}的数据点`);
+  assertPointArray(curve.rawPath, `${label}的原始路径`);
+  assertPointArray(curve.anchors, `${label}的引导点`);
+  if (curve.seed !== null && curve.seed !== undefined && !isFinitePixelPoint(curve.seed)) {
+    throw new Error(`${label}包含非法取色点`);
+  }
+  if (curve.parameters !== null && curve.parameters !== undefined && !isPlainRecord(curve.parameters)) {
+    throw new Error(`${label}的追踪参数格式无效`);
+  }
+  if (curve.id !== null && curve.id !== undefined && typeof curve.id !== "string") {
+    throw new Error(`${label}的 ID 格式无效`);
+  }
+  if (curve.visible !== null && curve.visible !== undefined && typeof curve.visible !== "boolean") {
+    throw new Error(`${label}的显示状态格式无效`);
+  }
+  validateTraceCorridorPayload(curve.traceCorridorOperations, `${label}的 Pen 走廊`);
+  validateCalibrationPayload(curve.calibration, `${label}的标定`);
+  validateCalibrationPayload(curve.calibrationBeforeSeriesEdit, `${label}的编辑前标定`);
+}
+
+function validateEditableGeometry(geometry) {
+  if (!isPlainRecord(geometry)) return false;
+  try {
+    if (geometry.plotRect !== null && geometry.plotRect !== undefined && !isFiniteRect(geometry.plotRect)) return false;
+    assertRectArray(geometry.exclusions, "屏蔽区");
+    assertRectArray(geometry.exclusionSuggestions, "屏蔽区建议");
+    assertRectArray(geometry.plotSuggestions, "绘图区建议");
+    assertPointArray(geometry.anchors, "引导点");
+    assertPointArray(geometry.rawPath, "原始路径");
+    assertPointArray(geometry.path, "数据路径");
+    if (geometry.seed !== null && geometry.seed !== undefined && !isFinitePixelPoint(geometry.seed)) return false;
+    validateTraceCorridorPayload(geometry.traceCorridorOperations, "Pen 走廊");
+    validateCalibrationPayload({ points: geometry.calibrationPoints }, "标定");
+    validateCalibrationPayload(geometry.calibrationBeforeSeriesEdit, "编辑前标定");
+    if (geometry.series !== null && geometry.series !== undefined) {
+      if (!Array.isArray(geometry.series)) return false;
+      geometry.series.forEach((curve, index) => validateCurvePayload(curve, `曲线 ${index + 1}`));
+    }
+    if (
+      geometry.traceOrientation !== null
+      && geometry.traceOrientation !== undefined
+      && !["horizontal", "vertical", "parametric"].includes(geometry.traceOrientation)
+    ) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function validateProjectPayload(project) {
+  if (!isPlainRecord(project)) throw new Error("项目文件顶层格式无效");
+  if (!supportedProjectSchemaVersions.has(project.schemaVersion)) throw new Error("不支持的项目文件版本");
+  if (!isPlainRecord(project.source)) throw new Error("项目缺少有效的原图信息");
+  if (project.source.name !== null && project.source.name !== undefined && typeof project.source.name !== "string") {
+    throw new Error("项目原图名称格式无效");
+  }
+  const samplePath = project.source.samplePath;
+  if (samplePath !== null && samplePath !== undefined && samplePath !== builtInSamplePath) {
+    throw new Error("项目中的示例图片路径不受支持");
+  }
+  for (const key of ["width", "height"]) {
+    const value = project.source[key];
+    if (value !== null && value !== undefined && (!Number.isFinite(value) || value <= 0)) {
+      throw new Error(`项目原图${key === "width" ? "宽度" : "高度"}无效`);
+    }
+  }
+  if (project.plotRect !== null && project.plotRect !== undefined && !isFiniteRect(project.plotRect)) {
+    throw new Error("项目绘图区格式无效");
+  }
+  assertRectArray(project.exclusions, "项目屏蔽区");
+  if (project.series !== null && project.series !== undefined) {
+    if (!Array.isArray(project.series)) throw new Error("项目曲线列表必须是数组");
+    project.series.forEach((curve, index) => validateCurvePayload(curve, `项目曲线 ${index + 1}`));
+  }
+  if (project.activeCurve !== null && project.activeCurve !== undefined) {
+    validateCurvePayload(project.activeCurve, "项目当前曲线");
+  }
+  if (project.curve !== null && project.curve !== undefined) {
+    validateCurvePayload(project.curve, "项目旧版当前曲线");
+  }
+  if (project.axes !== null && project.axes !== undefined && !isPlainRecord(project.axes)) {
+    throw new Error("项目坐标轴格式无效");
+  }
+  validateCalibrationPayload({
+    x: project.axes?.x,
+    y: project.axes?.y,
+    points: project.calibrationPoints,
+  }, "项目标定");
+  const perspective = project.preprocessing?.perspective;
+  if (perspective !== null && perspective !== undefined) {
+    if (!isPlainRecord(perspective)) throw new Error("项目透视矫正格式无效");
+    for (const key of ["sourceCorners", "destinationCorners"]) {
+      if (perspective[key] !== null && perspective[key] !== undefined) {
+        assertPointArray(perspective[key], `项目透视矫正的 ${key}`);
+        if (perspective[key].length !== 4) throw new Error("项目透视矫正必须包含四个角点");
+      }
+    }
+  }
+  return true;
+}
+
+function restoredSeriesId(value, index, usedIds) {
+  const candidate = typeof value === "string" && /^[A-Za-z0-9._:-]{1,128}$/.test(value)
+    ? value
+    : null;
+  if (candidate && !usedIds?.has(candidate)) {
+    usedIds?.add(candidate);
+    return candidate;
+  }
+  let suffix = 0;
+  let fallback;
+  do {
+    fallback = `series-restored-${String(index)}-${suffix}`;
+    suffix += 1;
+  } while (usedIds?.has(fallback));
+  usedIds?.add(fallback);
+  return fallback;
+}
+
 function applyProject(project) {
+  validateProjectPayload(project);
+  interferenceScanSequence += 1;
+  colorDiscoverySequence += 1;
+  targetSelectionSequence += 1;
+  traceTaskSequence += 1;
+  state.computeBusy = null;
+  delete $("#suggest-exclusions").dataset.scanning;
   const legacyCalibration = projectCalibrationSnapshot(project);
   const projectDegrees = projectRotationDegrees(project);
   const projectPerspective = project?.preprocessing?.perspective?.applied
@@ -2222,19 +2991,34 @@ function applyProject(project) {
   state.source.workingHeight = state.image?.height ?? state.source.workingHeight;
   state.plotRect = project.plotRect ?? null;
   state.exclusions = project.exclusions ?? [];
+  state.exclusionSuggestions = [];
+  state.exclusionSuggestionIndex = 0;
+  state.colorSuggestions = [];
   state.calibrationPoints = cloneSerializable(legacyCalibration.points);
   state.selectedCalibrationKey = null;
   state.draggedCalibrationKey = null;
   state.calibrationDragMoved = false;
   const activeCurve = project.activeCurve ?? project.curve ?? null;
-  const restoreCurve = (curve) => {
+  const usedSeriesIds = new Set();
+  const restoreCurve = (curve, index = 0, registerSeriesId = false) => {
     const originalPath = curve?.path ?? [];
     const pointCount = normalizeTracePointCount(curve?.parameters?.pointCount);
     const preserveDiscreteMarkers = curve?.parameters?.targetStyle === "markers";
-    const editablePath = originalPath.every((point) => point.pointId) || preserveDiscreteMarkers
-      ? originalPath
-      : resamplePixelPath(originalPath, pointCount);
-    const path = createDataPath(editablePath);
+    const traceOrientation = resolvedTraceOrientation(curve?.parameters, originalPath);
+    // Before the scope selector existed, 2D tracing used a global painted
+    // region, while scan-line tracing used local assistance.
+    const savedScope = curve?.parameters?.corridorMode;
+    const corridorMode = ["strict", "local"].includes(savedScope)
+      ? savedScope : traceOrientation === "parametric" ? "strict" : "local";
+    const traceCorridorOperations = normalizeTraceCorridorOperations(curve?.traceCorridorOperations);
+    const restored = prepareRestoredTrace({ ...curve, path: originalPath }, {
+      count: originalPath.every((point) => point.pointId) ? null : pointCount,
+      markerData: preserveDiscreteMarkers, orientation: traceOrientation,
+      parameters: { samplingMode: "geometry", ...curve?.parameters },
+      inclusionMask: buildTraceCorridorMask(traceCorridorOperations, corridorMode),
+      width: canvas.width, height: canvas.height, rect: state.plotRect,
+    });
+    const path = createDataPath(restored.path);
     const restoredAnchors = (curve?.anchors?.length
       ? curve.anchors
       : (curve?.seed ? [curve.seed] : [])
@@ -2242,29 +3026,44 @@ function applyProject(project) {
     const seed = restoredAnchors.find((anchor) => anchor.anchorId === curve?.seed?.anchorId)
       ?? restoredAnchors[0]
       ?? null;
+    const restoredId = registerSeriesId
+      ? restoredSeriesId(curve.id, index, usedSeriesIds)
+      : restoredSeriesId(curve.id, index, null);
     return {
       ...curve,
+      id: restoredId,
       seed,
       anchors: restoredAnchors,
       visible: curve?.visible ?? false,
       path,
-      rawPath: (curve?.rawPath ?? []).map((point) => ({ ...point })),
-      traceCorridorOperations: normalizeTraceCorridorOperations(curve?.traceCorridorOperations),
-      parameters: { ...curve?.parameters, pointCount: path.length || pointCount },
+      traceStale: Boolean(restored.traceStale),
+      traceError: restored.traceError ?? null,
+      rawPath: (restored.rawPath ?? []).map((point) => ({ ...point })),
+      traceCorridorOperations,
+      parameters: {
+        ...curve?.parameters,
+        pointCount: path.length || pointCount,
+        resolvedOrientation: traceOrientation,
+        corridorMode,
+      },
       calibration: cloneSerializable(curve?.calibration ?? legacyCalibration),
     };
   };
-  const restoredActive = activeCurve ? restoreCurve(activeCurve) : null;
+  const restoredActive = activeCurve ? restoreCurve(activeCurve, "active") : null;
   state.seed = restoredActive?.seed ?? null;
   state.seedColor = restoredActive?.seedColor ?? null;
   state.anchors = restoredActive?.anchors ?? [];
   state.rawPath = restoredActive?.rawPath ?? [];
   state.path = restoredActive?.path ?? [];
+  state.traceOrientation = resolvedTraceOrientation(restoredActive?.parameters, state.path);
+  state.traceStale = Boolean(restoredActive?.traceStale);
+  state.traceError = restoredActive?.traceError ?? null;
   state.traceCorridorOperations = restoredActive?.traceCorridorOperations ?? [];
   state.draftTraceCorridor = null;
   invalidateTraceCorridor();
   state.reviewRegionIndex = 0;
-  state.series = (project.series ?? []).map(restoreCurve);
+  state.ambiguityResolutionTarget = null;
+  state.series = (project.series ?? []).map((curve, index) => restoreCurve(curve, index, true));
   const requestedEditingId = activeCurve?.editingSeriesId ?? null;
   state.editingSeriesId = state.series.some((series) => series.id === requestedEditingId)
     ? requestedEditingId
@@ -2290,11 +3089,19 @@ function applyProject(project) {
   $("#noise-density").value = activeCurve?.parameters?.noiseDensity ?? 4;
   $("#noise-window").value = activeCurve?.parameters?.noiseWindow ?? 3;
   $("#strict-guide").checked = activeCurve?.parameters?.strictGuidance ?? false;
+  $("#trace-orientation").value = activeCurve?.parameters?.orientationMode ?? "auto";
   $("#target-style").value = activeCurve?.parameters?.targetStyle ?? "auto";
   delete $("#target-style").dataset.autoDetected;
   delete $("#target-style").dataset.autoConfidence;
   delete $("#target-style").dataset.autoFallback;
+  state.automaticMarkerSeries = Boolean(activeCurve?.parameters?.automaticMarkerSeries);
+  state.automaticMarkerConfidence = Number(activeCurve?.parameters?.automaticMarkerConfidence) || 0;
+  if (state.automaticMarkerSeries && $("#target-style").value === "markers") {
+    $("#target-style").dataset.autoDetected = "markers";
+    $("#target-style").dataset.autoConfidence = String(state.automaticMarkerConfidence);
+  }
   $("#path-refinement").value = activeCurve?.parameters?.refinementMode ?? "full";
+  $("#trace-corridor-mode").value = restoredActive?.parameters?.corridorMode ?? "strict";
   $("#trace-corridor-width").value = String(activeCurve?.parameters?.corridorWidth ?? 24);
   $("#trace-point-count").value = String(state.path.length || normalizeTracePointCount(activeCurve?.parameters?.pointCount));
   state.magnifierPoint = { x: canvas.width / 2, y: canvas.height / 2 };
@@ -2302,9 +3109,14 @@ function applyProject(project) {
   updateUi();
   draw();
   showToast("项目参数和提取路径已恢复");
+  if (state.plotRect) void scanColorSuggestions();
 }
 
 function loadImageSource(source, name, samplePath = null, project = null) {
+  if (samplePath !== null && (samplePath !== builtInSamplePath || source !== builtInSamplePath)) {
+    showToast("仅允许载入应用内置的示例图片");
+    return false;
+  }
   const loadId = ++imageLoadSequence;
   const resolvedSource = globalThis.__SCIDIGITIZER_EMBEDDED_ASSETS__?.[source] ?? source;
   const isObjectUrl = String(resolvedSource).startsWith("blob:");
@@ -2321,6 +3133,11 @@ function loadImageSource(source, name, samplePath = null, project = null) {
       return;
     }
     releaseObjectUrl();
+    // Finish the previous image's delayed save before changing its fingerprint.
+    // Merely opening an image must not save the fresh state over its old draft.
+    editSession?.flushPendingSave();
+    draftRecoveryAvailable = false;
+    $("#autosave-status").textContent = "自动保存待命";
     if (state.rotationPreviewFrame !== null) window.cancelAnimationFrame(state.rotationPreviewFrame);
     state.rotationPreviewFrame = null;
     state.originalImage = image;
@@ -2373,9 +3190,16 @@ function loadImageSource(source, name, samplePath = null, project = null) {
     state.magnifierPoint = { x: canvas.width / 2, y: canvas.height / 2 };
     window.requestAnimationFrame(fitZoom);
     if (project) {
-      applyProject(project);
-      resetHistorySession();
-      scheduleDraftSave();
+      try {
+        applyProject(project);
+        resetHistorySession();
+        scheduleDraftSave();
+      } catch (error) {
+        resetExtraction({ keepCalibrationValues: false });
+        resetHistorySession();
+        draw();
+        showToast(`项目载入失败：${error.message}`);
+      }
     }
     else {
       resetHistorySession();
@@ -2385,10 +3209,10 @@ function loadImageSource(source, name, samplePath = null, project = null) {
         cleanUrl.searchParams.delete("fresh");
         window.history.replaceState(null, "", cleanUrl);
       }
-      if (freshStart || !restoreAutosavedDraft()) {
-        draw();
-        suggestPlotRect({ automatic: true });
-      }
+      draftRecoveryAvailable = Boolean(editSession?.readDraft());
+      syncDraftRecovery();
+      draw();
+      suggestPlotRect({ automatic: true });
     }
   };
   image.onerror = () => {
@@ -2397,14 +3221,50 @@ function loadImageSource(source, name, samplePath = null, project = null) {
     showToast(`无法载入 ${name}；请确认应用文件完整，或重新打开图片`);
   };
   image.src = resolvedSource;
+  return true;
 }
 
-function traceCurrentCurve({ silent = false } = {}) {
-  if (state.rotationPreviewActive || !state.imageData || !state.plotRect || !state.anchors.length || !state.seedColor) return;
+function rasterImportFailureMessage(validation) {
+  if (validation?.code === "too-large") return "图片文件超过 80 MiB；请先裁剪或压缩后再导入";
+  if (validation?.code === "empty") return "图片文件为空，未改变当前项目";
+  return "仅支持 PNG、JPEG 和 WebP 图片；未改变当前项目";
+}
+
+function importRasterImageFile(file, { pasted = false } = {}) {
+  const validation = validateRasterImageFile(file);
+  if (!validation.valid) {
+    showToast(rasterImportFailureMessage(validation));
+    return false;
+  }
+  const name = rasterImageDisplayName(file, { pasted });
+  loadImageSource(URL.createObjectURL(file), name);
+  return true;
+}
+
+function importTransferredRasterImages(files, options = {}) {
+  const picked = pickRasterImageFile(files);
+  if (!picked.file) {
+    showToast(rasterImportFailureMessage(picked.validation));
+    return false;
+  }
+  return importRasterImageFile(picked.file, options);
+}
+
+function retraceIfReady(options) {
+  if (!state.seedColor || !state.plotRect || state.anchors.length < minimumTraceAnchorCount()) return false;
+  void traceCurrentCurve(options);
+  return true;
+}
+
+async function traceCurrentCurve({ silent = false, refreshHistory = true } = {}) {
+  if (state.rotationPreviewActive || !state.imageData || !state.plotRect || !state.anchors.length || !state.seedColor) return false;
+  const taskId = ++traceTaskSequence;
+  const seedAnchorId = state.seed?.anchorId;
+  state.ambiguityResolutionTarget = null;
   try {
     const previouslySelectedAnchor = state.selectedAnchorIndex;
     let targetStyle = $("#target-style").value;
-    if (targetStyle === "markers" && state.anchors.length < 3) {
+    if (targetStyle === "markers" && state.anchors.length < minimumTraceAnchorCount()) {
       throw new Error("marker 模式需要取色种子，并在点列弯曲处和另一端各添加 1 个引导点");
     }
     const effectiveStrictGuidance = $("#strict-guide").checked
@@ -2412,9 +3272,6 @@ function traceCurrentCurve({ silent = false } = {}) {
     const avoidPaths = targetStyle === "markers" ? [] : sameColorAvoidancePaths();
     const inclusionMask = traceCorridorMask();
     const commonOptions = {
-      rgba: state.imageData.data,
-      width: canvas.width,
-      height: canvas.height,
       rect: state.plotRect,
       anchors: state.anchors,
       target: state.seedColor,
@@ -2425,74 +3282,79 @@ function traceCurrentCurve({ silent = false } = {}) {
       avoidanceRadius: 2.5,
       inclusionMask,
     };
-    const constrainToCorridor = (path) => constrainToCurrentTraceCorridor(path, inclusionMask);
+    const outputOptions = {
+      inclusionMask, width: canvas.width, height: canvas.height, rect: state.plotRect,
+      parameters: activeSamplingParameters(), count: activeTracePointCount(),
+    };
+    const inputGuides = state.anchors.map((point) => ({ ...point }));
+    const requestedParameters = { ...activeTraceParameters() };
+    state.traceStale = true;
+    state.traceError = null;
+    state.computeBusy = "trace";
+    updateUi();
+    draw();
     let rawPath;
+    let prepared;
+    let nextOrientation = "horizontal";
+    let autoFallback = false;
     if (targetStyle === "markers") {
-      rawPath = constrainToCorridor(extractMarkerCenters(commonOptions));
+      const automatic = automaticMarkerSeriesActive() && state.anchors.length === 1;
+      const result = await runBackgroundOperation("trace-marker", {
+        ...commonOptions,
+        automatic,
+        seed: state.seed,
+      });
+      if (taskId !== traceTaskSequence || state.seed?.anchorId !== seedAnchorId) return false;
+      if (automatic) {
+        if (!result.inference?.detected) {
+          throw new Error("自动 marker 证据已不足；请重选一个清晰标记，或手动选择 marker 类型后添加引导点");
+        }
+        $("#target-style").dataset.autoConfidence = String(result.inference.confidence);
+      }
+      rawPath = result.path;
       if (!rawPath.length) {
         throw new Error("没有检测到符合条件的 marker；请检查目标颜色、引导点和图例屏蔽区");
       }
-      state.rawPath = rawPath.map((point) => ({ ...point }));
-      state.path = createDataPath(rawPath, "marker");
-      $("#trace-point-count").value = String(state.path.length);
+      prepared = prepareTraceOutput(rawPath, { ...outputOptions, markerData: true });
     } else {
-      rawPath = traceCurveThroughAnchors({
+      const refinementMode = $("#path-refinement").value;
+      const result = await runBackgroundOperation("trace-line", {
         ...commonOptions,
         maxJump: Number($("#max-jump").value),
         maxGap: Number($("#max-gap").value),
         targetStyle,
+        autoPatternedStyle: Boolean($("#target-style").dataset.autoDetected)
+          && ["dashed", "dashdot", "dotted"].includes(targetStyle),
+        autoStyleConfidence: Number($("#target-style").dataset.autoConfidence ?? 1),
+        refinementMode,
+        orientationMode: $("#trace-orientation").value,
       });
-      const autoPatternedStyle = Boolean($("#target-style").dataset.autoDetected)
-        && ["dashed", "dashdot", "dotted"].includes(targetStyle);
-      const horizontalSpan = (path) => {
-        if (!path?.length) return 0;
-        const xs = path.map((point) => point.x);
-        return (Math.max(...xs) - Math.min(...xs)) / Math.max(1, state.plotRect.width);
-      };
-      // Local markers or antialias gaps can make a simple curve look dotted.
-      // In automatic mode only, retry ordinary continuity when the patterned
-      // path stalls. Explicit user-selected dashed/dotted modes remain exact.
-      if (autoPatternedStyle && horizontalSpan(rawPath) < 0.72) {
-        const ordinaryPath = traceCurveThroughAnchors({
-          ...commonOptions,
-          maxJump: Number($("#max-jump").value),
-          maxGap: Number($("#max-gap").value),
-          targetStyle: "line",
-        });
-        if (horizontalSpan(ordinaryPath) >= horizontalSpan(rawPath) + 0.15) {
-          rawPath = ordinaryPath;
-          targetStyle = "line";
-          $("#target-style").value = "line";
-          $("#target-style").dataset.autoDetected = "line";
-          $("#target-style").dataset.autoFallback = "true";
-        }
-      }
-      const refinementMode = $("#path-refinement").value;
-      if (refinementMode !== "off") {
-        rawPath = refinePathCenterline({
-          ...commonOptions,
-          path: rawPath,
-          iterations: 2,
-        });
-      }
-      if (refinementMode === "full") {
-        rawPath = fitInferredPathGaps(rawPath, { rect: state.plotRect });
-      }
-      // Candidate filtering is not enough: gap recovery and interpolation can
-      // synthesize new coordinates outside the painted ROI. Make the Pen a
-      // final path boundary while preserving every exact user guide.
-      rawPath = constrainToCorridor(rawPath);
-      state.rawPath = rawPath.map((point) => ({ ...point }));
-      const requestedCount = activeTracePointCount();
-      const mandatoryGuides = rawPath.filter((point) => point.anchor);
-      const sampledPath = constrainToCorridor(includeMandatoryPoints(
-        samplePixelPath(rawPath, requestedCount),
-        mandatoryGuides,
-        requestedCount,
-      ));
-      state.path = createDataPath(sampledPath);
-      $("#trace-point-count").value = String(state.path.length);
+      if (taskId !== traceTaskSequence || state.seed?.anchorId !== seedAnchorId) return false;
+      rawPath = result.path;
+      nextOrientation = ["vertical", "parametric"].includes(result.orientation)
+        ? result.orientation
+        : "horizontal";
+      targetStyle = result.targetStyle;
+      autoFallback = result.autoFallback;
+      // Gap recovery and interpolation may synthesize coordinates outside the
+      // painted ROI, so the Pen remains a final boundary after the Worker.
+      prepared = prepareTraceOutput(rawPath, { ...outputOptions, orientation: nextOrientation, guides: inputGuides });
     }
+    // Commit all derived data together, only after the shared output validator
+    // has accepted raw geometry, guide retention and final sampled points.
+    const nextPath = createDataPath(prepared.path, targetStyle === "markers" ? "marker" : "auto");
+    state.rawPath = prepared.rawPath;
+    state.path = nextPath;
+    state.traceOrientation = nextOrientation;
+    rawPath = prepared.rawPath;
+    state.traceStale = false;
+    state.traceError = null;
+    if (autoFallback) {
+      $("#target-style").value = "line";
+      $("#target-style").dataset.autoDetected = "line";
+      $("#target-style").dataset.autoFallback = "true";
+    }
+    $("#trace-point-count").value = String(state.path.length);
     state.reviewRegionIndex = 0;
     state.hoveredPointId = null;
     state.pointHoverSource = null;
@@ -2505,20 +3367,23 @@ function traceCurrentCurve({ silent = false } = {}) {
       ? previouslySelectedAnchor
       : (state.anchors.length ? 0 : null);
     state.draggedAnchorIndex = null;
+    state.computeBusy = null;
     updateUi();
     draw();
+    scheduleDraftSave();
+    if (refreshHistory) editSession?.refreshCurrent();
     const observed = state.path.filter((point) => point.observed).length;
     if (targetStyle === "markers") {
       const markerGuidance = effectiveStrictGuidance ? "强约束" : "柔性引导";
       if (!silent) showToast(`识别到 ${state.path.length} 个 marker 中心 · ${markerGuidance}。已检测独立圆点及粘在线上的局部圆核`);
     } else {
-      const samplingLabel = $("#sampling-mode").value === "peak"
+      const samplingLabel = nextOrientation === "parametric" ? "二维弧长采样" : $("#sampling-mode").value === "peak"
         ? "峰值自适应"
         : $("#sampling-mode").value === "noise"
           ? "波动自适应"
           : $("#sampling-mode").value === "geometry" ? "几何自适应" : "等间距";
       const hiddenGuideCount = rawPath.filter((point) => point.anchor && point.occlusionGuide).length;
-      const guidanceLabel = $("#strict-guide").checked
+      const guidanceLabel = nextOrientation === "parametric" ? "二维引导路径" : $("#strict-guide").checked
         ? "同色/遮挡强约束"
         : hiddenGuideCount
           ? `${hiddenGuideCount} 个遮挡内引导点已自动局部强约束`
@@ -2533,7 +3398,13 @@ function traceCurrentCurve({ silent = false } = {}) {
         ? `自动识别${detectedStyleLabels[targetStyle] ?? "线型"} · `
         : "";
       const styleLabel = autoStyleLabel || (["dashed", "dashdot", "dotted"].includes(targetStyle) ? "线型指纹 · " : "");
-      const avoidanceLabel = avoidPaths.length ? ` · 已避让 ${avoidPaths.length} 条同色已存曲线` : "";
+      const orientationLabel = state.traceOrientation === "vertical"
+        ? " · 自动采用纵向追踪"
+        : state.traceOrientation === "parametric" ? " · 自动采用二维路径追踪" : "";
+      const topologyReviewLabel = rawPath.some((point) => point.topologyReview)
+        ? " · 自交节点已按切向连续连接，请复核"
+        : "";
+      const avoidanceLabel = avoidPaths.length && nextOrientation !== "parametric" ? ` · 已避让 ${avoidPaths.length} 条同色已存曲线` : "";
       const corridorLabel = inclusionMask
         ? ` · Pen 走廊约束 ${traceCorridorColumnCount(inclusionMask)} 列`
         : "";
@@ -2541,18 +3412,39 @@ function traceCurrentCurve({ silent = false } = {}) {
       const corridorCorrectionLabel = corridorCorrectedCount
         ? ` / 边界修正 ${corridorCorrectedCount} 点`
         : "";
-      const refinementMode = $("#path-refinement").value;
+      const refinementMode = requestedParameters.refinementMode;
       const centeredCount = rawPath.filter((point) => point.centerRefined).length;
       const fittedCount = rawPath.filter((point) => point.occlusionInferred).length;
+      const patternedGapCount = rawPath.filter((point) => point.patternInferred).length;
+      const patternedGapLabel = patternedGapCount
+        ? ` / 虚线间隔 ${patternedGapCount} 个推断点`
+        : "";
+      const reconnectedCount = rawPath.filter((point) => point.reconnectedAfterOcclusion).length;
+      const reconnectionLabel = reconnectedCount
+        ? ` · 跨遮挡自动重连 ${reconnectedCount} 段`
+        : "";
       const refinementLabel = refinementMode === "full"
-        ? ` · 中心校正 ${centeredCount} 点 / 多模型遮挡恢复 ${fittedCount} 点`
+        ? ` · 中心校正 ${centeredCount} 点 / 遮挡恢复 ${fittedCount} 点${patternedGapLabel}`
         : refinementMode === "center"
           ? ` · 中心校正 ${centeredCount} 点`
           : "";
-      if (!silent) showToast(`追踪完成：${state.anchors.length}/${state.anchors.length} 个引导点已锁定 · ${styleLabel}${guidanceLabel}${avoidanceLabel}${corridorLabel}${corridorCorrectionLabel}${refinementLabel} · ${samplingLabel}生成 ${state.path.length} 个数据点；其中 ${observed} 个直接来自图像`);
+      if (!silent) showToast(`追踪完成：${state.anchors.length}/${state.anchors.length} 个引导点已锁定 · ${styleLabel}${guidanceLabel}${orientationLabel}${topologyReviewLabel}${avoidanceLabel}${corridorLabel}${corridorCorrectionLabel}${reconnectionLabel}${refinementLabel} · ${samplingLabel}生成 ${state.path.length} 个数据点；其中 ${observed} 个直接来自图像`);
     }
+    return true;
   } catch (error) {
-    showToast(`追踪失败：${error.message}`);
+    if (taskId !== traceTaskSequence) return false;
+    state.traceStale = true;
+    state.traceError = error.message;
+    showToast(`${translateMessage("追踪失败")}：${translateMessage(error.message)}`);
+    scheduleDraftSave();
+    if (refreshHistory) editSession?.refreshCurrent();
+    return false;
+  } finally {
+    if (taskId === traceTaskSequence) {
+      state.computeBusy = null;
+      updateUi();
+      draw();
+    }
   }
 }
 
@@ -2574,11 +3466,20 @@ function updateCursorReadout(point) {
 }
 
 function clearActiveCurve({ keepLabel = false, keepTargetStyle = false } = {}) {
+  state.traceStale = false;
+  state.traceError = null;
+  $("#trace-corridor-mode").value = "strict";
+  targetSelectionSequence += 1;
+  traceTaskSequence += 1;
+  state.computeBusy = null;
   const calibrationToRestore = state.editingSeriesId
     ? state.calibrationBeforeSeriesEdit
     : null;
   state.seed = null;
   state.seedColor = null;
+  state.automaticMarkerSeries = false;
+  state.automaticMarkerConfidence = 0;
+  state.traceOrientation = "horizontal";
   state.anchors = [];
   state.traceCorridorOperations = [];
   state.draftTraceCorridor = null;
@@ -2586,6 +3487,7 @@ function clearActiveCurve({ keepLabel = false, keepTargetStyle = false } = {}) {
   if (state.mode === "corridor-pen" || state.mode === "corridor-erase") state.mode = null;
   $("#strict-guide").checked = false;
   if (!keepTargetStyle || $("#target-style").dataset.autoDetected) $("#target-style").value = "auto";
+  $("#trace-orientation").value = "auto";
   delete $("#target-style").dataset.autoDetected;
   delete $("#target-style").dataset.autoConfidence;
   delete $("#target-style").dataset.autoFallback;
@@ -2610,11 +3512,17 @@ function clearActiveCurve({ keepLabel = false, keepTargetStyle = false } = {}) {
 }
 
 function resetCurvesForNewPlot() {
+  interferenceScanSequence += 1;
+  colorDiscoverySequence += 1;
+  delete $("#suggest-exclusions").dataset.scanning;
   clearActiveCurve();
   state.series = [];
+  state.colorSuggestions = [];
   state.exclusions = [];
+  state.exclusionSuggestions = [];
+  state.exclusionSuggestionIndex = 0;
   state.draftExclusion = null;
-  state.calibrationPoints = { x1: null, x2: null, x3: null, y1: null, y2: null, y3: null };
+  state.calibrationPoints = emptyCalibrationPoints();
   state.selectedCalibrationKey = null;
   state.draggedCalibrationKey = null;
   state.calibrationDragMoved = false;
@@ -2622,8 +3530,158 @@ function resetCurvesForNewPlot() {
   updateUi();
 }
 
+function currentExclusionSuggestion() {
+  if (!state.exclusionSuggestions.length) return null;
+  state.exclusionSuggestionIndex = clamp(
+    state.exclusionSuggestionIndex,
+    0,
+    state.exclusionSuggestions.length - 1,
+  );
+  return state.exclusionSuggestions[state.exclusionSuggestionIndex] ?? null;
+}
+
+function rectanglesIntersect(left, right) {
+  return left.left <= right.right
+    && left.right >= right.left
+    && left.top <= right.bottom
+    && left.bottom >= right.top;
+}
+
+function syncExclusionSuggestionUi() {
+  const review = $("#exclusion-suggestion-review");
+  const suggestion = currentExclusionSuggestion();
+  review.hidden = !suggestion;
+  const scanButton = $("#suggest-exclusions");
+  if (!scanButton.dataset.scanning) {
+    scanButton.textContent = suggestion ? "重新扫描图例 / 文字干扰" : "扫描图例 / 文字干扰";
+  }
+  if (!suggestion) return;
+  $("#exclusion-suggestion-count").textContent = `${state.exclusionSuggestionIndex + 1} / ${state.exclusionSuggestions.length}`;
+  const type = suggestion.kind === "legend"
+    ? "带边框图例"
+    : suggestion.kind === "annotation" ? "文字标注" : "图例或文字标注";
+  $("#exclusion-suggestion-status").textContent = `${type} · 可信度 ${Math.round(suggestion.confidence * 100)}% · 橙色框仅供复核，接受前不会影响追踪。`;
+  $("#previous-exclusion-suggestion").disabled = state.exclusionSuggestions.length <= 1;
+  $("#next-exclusion-suggestion").disabled = state.exclusionSuggestions.length <= 1;
+}
+
+async function scanInterferenceSuggestions({ automatic = false } = {}) {
+  if (!state.imageData || !state.plotRect) return [];
+  const scanId = ++interferenceScanSequence;
+  const plotRect = { ...state.plotRect };
+  const button = $("#suggest-exclusions");
+  button.dataset.scanning = "true";
+  button.disabled = true;
+  button.textContent = "正在扫描干扰区…";
+  await new Promise((resolve) => window.requestAnimationFrame(resolve));
+  const suggestions = suggestInterferenceMasks({
+    rgba: state.imageData.data,
+    width: canvas.width,
+    height: canvas.height,
+    plotRect,
+    exclusions: state.exclusions,
+  });
+  if (scanId !== interferenceScanSequence || JSON.stringify(plotRect) !== JSON.stringify(state.plotRect)) return [];
+  state.exclusionSuggestions = suggestions;
+  state.exclusionSuggestionIndex = 0;
+  delete button.dataset.scanning;
+  updateUi();
+  draw();
+  if (!automatic) {
+    showToast(suggestions.length
+      ? `发现 ${suggestions.length} 个可能的图例或文字干扰区；请逐个复核后接受`
+      : "未发现足够可靠的图例或文字干扰区；不会自动添加屏蔽");
+  }
+  return suggestions;
+}
+
+function availableColorSuggestions() {
+  return state.colorSuggestions.filter((suggestion) => state.series.every((series) => (
+    colorDistance(series.seedColor, suggestion.color) > 24
+  )));
+}
+
+function syncColorSuggestionUi() {
+  const panel = $("#color-suggestions");
+  const list = $("#color-suggestion-list");
+  const suggestions = state.seedColor ? [] : availableColorSuggestions();
+  panel.hidden = suggestions.length === 0;
+  list.replaceChildren(...suggestions.map((suggestion, index) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "color-suggestion-chip";
+    button.dataset.colorSuggestion = String(state.colorSuggestions.indexOf(suggestion));
+    button.title = `候选 ${index + 1} · 可信度 ${Math.round(suggestion.confidence * 100)}%`;
+    button.setAttribute("aria-label", `选择可能的彩色曲线 ${index + 1}`);
+    button.setAttribute("role", "listitem");
+    const swatch = document.createElement("span");
+    swatch.style.background = colorToCss(suggestion.color);
+    swatch.setAttribute("aria-hidden", "true");
+    button.append(swatch);
+    return button;
+  }));
+}
+
+async function scanColorSuggestions() {
+  if (!state.imageData || !state.plotRect) return [];
+  const scanId = ++colorDiscoverySequence;
+  const plotRect = { ...state.plotRect };
+  await new Promise((resolve) => window.requestAnimationFrame(resolve));
+  let suggestions;
+  try {
+    suggestions = await runBackgroundOperation("discover-colors", {
+      plotRect,
+      exclusions: state.exclusions,
+    });
+  } catch (error) {
+    // Loading or geometrically correcting another raster invalidates the scan.
+    // This is routine cancellation, not an application error.
+    if (error?.name === "AbortError" || scanId !== colorDiscoverySequence) return [];
+    showToast(`颜色候选分析失败：${error.message}`);
+    return [];
+  }
+  if (
+    scanId !== colorDiscoverySequence
+    || JSON.stringify(plotRect) !== JSON.stringify(state.plotRect)
+  ) return [];
+  state.colorSuggestions = suggestions;
+  syncColorSuggestionUi();
+  return suggestions;
+}
+
+function acceptExclusionSuggestions({ all = false } = {}) {
+  const accepted = all
+    ? state.exclusionSuggestions.splice(0)
+    : state.exclusionSuggestions.splice(state.exclusionSuggestionIndex, 1);
+  if (!accepted.length) return;
+  for (const suggestion of accepted) {
+    state.exclusions.push({
+      left: suggestion.left,
+      top: suggestion.top,
+      right: suggestion.right,
+      bottom: suggestion.bottom,
+      width: suggestion.width,
+      height: suggestion.height,
+      suggested: true,
+      suggestionKind: suggestion.kind,
+      suggestionConfidence: suggestion.confidence,
+    });
+  }
+  state.exclusionSuggestionIndex = clamp(
+    state.exclusionSuggestionIndex,
+    0,
+    Math.max(0, state.exclusionSuggestions.length - 1),
+  );
+  retraceIfReady({ silent: true });
+  updateUi();
+  draw();
+  showToast(`已接受 ${accepted.length} 个干扰区建议${state.path.length ? "，并已自动重新追踪" : ""}`);
+  commitHistory(all ? "接受全部干扰屏蔽建议" : "接受干扰屏蔽建议");
+  void scanColorSuggestions();
+}
+
 function addDataPoint(point) {
-  if (state.rotationPreviewActive || !state.seedColor || !pointInsidePlot(point)) return false;
+  if (state.traceStale || state.rotationPreviewActive || !state.seedColor || !pointInsidePlot(point)) return false;
   const dataPoint = createDataPoint({
     x: point.x,
     y: point.y,
@@ -2635,7 +3693,12 @@ function addDataPoint(point) {
     marker: $("#target-style").value === "markers",
   }, "manual");
   state.rawPath = [];
-  state.path.push(dataPoint);
+  if (state.traceOrientation === "parametric" && state.path.length >= 2) {
+    const segmentIndex = nearestParametricSegmentIndex(state.path, dataPoint);
+    state.path.splice(segmentIndex + 1, 0, dataPoint);
+  } else {
+    state.path.push(dataPoint);
+  }
   sortDataPoints();
   state.selectedPointId = dataPoint.pointId;
   state.hoveredPointId = dataPoint.pointId;
@@ -2662,8 +3725,7 @@ function nudgeGuideAnchor(index, deltaX, deltaY) {
   state.selectedAnchorIndex = index;
   state.magnifierPoint = { ...anchor };
   state.cursor = null;
-  if (state.path.length) traceCurrentCurve({ silent: true });
-  else {
+  if (!retraceIfReady({ silent: true })) {
     updateUi();
     draw();
   }
@@ -2681,6 +3743,7 @@ function nudgeDataPoint(pointId, deltaX, deltaY) {
     const anchorIndex = state.anchors.findIndex((anchor) => anchor.anchorId === point.anchorId);
     if (anchorIndex >= 0) return nudgeGuideAnchor(anchorIndex, deltaX, deltaY);
   }
+  if (state.traceStale) return false;
   const next = boundedPlotPoint({ x: point.x + deltaX, y: point.y + deltaY });
   if (next.x === point.x && next.y === point.y) return false;
   state.rawPath = [];
@@ -2703,6 +3766,7 @@ function nudgeDataPoint(pointId, deltaX, deltaY) {
 }
 
 function deleteDataPoint(pointId, { nearby = false } = {}) {
+  if (state.computeBusy || state.traceStale) return false;
   const index = state.path.findIndex((point) => point.pointId === pointId);
   if (index < 0) return false;
   if (state.path[index].anchor) {
@@ -2727,6 +3791,7 @@ function deleteDataPoint(pointId, { nearby = false } = {}) {
 }
 
 function clearAllDataPoints() {
+  if (state.computeBusy) return;
   if (!state.path.length) return;
   const removedCount = state.path.length;
   state.rawPath = [];
@@ -2742,7 +3807,134 @@ function clearAllDataPoints() {
   commitHistory("清空当前曲线数据点");
 }
 
+async function selectTraceTarget(point) {
+  if (!state.imageData || !state.plotRect || !pointInsidePlot(point)) {
+    showToast("曲线种子需要位于已框选的绘图区内");
+    return false;
+  }
+  const sampledColor = sampleRepresentativeColor(
+    state.imageData.data,
+    canvas.width,
+    canvas.height,
+    point,
+  );
+  const inkStrength = Math.hypot(255 - sampledColor.r, 255 - sampledColor.g, 255 - sampledColor.b);
+  if (inkStrength < 12) {
+    showToast("这里接近纯白背景，没有采到曲线；请放大后重新点击线条中心");
+    return false;
+  }
+  const preliminaryThreshold = estimateColorThreshold(
+    state.imageData.data,
+    canvas.width,
+    canvas.height,
+    point,
+    sampledColor,
+  );
+  const snappedPoint = snapTargetPoint({
+    rgba: state.imageData.data,
+    width: canvas.width,
+    height: canvas.height,
+    rect: state.plotRect,
+    point,
+    target: sampledColor,
+    threshold: preliminaryThreshold,
+    exclusions: state.exclusions,
+  });
+  // Picking a target begins a fresh, simple trace. Pen and strict-guide
+  // constraints are opt-in aids for ambiguities and must never leak from a
+  // previous attempt into an ordinary one-click trace.
+  state.traceCorridorOperations = [];
+  state.draftTraceCorridor = null;
+  invalidateTraceCorridor();
+  $("#strict-guide").checked = false;
+  // A target pick is the ordinary one-click entry point. A forced direction
+  // restored from an older draft or previous attempt must not silently turn a
+  // simple y(x) curve into a half-length vertical branch. Users can still
+  // choose a manual direction after the first automatic result when needed.
+  $("#trace-orientation").value = "auto";
+  state.traceOrientation = "horizontal";
+  $("#trace-assist-tools").open = false;
+  state.seed = createGuideAnchor(snappedPoint);
+  state.traceStale = false;
+  state.traceError = null;
+  state.magnifierPoint = { ...snappedPoint };
+  state.seedColor = sampledColor;
+  state.anchors = [state.seed];
+  const selectedAnchorId = state.seed.anchorId;
+  const selectionId = ++targetSelectionSequence;
+  traceTaskSequence += 1;
+  $("#color-threshold").value = String(estimateColorThreshold(
+    state.imageData.data,
+    canvas.width,
+    canvas.height,
+    snappedPoint,
+    sampledColor,
+  ));
+  syncRangeOutputs();
+  state.rawPath = [];
+  state.path = [];
+  state.hoveredPointId = null;
+  state.pointHoverSource = null;
+  state.selectedPointId = null;
+  state.draggedPointId = null;
+  state.hoveredAnchorIndex = null;
+  state.selectedAnchorIndex = 0;
+  state.draggedAnchorIndex = null;
+  setMode(null);
+  try {
+    if ($("#target-style").value === "auto") {
+      state.computeBusy = "classify";
+      updateUi();
+      draw();
+      const { markerInference, lineInference } = await runBackgroundOperation("classify-target", {
+        rect: state.plotRect,
+        seed: snappedPoint,
+        target: sampledColor,
+        threshold: Number($("#color-threshold").value),
+        exclusions: state.exclusions,
+      });
+      if (selectionId !== targetSelectionSequence || state.seed?.anchorId !== selectedAnchorId) return false;
+      const inferredStyle = markerInference.detected ? {
+        style: "markers",
+        confidence: markerInference.confidence,
+      } : lineInference;
+      $("#target-style").value = inferredStyle.style;
+      state.automaticMarkerSeries = markerInference.detected;
+      state.automaticMarkerConfidence = markerInference.detected ? markerInference.confidence : 0;
+      $("#target-style").dataset.autoDetected = inferredStyle.style;
+      $("#target-style").dataset.autoConfidence = String(inferredStyle.confidence);
+      delete $("#target-style").dataset.autoFallback;
+    } else {
+      state.automaticMarkerSeries = false;
+      state.automaticMarkerConfidence = 0;
+      delete $("#target-style").dataset.autoDetected;
+      delete $("#target-style").dataset.autoConfidence;
+      delete $("#target-style").dataset.autoFallback;
+    }
+    state.computeBusy = null;
+    updateUi();
+    draw();
+    if ($("#target-style").value === "markers" && !automaticMarkerSeriesActive()) {
+      showToast("marker 颜色已采样；请在点列弯曲处和另一端各添加 1 个引导点");
+    } else {
+      const traced = await traceCurrentCurve({ refreshHistory: false });
+      if (!traced) return false;
+    }
+    if (selectionId !== targetSelectionSequence || state.seed?.anchorId !== selectedAnchorId) return false;
+    commitHistory("选择目标并智能追踪");
+    return true;
+  } catch (error) {
+    if (selectionId !== targetSelectionSequence) return false;
+    state.computeBusy = null;
+    updateUi();
+    draw();
+    showToast(`目标识别失败：${error.message}`);
+    return false;
+  }
+}
+
 canvas.addEventListener("pointerdown", (event) => {
+  if (state.computeBusy) return;
   if (!state.image) return;
   const point = imageCoordinates(event);
   state.cursor = point;
@@ -2849,6 +4041,7 @@ canvas.addEventListener("pointermove", (event) => {
     if (calibrationPoint) {
       state.calibrationDragMoved ||= Math.abs(calibrationPoint[coordinate] - point[coordinate]) > 0.01;
       calibrationPoint[coordinate] = point[coordinate];
+      if (state.calibrationDragMoved) markCalibrationPointManuallyAdjusted(calibrationPoint);
       state.magnifierPoint = { ...calibrationPoint };
     }
     updateUi();
@@ -2933,6 +4126,7 @@ canvas.addEventListener("pointerleave", () => {
 });
 
 canvas.addEventListener("pointerup", (event) => {
+  if (state.computeBusy) return;
   if (!state.image) return;
   const point = imageCoordinates(event);
   state.cursor = point;
@@ -2973,8 +4167,7 @@ canvas.addEventListener("pointerup", (event) => {
     state.selectedAnchorIndex = movedIndex;
     state.hoveredAnchorIndex = guideAnchorAt(point) ?? movedIndex;
     syncPointCursor();
-    if (moved && state.path.length) {
-      traceCurrentCurve();
+    if (moved && retraceIfReady()) {
       state.selectedAnchorIndex = movedIndex;
       state.hoveredAnchorIndex = movedIndex;
       draw();
@@ -3019,8 +4212,7 @@ canvas.addEventListener("pointerup", (event) => {
       state.traceCorridorOperations = [];
       invalidateTraceCorridor();
     }
-    if (state.path.length) traceCurrentCurve({ silent: true });
-    else {
+    if (!retraceIfReady({ silent: true })) {
       updateUi();
       draw();
     }
@@ -3052,6 +4244,8 @@ canvas.addEventListener("pointerup", (event) => {
       setMode(null);
       showToast("绘图区已设置；下一步点击坐标刻度进行标定");
       commitHistory("手动设置绘图区");
+      void scanInterferenceSuggestions({ automatic: true });
+      void scanColorSuggestions();
     }
   } else if (state.mode === "exclude" && state.dragStart) {
     const exclusion = normalizeRect(state.dragStart, point, { width: canvas.width, height: canvas.height });
@@ -3061,107 +4255,60 @@ canvas.addEventListener("pointerup", (event) => {
       showToast("屏蔽区太小，请拖拽框住完整的遮挡、图例或文字");
     } else {
       state.exclusions.push(exclusion);
+      state.exclusionSuggestions = state.exclusionSuggestions.filter(
+        (suggestion) => !rectanglesIntersect(suggestion, exclusion),
+      );
+      state.exclusionSuggestionIndex = clamp(
+        state.exclusionSuggestionIndex,
+        0,
+        Math.max(0, state.exclusionSuggestions.length - 1),
+      );
       setMode(null);
-      if (state.path.length) traceCurrentCurve();
-      showToast(`已添加遮挡/干扰屏蔽区 ${state.exclusions.length}；框内像素不参与追踪，将由引导点和两侧趋势恢复`);
+      retraceIfReady();
+      showToast(`已添加遮挡/干扰屏蔽区 ${state.exclusions.length}；框内像素不参与追踪，程序会在远端自动重连；若仍有歧义再添加引导点`);
       commitHistory("添加屏蔽区");
+      void scanColorSuggestions();
     }
   } else if (Object.keys(pickButtonByMode).includes(state.mode)) {
     const key = state.mode;
-    state.calibrationPoints[key] = point;
+    const axis = calibrationCoordinate(key);
+    const snapResult = $("#calibration-snap")?.checked
+      ? snapCalibrationPoint({
+        rgba: state.imageData?.data,
+        width: canvas.width,
+        height: canvas.height,
+        point,
+        axis,
+      })
+      : { point: { ...point }, snapped: false, confidence: 0, shift: 0, uncertaintyPx: 0.5 };
+    state.calibrationPoints[key] = {
+      ...snapResult.point,
+      snapped: snapResult.snapped,
+      snapConfidence: snapResult.confidence,
+      snapShift: snapResult.shift,
+      uncertaintyPx: snapResult.uncertaintyPx,
+    };
     state.selectedCalibrationKey = key;
     state.selectedPointId = null;
     state.selectedAnchorIndex = null;
-    state.magnifierPoint = { ...point };
+    state.magnifierPoint = { ...state.calibrationPoints[key] };
     setMode(null);
     updateUi();
     draw();
+    showToast(snapResult.snapped
+      ? `${calibrationPointLabel(key)} 已吸附到附近刻度中心（移动 ${formatNumber(Math.abs(snapResult.shift), 3)} px）`
+      : `${calibrationPointLabel(key)} 已按点击位置设置${$("#calibration-snap")?.checked ? "；附近刻度证据不足，未自动移动" : ""}`);
     commitHistory(`设置${key.startsWith("x") ? "X" : "Y"}轴刻度点`);
   } else if (state.mode === "seed") {
-    if (state.plotRect && (
-      point.x < state.plotRect.left || point.x > state.plotRect.right
-      || point.y < state.plotRect.top || point.y > state.plotRect.bottom
-    )) {
-      showToast("曲线种子需要位于已框选的绘图区内");
-      return;
-    }
-    const sampledColor = sampleRepresentativeColor(
-      state.imageData.data,
-      canvas.width,
-      canvas.height,
-      point,
-    );
-    const inkStrength = Math.hypot(255 - sampledColor.r, 255 - sampledColor.g, 255 - sampledColor.b);
-    if (inkStrength < 12) {
-      showToast("这里接近纯白背景，没有采到曲线；请放大后重新点击线条中心");
-      return;
-    }
-    // Picking a target begins a fresh, simple trace. Pen and strict-guide
-    // constraints are opt-in aids for ambiguities and must never leak from a
-    // previous attempt into an ordinary one-click trace.
-    state.traceCorridorOperations = [];
-    state.draftTraceCorridor = null;
-    invalidateTraceCorridor();
-    $("#strict-guide").checked = false;
-    $("#trace-assist-tools").open = false;
-    state.seed = createGuideAnchor(point);
-    state.seedColor = sampledColor;
-    state.anchors = [state.seed];
-    $("#color-threshold").value = String(estimateColorThreshold(
-      state.imageData.data,
-      canvas.width,
-      canvas.height,
-      point,
-      sampledColor,
-    ));
-    syncRangeOutputs();
-    if ($("#target-style").value === "auto") {
-      const inferredStyle = inferLineStyle({
-        rgba: state.imageData.data,
-        width: canvas.width,
-        height: canvas.height,
-        rect: state.plotRect,
-        seed: point,
-        target: sampledColor,
-        threshold: Number($("#color-threshold").value),
-        exclusions: state.exclusions,
-      });
-      $("#target-style").value = inferredStyle.style;
-      $("#target-style").dataset.autoDetected = inferredStyle.style;
-      $("#target-style").dataset.autoConfidence = String(inferredStyle.confidence);
-      delete $("#target-style").dataset.autoFallback;
-    } else {
-      delete $("#target-style").dataset.autoDetected;
-      delete $("#target-style").dataset.autoConfidence;
-      delete $("#target-style").dataset.autoFallback;
-    }
-    state.rawPath = [];
-    state.path = [];
-    state.hoveredPointId = null;
-    state.pointHoverSource = null;
-    state.selectedPointId = null;
-    state.draggedPointId = null;
-    state.hoveredAnchorIndex = null;
-    state.selectedAnchorIndex = 0;
-    state.draggedAnchorIndex = null;
-    setMode(null);
-    if ($("#target-style").value === "markers") {
-      showToast("marker 颜色已采样；请在点列弯曲处和另一端各添加 1 个引导点");
-    } else {
-      traceCurrentCurve();
-    }
-    commitHistory("选择目标并智能追踪");
+    selectTraceTarget(point);
   } else if (state.mode === "guide") {
     if (!pointInsidePlot(point)) {
       showToast("引导点需要位于已框选的绘图区内");
       return;
     }
-    const duplicate = state.anchors.some((anchor) => (
-      Math.hypot(anchor.x - point.x, anchor.y - point.y) < 3
-      || Math.round(anchor.x) === Math.round(point.x)
-    ));
+    const duplicate = isDuplicateGuidePoint(state.anchors, point);
     if (duplicate) {
-      showToast("这里或同一像素列已经有引导点；请沿曲线换一个横向位置");
+      showToast("这里已经有引导点；请沿二维路径换一个位置");
       return;
     }
     state.anchors.push(createGuideAnchor({
@@ -3170,9 +4317,7 @@ canvas.addEventListener("pointerup", (event) => {
     }));
     state.selectedAnchorIndex = state.anchors.length - 1;
     setMode(null);
-    const markerReady = $("#target-style").value === "markers" && state.anchors.length >= 3;
-    if (state.path.length || markerReady) traceCurrentCurve();
-    else showToast(`已添加第 ${state.anchors.length} 个引导点；再添加 ${3 - state.anchors.length} 个即可自动识别 marker`);
+    if (!retraceIfReady()) showToast("marker 颜色已采样；请在点列弯曲处和另一端各添加 1 个引导点");
     commitHistory("添加引导点并重新追踪");
   }
   updateUi();
@@ -3187,6 +4332,7 @@ canvas.addEventListener("pointercancel", () => {
 });
 
 canvas.addEventListener("contextmenu", (event) => {
+  if (state.computeBusy) { event.preventDefault(); return; }
   if (!state.image || state.rotationPreviewActive) return;
   const point = imageCoordinates(event);
   if (calibrationPointAt(point) !== null) {
@@ -3304,6 +4450,10 @@ $("#point-list").addEventListener("click", (event) => {
 });
 
 $("#point-list").addEventListener("change", (event) => {
+  if (state.computeBusy || state.traceStale) {
+    renderPointList();
+    return;
+  }
   const input = event.target.closest(".point-coordinate-input");
   const row = event.target.closest(".data-point-row");
   if (!input || !row) return;
@@ -3358,12 +4508,36 @@ $("#point-list").addEventListener("change", (event) => {
 });
 
 $("#clear-all-points").addEventListener("click", clearAllDataPoints);
-$("#review-focus").addEventListener("click", () => focusReviewRegion(0));
+$("#review-resolve").addEventListener("click", beginReviewResolution);
 $("#review-next").addEventListener("click", () => focusReviewRegion(1));
 
 $("#select-plot").addEventListener("click", () => setMode("plot"));
 $("#add-exclusion").addEventListener("click", () => setMode("exclude"));
 $("#exclude-trace").addEventListener("click", () => setMode("exclude"));
+$("#suggest-exclusions").addEventListener("click", () => scanInterferenceSuggestions());
+$("#previous-exclusion-suggestion").addEventListener("click", () => {
+  if (state.exclusionSuggestions.length <= 1) return;
+  state.exclusionSuggestionIndex = (
+    state.exclusionSuggestionIndex - 1 + state.exclusionSuggestions.length
+  ) % state.exclusionSuggestions.length;
+  updateUi();
+  draw();
+});
+$("#next-exclusion-suggestion").addEventListener("click", () => {
+  if (state.exclusionSuggestions.length <= 1) return;
+  state.exclusionSuggestionIndex = (state.exclusionSuggestionIndex + 1) % state.exclusionSuggestions.length;
+  updateUi();
+  draw();
+});
+$("#accept-exclusion-suggestion").addEventListener("click", () => acceptExclusionSuggestions());
+$("#accept-all-exclusion-suggestions").addEventListener("click", () => acceptExclusionSuggestions({ all: true }));
+$("#dismiss-exclusion-suggestions").addEventListener("click", () => {
+  state.exclusionSuggestions = [];
+  state.exclusionSuggestionIndex = 0;
+  updateUi();
+  draw();
+  showToast("已忽略本次干扰区建议；没有添加任何屏蔽");
+});
 $("#draw-trace-corridor").addEventListener("click", () => setMode("corridor-pen"));
 $("#erase-trace-corridor").addEventListener("click", () => setMode("corridor-erase"));
 $("#clear-trace-corridor").addEventListener("click", () => {
@@ -3372,7 +4546,7 @@ $("#clear-trace-corridor").addEventListener("click", () => {
   state.draftTraceCorridor = null;
   invalidateTraceCorridor();
   if (state.mode === "corridor-erase") setMode(null);
-  if (state.path.length) traceCurrentCurve({ silent: true });
+  retraceIfReady({ silent: true });
   updateUi();
   draw();
   showToast(`Pen 走廊已清除；恢复全绘图区搜索${state.path.length ? "，并已自动重新追踪" : ""}`);
@@ -3381,11 +4555,12 @@ $("#clear-trace-corridor").addEventListener("click", () => {
 $("#undo-exclusion").addEventListener("click", () => {
   if (!state.exclusions.length) return;
   state.exclusions.pop();
-  if (state.path.length) traceCurrentCurve();
+  retraceIfReady();
   updateUi();
   draw();
   showToast("已撤销最后一个屏蔽区");
   commitHistory("移除最后一个屏蔽区");
+  void scanColorSuggestions();
 });
 
 function maybeApplyAutomaticPerspective(suggestions, suppliedDiagnosis = null) {
@@ -3453,6 +4628,8 @@ function maybeApplyAutomaticPerspective(suggestions, suppliedDiagnosis = null) {
 
 function suggestPlotRect({ automatic = false } = {}) {
   if (!state.imageData) return;
+  const detectionId = ++plotDetectionSequence;
+  const imageId = imageLoadSequence;
   if (state.plotSuggestions.length) {
     state.plotSuggestionIndex = (state.plotSuggestionIndex + 1) % state.plotSuggestions.length;
     state.plotRect = state.plotSuggestions[state.plotSuggestionIndex];
@@ -3460,10 +4637,13 @@ function suggestPlotRect({ automatic = false } = {}) {
     setMode(null);
     showToast(`已切换到图框建议 ${state.plotSuggestionIndex + 1}/${state.plotSuggestions.length}`);
     commitHistory("切换绘图区建议");
+    void scanInterferenceSuggestions({ automatic: true });
+    void scanColorSuggestions();
     return;
   }
   $("#mode-hint").textContent = automatic ? "正在自动识别绘图区…" : "正在分析候选图框…";
   window.requestAnimationFrame(() => {
+    if (detectionId !== plotDetectionSequence || imageId !== imageLoadSequence) return;
     let suggestions = detectPlotRects(state.imageData.data, canvas.width, canvas.height);
     if (!suggestions.length) {
       const perspectiveFrame = detectPerspectiveFrame({
@@ -3496,12 +4676,23 @@ function suggestPlotRect({ automatic = false } = {}) {
     showToast(automatic
       ? `已自动选择最可信绘图区；共发现 ${suggestions.length} 个候选`
       : `找到 ${suggestions.length} 个候选图框；可点“下一个建议”切换，或手动框选`);
-    commitHistory("自动选择绘图区");
+    // Initial frame detection is a fresh baseline, not an edit/autosave.
+    if (automatic) resetHistorySession();
+    else commitHistory("自动选择绘图区");
+    void scanInterferenceSuggestions({ automatic: true });
+    void scanColorSuggestions();
   });
 }
 
 $("#auto-plot").addEventListener("click", () => suggestPlotRect());
 $("#pick-seed").addEventListener("click", () => setMode("seed"));
+$("#color-suggestion-list").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-color-suggestion]");
+  if (!button || state.seedColor) return;
+  const suggestion = state.colorSuggestions[Number(button.dataset.colorSuggestion)];
+  if (!suggestion) return;
+  selectTraceTarget(suggestion.seed);
+});
 $("#add-guide").addEventListener("click", () => setMode("guide"));
 $("#undo-guide").addEventListener("click", () => {
   if (state.anchors.length <= 1) return;
@@ -3518,6 +4709,32 @@ for (const [mode, button] of Object.entries(pickButtonByMode)) {
     setMode(mode);
     updateUi();
     draw();
+  });
+}
+
+for (const axis of ["x", "y"]) {
+  $(`#add-${axis}-reference`).addEventListener("click", () => {
+    const count = setCalibrationReferenceCount(axis, activeCalibrationReferenceCount(axis) + 1, { clearRemoved: false });
+    updateUi();
+    setMode(`${axis}${count}`);
+    showToast(`已增加 ${axis.toUpperCase()} 轴参考点 ${count}；请输入刻度值并点击对应刻度`);
+    commitHistory(`增加 ${axis.toUpperCase()} 轴标定参考点`);
+  });
+  $(`#remove-${axis}-reference`).addEventListener("click", () => {
+    const previous = activeCalibrationReferenceCount(axis);
+    const count = setCalibrationReferenceCount(axis, previous - 1);
+    if (count === previous) return;
+    setMode(null);
+    updateUi();
+    draw();
+    showToast(`已移除 ${axis.toUpperCase()} 轴末个参考点；保留 ${count} 个`);
+    commitHistory(`移除 ${axis.toUpperCase()} 轴标定参考点`);
+  });
+  $(`#${axis}-scale`).addEventListener("change", () => {
+    if ($(`#${axis}-scale`).value === "piecewise") {
+      setCalibrationReferenceCount(axis, Math.max(3, activeCalibrationReferenceCount(axis)), { clearRemoved: false });
+    }
+    updateUi();
   });
 }
 
@@ -3549,24 +4766,90 @@ $("#calibration-pixel-position").addEventListener("change", (event) => {
 
 $("#sample-select").addEventListener("change", (event) => {
   const path = event.target.value;
+  if (path !== builtInSamplePath) {
+    event.target.value = builtInSamplePath;
+    showToast("仅允许载入应用内置的示例图片");
+    return;
+  }
   loadImageSource(path, path.split("/").at(-1), path);
 });
 
 $("#image-upload").addEventListener("change", (event) => {
   const [file] = event.target.files;
+  event.target.value = "";
   if (!file) return;
-  loadImageSource(URL.createObjectURL(file), file.name);
+  importRasterImageFile(file);
+});
+
+let imageDragDepth = 0;
+
+function transferContainsFiles(transfer) {
+  return Array.from(transfer?.types ?? []).includes("Files") || Boolean(transfer?.files?.length);
+}
+
+function setImageDropOverlayVisible(visible) {
+  const overlay = $("#image-drop-overlay");
+  if (overlay) overlay.hidden = !visible;
+}
+
+document.addEventListener("dragenter", (event) => {
+  if (!transferContainsFiles(event.dataTransfer)) return;
+  event.preventDefault();
+  imageDragDepth += 1;
+  setImageDropOverlayVisible(true);
+});
+
+document.addEventListener("dragover", (event) => {
+  if (!transferContainsFiles(event.dataTransfer)) return;
+  event.preventDefault();
+  if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+  setImageDropOverlayVisible(true);
+});
+
+document.addEventListener("dragleave", (event) => {
+  if (!transferContainsFiles(event.dataTransfer)) return;
+  imageDragDepth = Math.max(0, imageDragDepth - 1);
+  if (!imageDragDepth) setImageDropOverlayVisible(false);
+});
+
+document.addEventListener("drop", (event) => {
+  if (!transferContainsFiles(event.dataTransfer)) return;
+  event.preventDefault();
+  imageDragDepth = 0;
+  setImageDropOverlayVisible(false);
+  importTransferredRasterImages(event.dataTransfer.files);
+});
+
+document.addEventListener("paste", (event) => {
+  const itemFiles = Array.from(event.clipboardData?.items ?? [])
+    .filter((item) => item.kind === "file")
+    .map((item) => item.getAsFile())
+    .filter(Boolean);
+  const files = itemFiles.length ? itemFiles : Array.from(event.clipboardData?.files ?? []);
+  const includesImage = files.some((file) => (
+    String(file.type ?? "").toLowerCase().startsWith("image/")
+    || validateRasterImageFile(file).valid
+  ));
+  if (!includesImage) return;
+  event.preventDefault();
+  importTransferredRasterImages(files, { pasted: true });
+});
+
+window.addEventListener("blur", () => {
+  imageDragDepth = 0;
+  setImageDropOverlayVisible(false);
 });
 
 $("#project-upload").addEventListener("change", async (event) => {
   const [file] = event.target.files;
+  event.target.value = "";
   if (!file) return;
   try {
     const project = JSON.parse(await file.text());
-    if (![1, 2, 3, 4, 5, 6, 7].includes(project.schemaVersion)) throw new Error("不支持的项目文件版本");
-    if (project.source?.samplePath) {
-      $("#sample-select").value = project.source.samplePath;
-      loadImageSource(project.source.samplePath, project.source.name, project.source.samplePath, project);
+    validateProjectPayload(project);
+    if (project.source.samplePath === builtInSamplePath) {
+      $("#sample-select").value = builtInSamplePath;
+      loadImageSource(builtInSamplePath, project.source.name, builtInSamplePath, project);
     } else if (state.image && state.source.name === project.source?.name) {
       if ((project.source?.width && project.source.width !== state.source.width) || (project.source?.height && project.source.height !== state.source.height)) {
         throw new Error("项目对应的原图尺寸不同，请重新导入匹配的原图");
@@ -3610,24 +4893,42 @@ $("#trace-corridor-width").addEventListener("input", () => {
   draw();
 });
 $("#trace-corridor-width").addEventListener("change", () => commitHistory("调整 Pen 宽度"));
+$("#trace-corridor-mode").addEventListener("change", () => {
+  invalidateTraceCorridor();
+  retraceIfReady();
+  updateUi();
+  draw();
+  commitHistory("更改 Pen 范围");
+});
 
 for (const selector of ["#color-threshold", "#max-jump", "#max-gap"]) {
   $(selector).addEventListener("input", () => {
     syncRangeOutputs();
-    if (state.path.length) traceCurrentCurve();
+    retraceIfReady();
   });
   $(selector).addEventListener("change", () => commitHistory("调整追踪参数"));
 }
 
 $("#sampling-mode").addEventListener("change", () => {
   syncRangeOutputs();
-  if (state.path.length) traceCurrentCurve();
+  retraceIfReady();
   commitHistory("更改数据点分布");
 });
 
-$("#path-refinement").addEventListener("change", () => {
-  if (state.path.length) {
+$("#trace-orientation").addEventListener("change", () => {
+  if (state.seedColor && $("#target-style").value !== "markers") {
     traceCurrentCurve();
+  } else if ($("#trace-orientation").value === "vertical") {
+    showToast("已选择纵向追踪；适合近垂直且同一 X 对应多个 Y 的曲线");
+  } else if ($("#trace-orientation").value === "parametric") {
+    showToast("已选择二维路径追踪；发卡弯和圆环可直接识别，有额外分叉时请沿目标顺序添加至少 2 个引导点");
+  }
+  commitHistory("更改追踪方向");
+});
+
+$("#path-refinement").addEventListener("change", () => {
+  if (retraceIfReady()) {
+    // Settings are applied even when the previous attempt yielded no points.
   } else if ($("#path-refinement").value === "full") {
     showToast("已开启线宽中心校正和自适应多模型遮挡恢复；引导点位置保持不变");
   }
@@ -3635,6 +4936,8 @@ $("#path-refinement").addEventListener("change", () => {
 });
 
 $("#target-style").addEventListener("change", () => {
+  state.automaticMarkerSeries = false;
+  state.automaticMarkerConfidence = 0;
   delete $("#target-style").dataset.autoDetected;
   delete $("#target-style").dataset.autoConfidence;
   delete $("#target-style").dataset.autoFallback;
@@ -3649,7 +4952,7 @@ $("#target-style").addEventListener("change", () => {
     syncRangeOutputs();
   }
   updateUi();
-  if (state.path.length) {
+  if (state.seedColor && state.anchors.length) {
     traceCurrentCurve();
   } else if (["dashed", "dashdot", "dotted"].includes($("#target-style").value)) {
     showToast("线型指纹已开启；请在目标曲线一段清晰、孤立的划线上取色");
@@ -3666,9 +4969,7 @@ $("#strict-guide").addEventListener("change", () => {
     updateUi();
     return;
   }
-  if (state.path.length) {
-    traceCurrentCurve();
-  } else if ($("#strict-guide").checked) {
+  if (!retraceIfReady() && $("#strict-guide").checked) {
     showToast("强约束已开启；请在同色分支或遮挡区前后添加引导点");
   }
   commitHistory("切换同色遮挡约束");
@@ -3677,7 +4978,7 @@ $("#strict-guide").addEventListener("change", () => {
 for (const selector of ["#peak-density", "#peak-width"]) {
   $(selector).addEventListener("input", syncRangeOutputs);
   $(selector).addEventListener("change", () => {
-    if (state.path.length) traceCurrentCurve();
+    retraceIfReady();
     commitHistory("调整峰值采样密度");
   });
 }
@@ -3685,7 +4986,7 @@ for (const selector of ["#peak-density", "#peak-width"]) {
 for (const selector of ["#noise-density", "#noise-window"]) {
   $(selector).addEventListener("input", syncRangeOutputs);
   $(selector).addEventListener("change", () => {
-    if (state.path.length) traceCurrentCurve();
+    retraceIfReady();
     commitHistory("调整波动采样密度");
   });
 }
@@ -3700,6 +5001,7 @@ function selectExistingDataPoints(path, count) {
 }
 
 $("#trace-point-count").addEventListener("change", (event) => {
+  if (state.computeBusy || state.traceStale) return;
   const pointCount = normalizeTracePointCount(event.target.value);
   event.target.value = String(pointCount);
   if (state.path.length && state.path.length !== pointCount) {
@@ -3715,13 +5017,18 @@ $("#trace-point-count").addEventListener("change", (event) => {
       commitHistory("调整 marker 数据点数量");
       return;
     }
-    state.path = markerData
-      ? createDataPath(selectExistingDataPoints(sourcePath, pointCount), "marker")
-      : createDataPath(constrainToCurrentTraceCorridor(includeMandatoryPoints(
-        samplePixelPath(sourcePath, pointCount),
-        sourcePath.filter((point) => point.anchor),
-        pointCount,
-      )), "resampled");
+    try {
+      const prepared = prepareTraceOutput(markerData ? selectExistingDataPoints(sourcePath, pointCount) : sourcePath, {
+        count: pointCount, parameters: activeSamplingParameters(), orientation: state.traceOrientation,
+        markerData, inclusionMask: traceCorridorMask(), rect: state.plotRect,
+        width: canvas.width, height: canvas.height,
+      });
+      state.path = createDataPath(prepared.path, markerData ? "marker" : "resampled");
+    } catch (error) {
+      event.target.value = String(state.path.length);
+      showToast(translateMessage(error.message));
+      return;
+    }
     event.target.value = String(state.path.length);
     state.hoveredPointId = null;
     state.pointHoverSource = null;
@@ -3737,7 +5044,8 @@ $("#trace-point-count").addEventListener("change", (event) => {
 });
 
 for (const selector of [
-  "#x-scale", "#y-scale", "#x-value-1", "#x-value-2", "#x-value-3", "#y-value-1", "#y-value-2", "#y-value-3",
+  "#x-scale", "#y-scale", "#x-value-1", "#x-value-2", "#x-value-3", "#x-value-4", "#x-value-5",
+  "#y-value-1", "#y-value-2", "#y-value-3", "#y-value-4", "#y-value-5",
   "#x-label", "#y-label", "#series-label",
 ]) {
   $(selector).addEventListener("input", () => {
@@ -3748,16 +5056,22 @@ for (const selector of [
   $(selector).addEventListener("change", () => commitHistory("修改标定或标签"));
 }
 
-$("#trace-curve").addEventListener("click", () => {
-  traceCurrentCurve();
-  commitHistory("重新自动追踪");
+$("#calibration-snap").addEventListener("change", () => {
+  scheduleDraftSave();
+  commitHistory($("#calibration-snap").checked ? "启用刻度中心吸附" : "关闭刻度中心吸附");
 });
+
+$("#trace-curve").addEventListener("click", async () => {
+  if (await traceCurrentCurve({ refreshHistory: false })) commitHistory("重新自动追踪");
+});
+$("#retry-trace").addEventListener("click", () => $("#trace-curve").click());
 $("#clear-curve").addEventListener("click", () => {
   clearActiveCurve({ keepTargetStyle: true });
   commitHistory("重置当前曲线");
 });
 
 $("#save-series").addEventListener("click", () => {
+  if (state.computeBusy || state.traceStale) return;
   if (!state.path.length) {
     if (!state.series.length) return;
     clearActiveCurve();
@@ -3834,6 +5148,11 @@ $("#series-list").addEventListener("click", (event) => {
       ?? state.path[0]
       ?? null;
     state.rawPath = (series.rawPath ?? []).map((point) => ({ ...point }));
+    state.traceStale = Boolean(series.traceStale);
+    state.traceError = series.traceError ?? null;
+    state.traceOrientation = resolvedTraceOrientation(series.parameters, state.rawPath.length
+      ? state.rawPath
+      : state.path);
     state.traceCorridorOperations = normalizeTraceCorridorOperations(series.traceCorridorOperations);
     state.draftTraceCorridor = null;
     invalidateTraceCorridor();
@@ -3854,11 +5173,19 @@ $("#series-list").addEventListener("click", (event) => {
     $("#noise-density").value = series.parameters?.noiseDensity ?? 4;
     $("#noise-window").value = series.parameters?.noiseWindow ?? 3;
     $("#strict-guide").checked = series.parameters?.strictGuidance ?? false;
+    $("#trace-orientation").value = series.parameters?.orientationMode ?? "auto";
     $("#target-style").value = series.parameters?.targetStyle ?? "auto";
     delete $("#target-style").dataset.autoDetected;
     delete $("#target-style").dataset.autoConfidence;
     delete $("#target-style").dataset.autoFallback;
+    state.automaticMarkerSeries = Boolean(series.parameters?.automaticMarkerSeries);
+    state.automaticMarkerConfidence = Number(series.parameters?.automaticMarkerConfidence) || 0;
+    if (state.automaticMarkerSeries && $("#target-style").value === "markers") {
+      $("#target-style").dataset.autoDetected = "markers";
+      $("#target-style").dataset.autoConfidence = String(state.automaticMarkerConfidence);
+    }
     $("#path-refinement").value = series.parameters?.refinementMode ?? "full";
+    $("#trace-corridor-mode").value = series.parameters?.corridorMode ?? "local";
     $("#trace-corridor-width").value = String(series.parameters?.corridorWidth ?? 24);
     $("#trace-point-count").value = String(state.path.length || normalizeTracePointCount(series.parameters?.pointCount));
     syncRangeOutputs();
@@ -3873,6 +5200,7 @@ $("#zoom-range").addEventListener("input", (event) => setZoom(event.target.value
 $("#zoom-fit").addEventListener("click", fitZoom);
 $("#undo-action").addEventListener("click", () => navigateHistory("undo"));
 $("#redo-action").addEventListener("click", () => navigateHistory("redo"));
+$("#restore-draft").addEventListener("click", restorePreviousDraft);
 $("#restart-session").addEventListener("click", () => {
   const dialog = $("#clear-draft-confirm");
   if (dialog?.showModal) dialog.showModal();
@@ -3888,9 +5216,11 @@ $("#clear-draft-apply").addEventListener("click", (event) => {
     return;
   }
   $("#clear-draft-confirm")?.close("default");
-  const freshUrl = new URL(window.location.href);
-  freshUrl.searchParams.set("fresh", "1");
-  window.location.replace(freshUrl);
+  resetExtraction({ keepCalibrationValues: false });
+  resetHistorySession();
+  draw();
+  showToast("已清除当前图片的草稿和提取数据；原图与工作图保持不变");
+  suggestPlotRect({ automatic: true });
 });
 $("#export-density").addEventListener("change", () => commitHistory("更改导出采样密度"));
 window.addEventListener("keydown", (event) => {
@@ -3901,7 +5231,7 @@ window.addEventListener("keydown", (event) => {
     navigateHistory(event.shiftKey ? "redo" : "undo");
     return;
   }
-  if (editingText || event.ctrlKey || event.metaKey || event.altKey) return;
+  if (state.computeBusy || editingText || event.ctrlKey || event.metaKey || event.altKey) return;
   const direction = {
     ArrowLeft: { x: -1, y: 0 },
     ArrowRight: { x: 1, y: 0 },
@@ -3957,14 +5287,22 @@ function baseName() {
 }
 
 function buildCurveExportRows() {
+  if (state.computeBusy || state.traceStale) throw new Error("当前结果尚未按新设置更新；请重新追踪，或撤销本次调整");
   const exportSeries = curvesForExport();
   const density = $("#export-density").value;
   const pairedSeries = exportSeries.map((series) => {
+    if (series.traceStale) throw new Error(`${translateMessage("请编辑并重新追踪此已存曲线")}: ${series.label}`);
     const calibration = curveCalibrationSnapshot(series);
     const preserveDiscreteMarkers = series.parameters?.targetStyle === "markers";
-    const data = density === "curve" || preserveDiscreteMarkers
-      ? pathToData(series.path, calibration.x, calibration.y)
-      : resamplePath(series.path, calibration.x, calibration.y, normalizeTracePointCount(density));
+    const orientation = resolvedTraceOrientation(series.parameters, series.path);
+    const prepared = prepareTraceOutput(series.path, {
+      count: density === "curve" ? null : normalizeTracePointCount(density),
+      parameters: series.parameters ?? { samplingMode: "geometry" },
+      markerData: preserveDiscreteMarkers, orientation,
+      inclusionMask: buildTraceCorridorMask(series.traceCorridorOperations, series.parameters?.corridorMode),
+      width: canvas.width, height: canvas.height, rect: state.plotRect,
+    });
+    const data = pathToData(prepared.path, calibration.x, calibration.y);
     return {
       label: series.label,
       data,
@@ -3981,7 +5319,14 @@ function buildCurveExportRows() {
 }
 
 async function exportDelimitedCurves(format) {
-  const { rows, curveCount } = buildCurveExportRows();
+  let prepared;
+  try {
+    prepared = buildCurveExportRows();
+  } catch (error) {
+    showToast(translateMessage(error.message));
+    return false;
+  }
+  const { rows, curveCount } = prepared;
   if (!curveCount) return;
   const csv = format === "csv";
   const content = rows.map((row) => row.map((value) => (
@@ -4028,7 +5373,7 @@ $("#export-project").addEventListener("click", async () => {
     reviewRegions: findPathReviewRegions(series.path, state.plotRect),
   }));
   const project = {
-    schemaVersion: 7,
+    schemaVersion: 8,
     createdAt: new Date().toISOString(),
     source: state.source,
     preprocessing: {
@@ -4048,6 +5393,8 @@ $("#export-project").addEventListener("click", async () => {
     plotRect: state.plotRect,
     exclusions: state.exclusions,
     calibrationPoints: state.calibrationPoints,
+    calibrationReferenceCounts: state.calibrationReferenceCounts,
+    calibrationSnapEnabled: Boolean($("#calibration-snap").checked),
     axes: {
       x: { ...xCalibration(), label: $("#x-label").value.trim() },
       y: { ...yCalibration(), label: $("#y-label").value.trim() },
@@ -4057,6 +5404,8 @@ $("#export-project").addEventListener("click", async () => {
     calibrationAudit: cloneSerializable(calibrationAudit()),
     exportSettings: { csvDensity: $("#export-density").value },
     activeCurve: {
+      traceStale: state.traceStale || Boolean(state.computeBusy),
+      traceError: state.traceError,
       label: $("#series-label").value.trim(),
       seed: state.seed,
       seedColor: state.seedColor,
@@ -4069,7 +5418,7 @@ $("#export-project").addEventListener("click", async () => {
       calibration: currentCalibrationSnapshot(),
       calibrationBeforeSeriesEdit: state.calibrationBeforeSeriesEdit,
     },
-    extractor: { name: "SciDigitizer", version: "0.20.0-preview.3.1", engine: "bilingual-adaptive-occlusion-ensemble-risk-ranked-review-audited-manual-calibration-guided-color-centerline-multicurve-core" },
+    extractor: { name: "SciDigitizer", version: "0.20.0-preview.3.21", engine: "parametric-orientation-adaptive-bilingual-occlusion-pattern-gap-ensemble-risk-ranked-review-low-friction-import-responsive-worker-guided-color-centerline-multicurve-core" },
   };
   const saved = await downloadBlob(`${JSON.stringify(project, null, 2)}\n`, "application/json", `${baseName()}-project.json`);
   if (saved) showToast("项目文件已保存，可恢复标定、参数和路径");
@@ -4079,7 +5428,7 @@ initializePanelAccordion();
 window.addEventListener("languagechange", () => window.requestAnimationFrame(updatePanelSectionSummaries));
 syncRangeOutputs();
 updateUi();
-loadImageSource("images/fig1.png", "fig1.png", "images/fig1.png");
+loadImageSource(builtInSamplePath, "fig1.png", builtInSamplePath);
 
 function currentDisplayImage() {
   return state.rotationPreviewImage ?? state.image;
@@ -4128,7 +5477,16 @@ function updateWorkingCanvas(image, { preview = false } = {}) {
   imageContext.clearRect(0, 0, imageCanvas.width, imageCanvas.height);
   imageContext.drawImage(image, 0, 0);
   context.clearRect(0, 0, canvas.width, canvas.height);
-  if (!preview) state.imageData = imageContext.getImageData(0, 0, imageCanvas.width, imageCanvas.height);
+  if (!preview) {
+    // Any computation launched for the previous raster is obsolete even when
+    // the plot geometry happens to have the same dimensions.
+    targetSelectionSequence += 1;
+    traceTaskSequence += 1;
+    state.computeBusy = null;
+    state.imageData = imageContext.getImageData(0, 0, imageCanvas.width, imageCanvas.height);
+    computeClient.setImage(currentComputeImage());
+    document.documentElement.dataset.computeMode = computeClient.mode();
+  }
 }
 
 function updateSourceMeta() {
@@ -4223,7 +5581,7 @@ var rotationLockSelectors = [
   "#add-exclusion", "#exclude-trace", "#undo-exclusion", "#trace-curve",
   "#clear-curve", "#clear-all-points", "#save-series", "#export-csv",
   "#export-txt", "#export-overlay", "#export-project", "#zoom-range", "#zoom-fit",
-  "#restart-session",
+  "#restart-session", "#restore-draft",
   ...Object.keys(pickButtonByMode).map((key) => `#pick-${key.replace(/[0-9]/g, "-$&")}`),
 ];
 

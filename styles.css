@@ -315,6 +315,68 @@ button:disabled {
   outline: none;
 }
 
+.calibration-reference-actions {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 7px;
+}
+
+.calibration-reference-actions button {
+  min-height: 27px;
+  padding: 0 7px;
+  border: 1px solid #cbd6e2;
+  border-radius: 6px;
+  color: #33516e;
+  background: white;
+  font-size: 9px;
+  font-weight: 650;
+}
+
+.calibration-reference-actions button:disabled {
+  color: #a5b0bb;
+  background: #f4f6f8;
+}
+
+.calibration-reference-actions span {
+  margin-left: auto;
+  color: #718195;
+  font-size: 8px;
+  white-space: nowrap;
+}
+
+.calibration-snap-toggle {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 9px;
+  padding: 9px;
+  border: 1px solid #c9ddec;
+  border-radius: 8px;
+  color: #29445f;
+  background: #f4f9fd;
+  cursor: pointer;
+}
+
+.calibration-snap-toggle input {
+  margin-top: 2px;
+}
+
+.calibration-snap-toggle span {
+  display: grid;
+  gap: 2px;
+}
+
+.calibration-snap-toggle strong {
+  font-size: 10px;
+}
+
+.calibration-snap-toggle small {
+  color: #65788b;
+  font-size: 8px;
+  line-height: 1.45;
+}
+
 .select-control:focus,
 .compact-select:focus,
 .calibration-row input:focus {
@@ -332,6 +394,49 @@ button:disabled {
   border-color: #e4a4aa;
   color: #9f3540;
   background: #fff7f8;
+}
+
+.interference-scan-button {
+  margin-top: 7px;
+}
+
+.exclusion-suggestion-review {
+  margin-top: 8px;
+  padding: 9px;
+  border: 1px solid #e5bd72;
+  border-radius: 8px;
+  color: #6f5019;
+  background: #fff9ee;
+}
+
+.exclusion-suggestion-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 10px;
+}
+
+.exclusion-suggestion-heading span {
+  color: #8b6a31;
+  font-size: 8px;
+  font-variant-numeric: tabular-nums;
+}
+
+.exclusion-suggestion-review p {
+  margin: 5px 0 0;
+  color: #7c653c;
+  font-size: 8px;
+  line-height: 1.45;
+}
+
+.exclusion-suggestion-navigation,
+.exclusion-suggestion-actions {
+  margin-top: 6px;
+}
+
+.exclusion-suggestion-actions {
+  grid-template-columns: 1.15fr 1.15fr 0.7fr;
 }
 
 .export-status {
@@ -478,6 +583,13 @@ button:disabled {
 .source-meta,
 .status-line {
   margin-top: 10px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.image-import-hint {
+  margin: 7px 2px 2px;
   color: var(--muted);
   font-size: 11px;
   line-height: 1.45;
@@ -745,6 +857,13 @@ button:disabled {
   color: white;
 }
 
+.pick-button.calibration-outlier:not(.active) {
+  border-color: #db8c32;
+  color: #8a5516;
+  background: #fff7e9;
+  box-shadow: 0 0 0 2px rgb(219 140 50 / 12%);
+}
+
 .calibration-refine,
 .calibration-quality {
   margin-top: 9px;
@@ -939,6 +1058,74 @@ button:disabled {
 
 .trace-type-options .target-style-select {
   margin-bottom: 10px;
+}
+
+.color-suggestions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 9px;
+  padding: 8px 9px;
+  border: 1px solid #d9e4ef;
+  border-radius: 9px;
+  background: #fbfdff;
+}
+
+.color-suggestions[hidden] {
+  display: none;
+}
+
+.color-suggestions-copy strong,
+.color-suggestions-copy small {
+  display: block;
+}
+
+.color-suggestions-copy strong {
+  color: #36516d;
+  font-size: 9px;
+}
+
+.color-suggestions-copy small {
+  margin-top: 2px;
+  color: #7a8999;
+  font-size: 7.5px;
+  line-height: 1.35;
+}
+
+.color-suggestion-list {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 5px;
+  max-width: 126px;
+}
+
+.color-suggestion-chip {
+  width: 25px;
+  height: 25px;
+  padding: 3px;
+  border: 1px solid #b7c6d7;
+  border-radius: 50%;
+  background: white;
+  cursor: pointer;
+  transition: border-color 120ms ease, box-shadow 120ms ease, transform 120ms ease;
+}
+
+.color-suggestion-chip:hover,
+.color-suggestion-chip:focus-visible {
+  border-color: #276ec4;
+  box-shadow: 0 0 0 3px rgb(39 110 196 / 13%);
+  outline: none;
+  transform: translateY(-1px);
+}
+
+.color-suggestion-chip span {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  box-shadow: inset 0 0 0 1px rgb(0 0 0 / 9%);
 }
 
 .trace-primary-action {
@@ -1470,6 +1657,10 @@ input[type="range"] {
   background: #fafbfd;
 }
 
+.review-assistant[hidden] {
+  display: none;
+}
+
 .review-assistant.review {
   border-color: #efcb91;
   background: #fff9ed;
@@ -1529,7 +1720,7 @@ input[type="range"] {
   font-size: 9px;
 }
 
-.review-assistant-actions #review-focus {
+.review-assistant-actions #review-resolve {
   flex: 1;
 }
 
@@ -1554,7 +1745,7 @@ input[type="range"] {
 .workspace {
   position: relative;
   display: grid;
-  grid-template-rows: 58px minmax(0, 1fr) 39px;
+  grid-template-rows: 58px auto minmax(0, 1fr) 39px;
   min-width: 0;
   min-height: 0;
 }
@@ -1567,6 +1758,7 @@ input[type="range"] {
 }
 
 .workspace-toolbar {
+  grid-row: 1;
   justify-content: space-between;
   gap: 12px;
   padding: 0 18px;
@@ -1670,6 +1862,7 @@ input[type="range"] {
 }
 
 .canvas-scroller {
+  grid-row: 3;
   position: relative;
   overflow: auto;
   min-width: 0;
@@ -2013,12 +2206,31 @@ input[type="range"] {
 }
 
 .workspace-footer {
+  grid-row: 4;
   gap: 18px;
   padding: 0 18px;
   border-top: 1px solid var(--line);
   color: #69778a;
   font-size: 10px;
 }
+
+.trace-workspace-status {
+  grid-row: 2;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 18px;
+  border-bottom: 1px solid #e5b76b;
+  background: #fff5e7;
+  color: #794718;
+  font-size: 12px;
+}
+
+.trace-workspace-status > div { flex: 1; min-width: 0; }
+.trace-workspace-status p { margin: 4px 0; overflow-wrap: anywhere; }
+.trace-workspace-status button { flex: 0 0 auto; width: auto; }
+.point-list-stale { padding: 6px; color: #794718; background: #fff5e7; }
+.point-list[inert] { opacity: 0.55; }
 
 .legend-item {
   display: flex;
@@ -2076,6 +2288,40 @@ input[type="range"] {
 .cursor-readout {
   margin-left: auto;
   font-variant-numeric: tabular-nums;
+}
+
+.image-drop-overlay {
+  position: fixed;
+  z-index: 1200;
+  inset: 72px 0 0;
+  display: grid;
+  place-items: center;
+  padding: 32px;
+  background: rgb(16 49 80 / 48%);
+  backdrop-filter: blur(2px);
+  pointer-events: none;
+}
+
+.image-drop-overlay > div {
+  display: grid;
+  gap: 7px;
+  min-width: 360px;
+  padding: 28px 42px;
+  border: 3px dashed rgb(255 255 255 / 88%);
+  border-radius: 18px;
+  color: white;
+  background: rgb(15 73 132 / 92%);
+  box-shadow: 0 20px 60px rgb(9 27 47 / 35%);
+  text-align: center;
+}
+
+.image-drop-overlay strong {
+  font-size: 22px;
+}
+
+.image-drop-overlay span {
+  font-size: 13px;
+  opacity: 0.9;
 }
 
 .toast {

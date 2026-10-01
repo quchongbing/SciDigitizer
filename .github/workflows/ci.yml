@@ -15,7 +15,7 @@ concurrency:
 jobs:
   test:
     name: Node.js 22
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
 
     steps:
@@ -38,3 +38,16 @@ jobs:
 
       - name: Run unit tests
         run: npm test
+
+      - name: Check extraction accuracy regressions
+        run: npm run benchmark:check
+
+      - name: Run real-image smoke regressions
+        run: npm run smoke:real
+
+      - name: Run browser workflows (HTTP worker and file bundle)
+        # GitHub's Ubuntu runner includes Chrome; do not download a separate
+        # browser or disable its sandbox for untrusted pull-request code.
+        run: |
+          google-chrome --version
+          npm run smoke:app

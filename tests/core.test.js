@@ -3,29 +3,40 @@ import assert from "node:assert/strict";
 
 import {
   assessCalibrationQuality,
+  calibrationUncertaintyAtPixel,
   calibrationError,
   assessPathQuality,
   buildPairedCurveRows,
   compositedColorDistance,
   constrainPathToInclusionMask,
   detectPlotRect,
+  discoverColoredSeries,
   estimateColorThreshold,
   extractMarkerCenters,
+  findMostInformativeAmbiguity,
   findPathReviewRegions,
   fitInferredPathGaps,
+  fitCalibrationModel,
+  includeMandatoryParametricPoints,
   includeMandatoryPoints,
   inferLineStyle,
+  inferMarkerSeries,
   normalizeRect,
   pathToData,
   pixelAt,
   pixelToValue,
+  preferOrdinaryTraceFallback,
   refinePathCenterline,
   resamplePath,
   resamplePixelPath,
+  resamplePixelPathArcLength,
   resamplePixelPathAdaptive,
   resamplePixelPathGeometry,
   resamplePixelPathRoughness,
   sampleRepresentativeColor,
+  snapCalibrationPoint,
+  snapTargetPoint,
+  suggestInterferenceMasks,
   traceCurve,
   traceCurveThroughAnchors,
   validateCalibration,
@@ -185,6 +196,81 @@ test("manual calibration quality reports pixel sensitivity and short reference s
   assert.ok(Math.abs(logarithmic.sensitivity - 10 ** 0.02) < 1e-12);
 });
 
+test("multi-point linear calibration resists one misplaced reference and reports it", () => {
+  const calibration = {
+    scale: "linear",
+    points: [
+      { key: "x1", pixel: 0, value: 0, uncertaintyPx: 0.25 },
+      { key: "x2", pixel: 100, value: 10, uncertaintyPx: 0.25 },
+      { key: "x3", pixel: 205, value: 20, uncertaintyPx: 0.25 },
+      { key: "x4", pixel: 300, value: 30, uncertaintyPx: 0.25 },
+      { key: "x5", pixel: 400, value: 40, uncertaintyPx: 0.25 },
+    ],
+  };
+  const model = fitCalibrationModel(calibration);
+  const quality = assessCalibrationQuality(calibration, 400);
+
+  assert.equal(validateCalibration(calibration), true);
+  assert.ok(Math.abs(pixelToValue(250, calibration) - 25) < 0.08);
+  assert.ok(Math.abs(valueToPixel(25, calibration) - 250) < 0.8);
+  assert.ok(model.outliers.some((point) => point.key === "x3"));
+  assert.ok(quality.warnings.some((warning) => warning.includes("x3")));
+  assert.ok(quality.residualRmsPx > 1);
+});
+
+test("multi-point Log10 calibration fits in logarithmic value space", () => {
+  const calibration = {
+    scale: "log",
+    points: [
+      { pixel: 0, value: 1 },
+      { pixel: 100, value: 10 },
+      { pixel: 200, value: 100 },
+      { pixel: 300, value: 1000 },
+    ],
+  };
+  assert.ok(Math.abs(pixelToValue(150, calibration) - Math.sqrt(1000)) < 1e-10);
+  assert.ok(Math.abs(valueToPixel(100, calibration) - 200) < 1e-10);
+});
+
+test("calibration uncertainty includes reference placement and curve inference", () => {
+  const calibration = {
+    scale: "linear",
+    points: [
+      { pixel: 0, value: 0, uncertaintyPx: 0.2 },
+      { pixel: 100, value: 10, uncertaintyPx: 0.2 },
+      { pixel: 200, value: 20, uncertaintyPx: 0.2 },
+      { pixel: 300, value: 30, uncertaintyPx: 0.2 },
+    ],
+  };
+  const calibrationOnly = calibrationUncertaintyAtPixel(150, calibration);
+  const withInference = calibrationUncertaintyAtPixel(150, calibration, 3);
+  assert.ok(calibrationOnly.pixelSigma > 0 && calibrationOnly.pixelSigma < 0.2);
+  assert.ok(withInference.pixelSigma > 3);
+  assert.ok(withInference.valueSigma > calibrationOnly.valueSigma * 10);
+});
+
+test("tick snapping centres a user click on a nearby vertical tick", () => {
+  const width = 40;
+  const height = 30;
+  const rgba = whiteImage(width, height);
+  const ink = { r: 20, g: 20, b: 20 };
+  for (let y = 10; y <= 24; y += 1) {
+    setPixel(rgba, width, 17, y, ink);
+    setPixel(rgba, width, 18, y, ink);
+  }
+  const result = snapCalibrationPoint({
+    rgba,
+    width,
+    height,
+    point: { x: 20.4, y: 17 },
+    axis: "x",
+  });
+  assert.equal(result.snapped, true);
+  assert.ok(result.point.x > 17 && result.point.x < 18);
+  assert.ok(result.confidence > 0.2);
+  assert.ok(result.uncertaintyPx < 0.5);
+});
+
 test("paired curve export uses two columns per curve and pads shorter series", () => {
   const rows = buildPairedCurveRows([
     {
@@ -260,6 +346,37 @@ test("piecewise calibration rejects a value reversal in pixel order", () => {
   assert.match(calibrationError(calibration, "X 轴"), /保持单调/);
 });
 
+test("black ink is distinguished from shaded neutral backgrounds without losing dark antialias pixels", () => {
+  const black = { r: 0, g: 0, b: 0 };
+  assert.equal(compositedColorDistance(0, 0, 0, black), 0);
+  assert.ok(compositedColorDistance(40, 42, 46, black) <= 9);
+  assert.ok(compositedColorDistance(96, 103, 121, black) > 15);
+  assert.ok(compositedColorDistance(110, 110, 110, black) > 15);
+});
+
+test("neutral ink keeps its luminance identity across black, grey and pale targets", () => {
+  for (const level of [0, 40, 79, 80, 100, 160, 200, 220]) {
+    const target = { r: level, g: level, b: level };
+    const antialias = Math.round(level + (255 - level) * 0.12);
+    assert.ok(compositedColorDistance(level, level, level, target) < 1e-4);
+    assert.ok(compositedColorDistance(antialias, antialias, antialias, target) <= 9,
+      `must retain a mostly covered antialias pixel for grey ${level}`);
+  }
+  for (const level of [100, 160, 200]) {
+    const target = { r: level, g: level, b: level };
+    assert.ok(compositedColorDistance(240, 240, 240, target) > 15, `grey ${level} matched pale background`);
+    assert.ok(compositedColorDistance(0, 0, 0, target) > 15, `grey ${level} matched a black grid`);
+  }
+  assert.ok(compositedColorDistance(220, 220, 220, { r: 100, g: 100, b: 100 }) > 15);
+});
+
+test("neutral luminance matching has no abrupt cutoff at grey 80", () => {
+  const before = compositedColorDistance(160, 160, 160, { r: 79, g: 79, b: 79 });
+  const after = compositedColorDistance(160, 160, 160, { r: 80, g: 80, b: 80 });
+  assert.ok(before > 15 && after > 15);
+  assert.ok(Math.abs(before - after) < 1);
+});
+
 test("composited color distance treats antialias shades as one ink color", () => {
   const blue = { r: 0, g: 0, b: 255 };
   assert.ok(compositedColorDistance(168, 168, 255, blue) < 1e-4);
@@ -332,6 +449,17 @@ test("representative color finds a black cross when scaling lands the click on a
   assert.deepEqual(pixelAt(rgba, width, 11, 8), { ...blue, a: 255 });
   const sampled = sampleRepresentativeColor(rgba, width, height, { x: 11, y: 8 });
   assert.ok(Math.max(sampled.r, sampled.g, sampled.b) <= 10);
+  const snapped = snapTargetPoint({
+    rgba,
+    width,
+    height,
+    rect: { left: 0, top: 0, right: width - 1, bottom: height - 1 },
+    point: { x: 11, y: 8 },
+    target: sampled,
+    threshold: estimateColorThreshold(rgba, width, height, { x: 11, y: 8 }, sampled),
+  });
+  assert.ok(Math.hypot(snapped.x - 10, snapped.y - 10) < 2.5,
+    `black cross snapped to the wrong stroke: ${JSON.stringify(snapped)}`);
 });
 
 test("representative color does not let a nearby black annotation line steal a colored click", () => {
@@ -344,6 +472,54 @@ test("representative color does not let a nearby black annotation line steal a c
 
   const sampled = sampleRepresentativeColor(rgba, width, height, { x: 10, y: 10 });
   assert.ok(compositedColorDistance(sampled.r, sampled.g, sampled.b, red) < 1);
+});
+
+test("target selection snaps a near miss to the center of a steep stroke", () => {
+  const width = 32;
+  const height = 32;
+  const rgba = whiteImage(width, height);
+  const green = { r: 0, g: 139, b: 0 };
+  for (let offset = -8; offset <= 8; offset += 1) {
+    const centerX = 16 + Math.round(offset / 3);
+    const centerY = 16 + offset;
+    for (let x = centerX - 1; x <= centerX + 1; x += 1) {
+      setPixel(rgba, width, x, centerY, green);
+    }
+  }
+  const point = { x: 12, y: 16 };
+  const snapped = snapTargetPoint({
+    rgba,
+    width,
+    height,
+    rect: { left: 0, top: 0, right: width - 1, bottom: height - 1 },
+    point,
+    target: green,
+    threshold: 5,
+  });
+  assert.ok(snapped.x >= 14.5 && snapped.x <= 16.5, `unexpected snapped x: ${snapped.x}`);
+  assert.ok(snapped.y >= 13 && snapped.y <= 19, `unexpected snapped y: ${snapped.y}`);
+  assert.notDeepEqual(snapped, point);
+});
+
+test("target selection centers a vertical stroke without moving along it", () => {
+  const width = 24;
+  const height = 40;
+  const rgba = whiteImage(width, height);
+  const blue = { r: 31, g: 119, b: 180 };
+  for (let y = 2; y <= 37; y += 1) {
+    for (let x = 10; x <= 12; x += 1) setPixel(rgba, width, x, y, blue);
+  }
+  const snapped = snapTargetPoint({
+    rgba,
+    width,
+    height,
+    rect: { left: 0, top: 0, right: width - 1, bottom: height - 1 },
+    point: { x: 8, y: 29 },
+    target: blue,
+    threshold: 5,
+  });
+  assert.ok(Math.abs(snapped.x - 11) < 0.1, `unexpected snapped x: ${snapped.x}`);
+  assert.ok(Math.abs(snapped.y - 29) < 0.1, `unexpected snapped y: ${snapped.y}`);
 });
 
 test("traceCurve follows a solid diagonal and ignores a parallel curve", () => {
@@ -369,6 +545,48 @@ test("traceCurve follows a solid diagonal and ignores a parallel curve", () => {
   });
   assert.equal(path.length, 70);
   assert.ok(path.every((point) => Math.abs(point.y - Math.round(12 + point.x * 0.25)) <= 0.5));
+});
+
+test("a later guide resolves a globally ambiguous same-color overlap", () => {
+  const width = 150;
+  const height = 82;
+  const rgba = whiteImage(width, height);
+  const blue = { r: 25, g: 75, b: 220 };
+  const targetY = (x) => {
+    if (x < 55) return 20 + (x - 5) * 0.4;
+    if (x <= 75) return 40;
+    return 40 + (x - 75) * 0.4;
+  };
+  const otherY = (x) => {
+    if (x < 55) return 60 - (x - 5) * 0.4;
+    if (x <= 75) return 40;
+    return 40 - (x - 75) * 0.4;
+  };
+  for (let x = 5; x <= 144; x += 1) {
+    setPixel(rgba, width, x, Math.round(otherY(x)), blue);
+    setPixel(rgba, width, x, Math.round(targetY(x)), blue);
+  }
+  const path = traceCurveThroughAnchors({
+    rgba,
+    width,
+    height,
+    rect: { left: 5, top: 3, right: 144, bottom: 78 },
+    anchors: [
+      { x: 22, y: targetY(22) },
+      { x: 130, y: targetY(130) },
+    ],
+    target: blue,
+    threshold: 5,
+    maxJump: 5,
+    maxGap: 2,
+    targetStyle: "line",
+  });
+  assert.equal(path.at(0).x, 5);
+  assert.equal(path.at(-1).x, 144);
+  assert.ok(Math.abs(path.find((point) => point.x === 110).y - targetY(110)) <= 1);
+  assert.ok(Math.abs(path.find((point) => point.x === 110).y - otherY(110)) >= 20);
+  const branchEvidence = path.filter((point) => point.ambiguityAlternatives?.length);
+  assert.ok(branchEvidence.some((point) => point.x > 75 && point.x < 100));
 });
 
 test("a partial Pen inclusion mask selects the intended branch only in painted columns", () => {
@@ -407,7 +625,7 @@ test("a partial Pen inclusion mask selects the intended branch only in painted c
   assert.ok(Math.abs(afterCrossing.y - Math.round(30 - afterCrossing.x * 0.25)) <= 0.5);
 });
 
-test("the final Pen constraint keeps inferred and resampled points inside while preserving guides", () => {
+test("the final Pen constraint flags distant inferred points instead of fabricating a boundary location", () => {
   const width = 42;
   const height = 32;
   const maskData = new Uint8Array(width * height);
@@ -430,10 +648,84 @@ test("the final Pen constraint keeps inferred and resampled points inside while 
   });
 
   assert.equal(constrained[0].y, 24, "unpainted columns remain unconstrained");
-  assert.equal(constrained[1].y, 15);
-  assert.equal(constrained[1].corridorConstrained, true);
+  assert.equal(constrained[1].y, 25);
+  assert.equal(constrained[1].corridorOutside, true);
   assert.equal(constrained[2].y, 12.5, "points already inside the corridor stay unchanged");
   assert.equal(constrained[3].y, 24, "an exact user guide always wins over the Pen mask");
+});
+
+test("the final Pen constraint rejects distant vertical points and preserves guides", () => {
+  const width = 28;
+  const height = 36;
+  const data = new Uint8Array(width * height);
+  const columns = new Uint8Array(width);
+  const rows = new Uint8Array(height);
+  for (let y = 8; y <= 28; y += 1) {
+    rows[y] = 1;
+    for (let x = 16; x <= 19; x += 1) {
+      data[y * width + x] = 1;
+      columns[x] = 1;
+    }
+  }
+  const path = [
+    { x: 9, y: 12, observed: false, traceOrientation: "vertical" },
+    { x: 25, y: 22, observed: false, traceOrientation: "vertical" },
+    { x: 7, y: 4, observed: true, traceOrientation: "vertical" },
+    { x: 10, y: 18, anchor: true, userGuided: true, traceOrientation: "vertical" },
+  ];
+  const constrained = constrainPathToInclusionMask(path, {
+    inclusionMask: { data, columns, rows },
+    width,
+    height,
+    rect: { left: 0, top: 0, right: width - 1, bottom: height - 1 },
+    orientation: "vertical",
+  });
+  assert.equal(constrained[0].x, 9);
+  assert.equal(constrained[1].x, 25);
+  assert.equal(constrained[2].x, 7);
+  assert.equal(constrained[3].x, 10);
+  assert.ok(constrained[0].corridorOutside);
+  assert.ok(constrained[1].corridorOutside);
+});
+
+test("the final Pen constraint refuses distant parametric projections while keeping exact guides", () => {
+  const width = 44;
+  const height = 42;
+  const data = new Uint8Array(width * height);
+  const columns = new Uint8Array(width);
+  const rows = new Uint8Array(height);
+  const paint = (x, y) => {
+    data[y * width + x] = 1;
+    columns[x] = 1;
+    rows[y] = 1;
+  };
+  for (let x = 6; x <= 30; x += 1) {
+    for (let y = 10; y <= 14; y += 1) paint(x, y);
+  }
+  for (let x = 28; x <= 32; x += 1) {
+    for (let y = 12; y <= 36; y += 1) paint(x, y);
+  }
+  const path = [
+    { x: 18, y: 23, observed: false },
+    { x: 37, y: 27, observed: false },
+    { x: 12, y: 30, anchor: true, userGuided: true },
+  ];
+  const constrained = constrainPathToInclusionMask(path, {
+    inclusionMask: { data, columns, rows },
+    width,
+    height,
+    rect: { left: 2, top: 2, right: 40, bottom: 39 },
+    orientation: "parametric",
+  });
+  assert.deepEqual([constrained[0].x, constrained[0].y], [18, 23]);
+  assert.deepEqual([constrained[1].x, constrained[1].y], [37, 27]);
+  assert.ok(constrained[0].corridorOutside);
+  assert.ok(constrained[1].corridorOutside);
+  assert.deepEqual(
+    { x: constrained[2].x, y: constrained[2].y },
+    { x: 12, y: 30 },
+    "an exact guide remains authoritative even outside the Pen corridor",
+  );
 });
 
 test("centerline refinement finds the subpixel middle of a thick antialiased stroke", () => {
@@ -494,7 +786,7 @@ test("adaptive gap fitting follows curved reliable neighborhoods without moving 
   assert.ok(Math.abs(middle.y - trueY(50)) < Math.abs(trueY(40) - trueY(50)) * 0.65);
   assert.equal(middle.observed, false);
   assert.equal(middle.inferenceMethod, "adaptive-local-ensemble");
-  assert.ok(["linear", "hermite", "quadratic"].includes(middle.inferenceModel));
+  assert.ok(["linear", "regularized-smooth", "hermite", "quadratic"].includes(middle.inferenceModel));
   assert.ok(Object.keys(middle.inferenceModelWeights).length >= 2);
   assert.ok(Number.isFinite(middle.modelDisagreement));
   assert.ok(Number.isFinite(middle.inferenceUncertainty) && middle.inferenceUncertainty >= 1);
@@ -548,6 +840,52 @@ test("a guide inside an occlusion remains exact and splits model recovery", () =
   assert.equal(anchor.anchor, true);
   assert.ok(fitted.find((point) => point.x === 45).inferenceMethod === "adaptive-local-ensemble");
   assert.ok(fitted.find((point) => point.x === 60).inferenceMethod === "adaptive-local-ensemble");
+  assert.equal(fitted.find((point) => point.x === 45).boundedByGuide, true);
+  assert.equal(fitted.find((point) => point.x === 60).boundedByGuide, true);
+});
+
+test("occlusion uncertainty grows with distance from observed or guided boundaries", () => {
+  const path = Array.from({ length: 101 }, (_, x) => ({
+    x,
+    y: 20 + x * 0.08,
+    observed: x <= 20 || x >= 80,
+    confidence: x <= 20 || x >= 80 ? 0.98 : 0.2,
+    thickness: x <= 20 || x >= 80 ? 2.5 : 0,
+    anchor: x === 20 || x === 80,
+  }));
+  const fitted = fitInferredPathGaps(path, {
+    rect: { left: 0, top: 0, right: 100, bottom: 60 },
+  });
+  const nearBoundary = fitted.find((point) => point.x === 22);
+  const middle = fitted.find((point) => point.x === 50);
+
+  assert.equal(nearBoundary.unsupportedDistance, 2);
+  assert.equal(middle.unsupportedDistance, 30);
+  assert.ok(middle.inferenceUncertainty > nearBoundary.inferenceUncertainty + 0.5);
+  assert.ok(middle.confidence < nearBoundary.confidence);
+  assert.equal(middle.boundedByGuide, true);
+});
+
+test("a long gap gives the regularized model more influence when support is noisy", () => {
+  const makePath = (noiseAmplitude) => Array.from({ length: 101 }, (_, x) => {
+    const hidden = x > 30 && x < 70;
+    return {
+      x,
+      y: 20 + x * 0.12 + (hidden ? 0 : noiseAmplitude * Math.sin(x * 1.7)),
+      observed: !hidden,
+      confidence: hidden ? 0.2 : 0.95,
+      thickness: hidden ? 0 : 2.5,
+    };
+  });
+  const cleanMiddle = fitInferredPathGaps(makePath(0)).find((point) => point.x === 50);
+  const noisyMiddle = fitInferredPathGaps(makePath(4)).find((point) => point.x === 50);
+
+  assert.ok((noisyMiddle.inferenceModelWeights["regularized-smooth"] ?? 0) > 0.2);
+  assert.ok(
+    noisyMiddle.inferenceModelWeights["regularized-smooth"]
+      > cleanMiddle.inferenceModelWeights["regularized-smooth"] * 10,
+  );
+  assert.ok(noisyMiddle.inferenceUncertainty > cleanMiddle.inferenceUncertainty + 4);
 });
 
 test("local fitting replaces a continuous low-confidence crossing fragment", () => {
@@ -669,13 +1007,80 @@ test("traceCurve excludes a legend region and records the bridge as inferred", (
   assert.ok(path.filter((point) => point.x >= 30 && point.x <= 40).every((point) => !point.observed));
 });
 
+test("an explicit occlusion mask reconnects a continuous curve beyond maxGap", () => {
+  const width = 120;
+  const height = 60;
+  const rgba = whiteImage(width, height);
+  const color = { r: 22, g: 146, b: 62 };
+  const expectedY = (x) => 18 + Math.round(5 * Math.sin(x / 22));
+  for (let x = 5; x <= 114; x += 1) {
+    setPixel(rgba, width, x, expectedY(x), color);
+    if (x > 75) setPixel(rgba, width, x, expectedY(x) + 18, color);
+  }
+  // Dragged masks preserve subpixel edges in real projects. The integer
+  // candidate columns covered by this mask are x=40 through x=75.
+  const exclusion = { left: 39.6, right: 75.7, top: 4, bottom: 54 };
+  const path = traceCurve({
+    rgba,
+    width,
+    height,
+    rect: { left: 5, top: 4, right: 114, bottom: 54 },
+    seed: { x: 20, y: expectedY(20) },
+    target: color,
+    threshold: 5,
+    maxJump: 4,
+    maxGap: 5,
+    exclusions: [exclusion],
+    targetStyle: "line",
+  });
+
+  assert.equal(path.at(0).x, 5);
+  assert.equal(path.at(-1).x, 114);
+  const hidden = path.filter((point) => point.x >= 40 && point.x <= 75);
+  assert.ok(hidden.length >= 34);
+  assert.ok(hidden.every((point) => point.observed === false && point.occlusionMasked));
+  assert.ok(path.some((point) => point.reconnectedAfterOcclusion));
+  assert.ok(path.filter((point) => point.x > 75).every((point) => Math.abs(point.y - expectedY(point.x)) < 1));
+});
+
+test("an unexplained long blank still stops instead of inventing a continuation", () => {
+  const width = 120;
+  const height = 60;
+  const rgba = whiteImage(width, height);
+  const color = { r: 22, g: 146, b: 62 };
+  for (let x = 5; x <= 114; x += 1) {
+    if (x < 40 || x > 75) setPixel(rgba, width, x, 24, color);
+  }
+  const path = traceCurve({
+    rgba,
+    width,
+    height,
+    rect: { left: 5, top: 4, right: 114, bottom: 54 },
+    seed: { x: 20, y: 24 },
+    target: color,
+    threshold: 5,
+    maxJump: 4,
+    maxGap: 5,
+    targetStyle: "line",
+  });
+
+  assert.ok(path.at(-1).x < 45);
+  assert.equal(path.some((point) => point.reconnectedAfterOcclusion), false);
+});
+
 test("pathToData preserves provenance fields", () => {
   const path = [{ x: 10, y: 90, observed: true, confidence: 0.9 }];
   const xCalibration = { scale: "linear", point1: 10, point2: 110, value1: 0, value2: 5 };
   const yCalibration = { scale: "linear", point1: 90, point2: 10, value1: 0, value2: 2 };
-  assert.deepEqual(pathToData(path, xCalibration, yCalibration), [
-    { x: 10, y: 90, observed: true, confidence: 0.9, dataX: 0, dataY: 0 },
-  ]);
+  const [result] = pathToData(path, xCalibration, yCalibration);
+  assert.deepEqual(
+    { x: result.x, y: result.y, observed: result.observed, confidence: result.confidence },
+    path[0],
+  );
+  assert.equal(result.dataX, 0);
+  assert.equal(result.dataY, 0);
+  assert.ok(result.dataXUncertainty > 0);
+  assert.ok(result.dataYUncertainty > 0);
 });
 
 test("resamplePath is uniform in displayed x coordinate and honors log axes", () => {
@@ -721,6 +1126,9 @@ test("resampling preserves occlusion model provenance and uncertainty", () => {
       modelDisagreement: 2,
       fitBlend: 0.8,
       fitSupport: 16,
+      unsupportedDistance: 10,
+      boundedByGuide: true,
+      occlusionMasked: true,
       inferenceUncertainty: 3,
     },
     {
@@ -736,6 +1144,9 @@ test("resampling preserves occlusion model provenance and uncertainty", () => {
       modelDisagreement: 4,
       fitBlend: 0.7,
       fitSupport: 16,
+      unsupportedDistance: 20,
+      boundedByGuide: true,
+      occlusionMasked: true,
       inferenceUncertainty: 5,
     },
     { x: 30, y: 10, observed: true, confidence: 0.96 },
@@ -749,7 +1160,45 @@ test("resampling preserves occlusion model provenance and uncertainty", () => {
   assert.equal(middle.inferenceModel, "quadratic");
   assert.ok(Math.abs(middle.inferenceModelWeights.quadratic - 0.6) < 1e-9);
   assert.equal(middle.modelDisagreement, 3);
+  assert.equal(middle.unsupportedDistance, 15);
+  assert.equal(middle.boundedByGuide, true);
+  assert.equal(middle.occlusionMasked, true);
   assert.equal(middle.inferenceUncertainty, 4);
+});
+
+test("arc-length resampling preserves patterned-gap provenance", () => {
+  const path = [
+    { x: 0, y: 0, observed: true, confidence: 0.95, traceOrientation: "parametric" },
+    {
+      x: 10,
+      y: 0,
+      observed: false,
+      imageObserved: false,
+      confidence: 0.45,
+      patternInferred: true,
+      origin: "pattern-gap-model",
+      inferenceMethod: "parametric-pattern-gap",
+      inferenceModel: "cubic-hermite-pattern",
+      inferenceModelScore: 0.82,
+      modelDisagreement: 1.2,
+      unsupportedDistance: 5,
+      inferenceUncertainty: 2.4,
+      traceOrientation: "parametric",
+    },
+    { x: 20, y: 0, observed: true, confidence: 0.95, traceOrientation: "parametric" },
+  ];
+  const sampled = resamplePixelPathArcLength(path, 5);
+  const inferred = sampled.filter((point) => point.patternInferred);
+  assert.equal(sampled.length, 5);
+  assert.equal(inferred.length, 3);
+  assert.ok(inferred.every((point) => (
+    point.observed === false
+    && point.imageObserved === false
+    && point.occlusionInferred !== true
+    && point.inferenceMethod === "parametric-pattern-gap"
+    && point.inferenceModel === "cubic-hermite-pattern"
+    && Number.isFinite(point.inferenceUncertainty)
+  )));
 });
 
 test("mandatory guide points survive display resampling exactly", () => {
@@ -784,6 +1233,59 @@ test("mandatory guides can raise an undersized requested sample count", () => {
   const result = includeMandatoryPoints(sampled, guides, 2);
   assert.equal(result.length, 4);
   assert.ok(result.every((point) => point.anchor));
+});
+
+test("closed parametric paths are resampled uniformly by arc length without duplicating the seam", () => {
+  const path = Array.from({ length: 72 }, (_, index) => {
+    const angle = (index / 72) * Math.PI * 2;
+    return {
+      x: 50 + Math.cos(angle) * 24,
+      y: 40 + Math.sin(angle) * 13,
+      observed: true,
+      confidence: 0.95,
+      traceOrientation: "parametric",
+      closedPath: true,
+      parametricOrder: index,
+    };
+  });
+  const result = resamplePixelPathArcLength(path, 24, { closed: true });
+  assert.equal(result.length, 24);
+  assert.ok(Math.hypot(result[0].x - result.at(-1).x, result[0].y - result.at(-1).y) > 2);
+  assert.ok(new Set(result.map((point) => Math.round(point.x))).size < result.length);
+  const lengths = result.map((point, index) => {
+    const next = result[(index + 1) % result.length];
+    return Math.hypot(next.x - point.x, next.y - point.y);
+  });
+  assert.ok(Math.max(...lengths) / Math.min(...lengths) < 1.12);
+  assert.ok(result.every((point, index) => point.parametricOrder >= index - 1));
+});
+
+test("manual guides remain exact after closed-path arc-length resampling", () => {
+  const path = Array.from({ length: 80 }, (_, index) => {
+    const angle = (index / 80) * Math.PI * 2;
+    return {
+      x: 60 + Math.cos(angle) * 30,
+      y: 60 + Math.sin(angle) * 20,
+      parametricOrder: index,
+      traceOrientation: "parametric",
+      closedPath: true,
+    };
+  });
+  const guides = [
+    { x: 60, y: 40, parametricOrder: 20, anchorId: "top" },
+    { x: 30, y: 60, parametricOrder: 40, anchorId: "left" },
+  ];
+  const result = includeMandatoryParametricPoints(
+    resamplePixelPathArcLength(path, 18, { closed: true }),
+    guides,
+    18,
+  );
+  assert.equal(result.length, 18);
+  assert.deepEqual(
+    result.filter((point) => point.anchor).map((point) => [point.x, point.y, point.anchorId]),
+    [[60, 40, "top"], [30, 60, "left"]],
+  );
+  assert.ok(result.every((point, index) => point.parametricOrder === index));
 });
 
 test("geometry resampling adds points to a steep straight segment", () => {
@@ -873,6 +1375,114 @@ test("assessPathQuality reports columns with many same-color candidates", () => 
   assert.ok(quality.warnings.some((warning) => warning.code === "many-candidates"));
 });
 
+test("assessPathQuality evaluates a vertical trace by height without collapsing repeated x values", () => {
+  const path = Array.from({ length: 81 }, (_, index) => ({
+    x: 42 + Math.sin(index / 10) * 3,
+    y: 10 + index,
+    observed: true,
+    confidence: 0.96,
+    candidateCount: 1,
+    traceOrientation: "vertical",
+    parametricOrder: index,
+  }));
+  const quality = assessPathQuality(path, {
+    left: 5, right: 95, top: 10, bottom: 90, width: 91, height: 81,
+  });
+  assert.equal(quality.metrics.traceOrientation, "vertical");
+  assert.equal(quality.metrics.spanFraction, 1);
+  assert.ok(!quality.warnings.some((warning) => warning.code === "short-span"));
+  assert.ok(quality.score >= 90);
+});
+
+test("assessPathQuality recognises a complete parametric loop without requiring horizontal span", () => {
+  const path = Array.from({ length: 80 }, (_, index) => {
+    const angle = (index / 80) * Math.PI * 2;
+    return {
+      x: 50 + Math.cos(angle) * 18,
+      y: 45 + Math.sin(angle) * 24,
+      observed: true,
+      confidence: 0.95,
+      candidateCount: 2,
+      traceOrientation: "parametric",
+      closedPath: true,
+      parametricOrder: index,
+    };
+  });
+  const quality = assessPathQuality(path, {
+    left: 0, right: 100, top: 0, bottom: 90, width: 101, height: 91,
+  });
+  assert.equal(quality.metrics.traceOrientation, "parametric");
+  assert.equal(quality.metrics.spanFraction, 1);
+  assert.ok(quality.metrics.parametricXSpan < 0.5);
+  assert.ok(!quality.warnings.some((warning) => warning.code === "short-span"));
+  assert.ok(quality.score >= 90);
+});
+
+test("assessPathQuality rejects a short open parametric fragment as complete coverage", () => {
+  const fragment = Array.from({ length: 20 }, (_, index) => ({
+    x: 100 + index,
+    y: 120,
+    observed: true,
+    confidence: 0.95,
+    traceOrientation: "parametric",
+    closedPath: false,
+  }));
+  const report = assessPathQuality(fragment, {
+    left: 0,
+    top: 0,
+    right: 399,
+    bottom: 299,
+    width: 400,
+    height: 300,
+  });
+  assert.ok(report.metrics.spanFraction < 0.1);
+  assert.ok(report.warnings.some((warning) => warning.code === "short-span"));
+  assert.notEqual(report.grade, "good");
+});
+
+test("assessPathQuality keeps self-intersection routing visible for manual review", () => {
+  const path = Array.from({ length: 90 }, (_, index) => {
+    const angle = (index / 90) * Math.PI * 2;
+    return {
+      x: 50 + Math.sin(angle) * 30,
+      y: 45 + Math.sin(angle * 2) * 24,
+      observed: true,
+      confidence: 0.9,
+      candidateCount: 2,
+      traceOrientation: "parametric",
+      closedPath: true,
+      topologyReview: true,
+      parametricOrder: index,
+    };
+  });
+  const quality = assessPathQuality(path, {
+    left: 5, right: 95, top: 5, bottom: 85, width: 91, height: 81,
+  });
+  assert.equal(quality.metrics.topologyReviewRequired, true);
+  assert.equal(quality.grade, "review");
+  assert.ok(quality.warnings.some((warning) => warning.code === "topology-review"));
+});
+
+test("a weak patterned diagnosis falls back to a clearly better observed path", () => {
+  const rect = { left: 0, right: 99, top: 0, bottom: 60, width: 100, height: 61 };
+  const patterned = Array.from({ length: 100 }, (_, x) => ({
+    x,
+    y: 30,
+    observed: x % 3 === 0,
+    confidence: x % 3 === 0 ? 0.7 : 0.25,
+    candidateCount: 1,
+  }));
+  const ordinary = Array.from({ length: 100 }, (_, x) => ({
+    x,
+    y: 30,
+    observed: true,
+    confidence: 0.95,
+    candidateCount: 1,
+  }));
+  assert.equal(preferOrdinaryTraceFallback(patterned, ordinary, rect, { autoConfidence: 0.55 }), true);
+  assert.equal(preferOrdinaryTraceFallback(patterned, ordinary, rect, { autoConfidence: 0.9 }), false);
+});
+
 test("review regions merge nearby questionable points and rank the strongest interval first", () => {
   const path = Array.from({ length: 24 }, (_, index) => ({
     x: 10 + index * 3,
@@ -940,6 +1550,38 @@ test("review regions surface isolated high disagreement between occlusion models
   });
   assert.equal(regions.length, 1);
   assert.ok(regions[0].reasons.some((reason) => reason.code === "model-disagreement"));
+});
+
+test("active disambiguation prefers a clear competing branch away from existing guides", () => {
+  const path = Array.from({ length: 31 }, (_, index) => ({
+    x: index * 4,
+    y: 30,
+    observed: true,
+    confidence: index === 3 ? 0.1 : 0.82,
+    candidateCount: index >= 10 && index <= 20 ? 2 : 1,
+  }));
+  path[11].ambiguityAlternatives = [33];
+  path[11].ambiguitySeparation = 3;
+  path[14].ambiguityAlternatives = [38];
+  path[14].ambiguitySeparation = 8;
+  path[18].ambiguityAlternatives = [42];
+  path[18].ambiguitySeparation = 12;
+  const rect = { left: 0, right: 120, top: 0, bottom: 60, width: 121, height: 61 };
+
+  const target = findMostInformativeAmbiguity(path, rect, [{ x: 72, y: 30 }]);
+
+  assert.equal(target.pointIndex, 14);
+  assert.deepEqual(target.candidateYs, [30, 38]);
+  assert.equal(target.kind, "branch");
+});
+
+test("active disambiguation returns no suggestion when guides already cover the split", () => {
+  const path = [
+    { x: 20, y: 18, ambiguityAlternatives: [26], confidence: 0.7 },
+    { x: 24, y: 19, ambiguityAlternatives: [27], confidence: 0.7 },
+  ];
+  const rect = { left: 0, right: 60, top: 0, bottom: 40, width: 61, height: 41 };
+  assert.equal(findMostInformativeAmbiguity(path, rect, [{ x: 22, y: 19 }]), null);
 });
 
 test("guided tracing uses a later anchor to select the intended branch", () => {
@@ -1078,7 +1720,7 @@ test("dash-dot fingerprint rejects a phase-shifted same-color dashed branch", ()
   assert.ok(path.some((point) => !point.observed));
 });
 
-test("strong anchors preserve dashed-series identity across an exact same-color overlap", () => {
+test("multiple guides automatically preserve dashed-series identity across an exact same-color overlap", () => {
   const width = 145;
   const height = 70;
   const rgba = whiteImage(width, height);
@@ -1106,12 +1748,46 @@ test("strong anchors preserve dashed-series identity across an exact same-color 
     threshold: 5,
     maxJump: 8,
     maxGap: 9,
-    strictGuideCorridor: true,
     targetStyle: "dashed",
   });
   assert.ok(Math.abs(path.find((point) => point.x === 30).y - 20) < 0.1);
   assert.ok(Math.abs(path.find((point) => point.x === 64).y - 30) < 0.1);
   assert.ok(Math.abs(path.find((point) => point.x === 105).y - 40) < 0.1);
+});
+
+test("automatic patterned guidance follows a curved dashed series without linearising it", () => {
+  const width = 180;
+  const height = 105;
+  const rgba = whiteImage(width, height);
+  const purple = { r: 125, g: 70, b: 190 };
+  const expectedY = (x) => 52 + 25 * Math.sin((x - 8) / 164 * Math.PI * 2);
+  for (let x = 8; x <= 172; x += 1) {
+    if ((x - 8) % 11 < 6) setPixel(rgba, width, x, Math.round(expectedY(x)), purple);
+  }
+  const anchors = [18, 58, 108, 158].map((x) => ({ x, y: expectedY(x), anchorId: `guide-${x}` }));
+  const path = traceCurveThroughAnchors({
+    rgba,
+    width,
+    height,
+    rect: { left: 8, top: 8, right: 172, bottom: 96 },
+    anchors,
+    target: purple,
+    threshold: 5,
+    maxJump: 7,
+    maxGap: 9,
+    targetStyle: "dashed",
+  });
+  for (const anchor of anchors) {
+    const retained = path.find((point) => point.anchorId === anchor.anchorId);
+    assert.ok(retained, `missing ${anchor.anchorId}`);
+    assert.equal(retained.y, anchor.y);
+  }
+  const central = path.filter((point) => point.x >= anchors[0].x && point.x <= anchors.at(-1).x);
+  const rmsError = Math.sqrt(central.reduce((sum, point) => (
+    sum + (point.y - expectedY(point.x)) ** 2
+  ), 0) / central.length);
+  assert.ok(rmsError < 5, `curved patterned path RMSE ${rmsError.toFixed(3)} px`);
+  assert.ok(central.filter((point) => point.observed).length / central.length > 0.15);
 });
 
 test("an explicit anchor bridges an occlusion longer than maxGap", () => {
@@ -1352,6 +2028,130 @@ test("marker extraction does not turn an ordinary thick solid curve into markers
   assert.deepEqual(markers, []);
 });
 
+test("one-click marker inference recognizes a repeated series and removes compact clutter", () => {
+  const width = 180;
+  const height = 105;
+  const rgba = whiteImage(width, height);
+  const black = { r: 8, g: 8, b: 8 };
+  const truth = Array.from({ length: 9 }, (_, index) => ({
+    x: 22 + index * 17,
+    y: 74 - index * 4 + 5 * Math.sin(index * 0.7),
+  }));
+  for (const point of truth) {
+    for (let offsetY = -4; offsetY <= 4; offsetY += 1) {
+      for (let offsetX = -4; offsetX <= 4; offsetX += 1) {
+        if (offsetX ** 2 + offsetY ** 2 <= 14) {
+          setPixel(rgba, width, Math.round(point.x + offsetX), Math.round(point.y + offsetY), black);
+        }
+      }
+    }
+  }
+  for (const point of [{ x: 45, y: 18 }, { x: 92, y: 90 }, { x: 150, y: 22 }]) {
+    for (let offsetY = -2; offsetY <= 2; offsetY += 1) {
+      for (let offsetX = -2; offsetX <= 2; offsetX += 1) {
+        setPixel(rgba, width, point.x + offsetX, point.y + offsetY, black);
+      }
+    }
+  }
+  const inference = inferMarkerSeries({
+    rgba,
+    width,
+    height,
+    rect: { left: 6, top: 6, right: 173, bottom: 98, width: 168, height: 93 },
+    seed: truth[2],
+    target: black,
+    threshold: 5,
+  });
+  assert.equal(inference.detected, true, JSON.stringify(inference));
+  assert.ok(inference.confidence >= 0.78);
+  assert.equal(inference.markers.length, truth.length);
+  assert.ok(inference.markers.every((point, index) => (
+    Math.hypot(point.x - truth[index].x, point.y - truth[index].y) <= 1
+  )));
+});
+
+test("one-click marker inference leaves an ordinary thick curve in line mode", () => {
+  const width = 150;
+  const height = 82;
+  const rgba = whiteImage(width, height);
+  const blue = { r: 20, g: 90, b: 210 };
+  for (let x = 8; x <= 142; x += 1) {
+    const y = Math.round(42 - 15 * Math.sin(x / 25));
+    for (let offset = -2; offset <= 2; offset += 1) setPixel(rgba, width, x, y + offset, blue);
+  }
+  const inference = inferMarkerSeries({
+    rgba,
+    width,
+    height,
+    rect: { left: 6, top: 5, right: 144, bottom: 76, width: 139, height: 72 },
+    seed: { x: 65, y: Math.round(42 - 15 * Math.sin(65 / 25)) },
+    target: blue,
+    threshold: 5,
+  });
+  assert.equal(inference.detected, false);
+  assert.deepEqual(inference.markers, []);
+});
+
+test("colour discovery finds persistent curves but ignores short legend swatches", () => {
+  const width = 240;
+  const height = 150;
+  const rgba = whiteImage(width, height);
+  const plotRect = { left: 12, top: 10, right: 228, bottom: 138, width: 217, height: 129 };
+  const blue = { r: 30, g: 105, b: 205 };
+  const red = { r: 215, g: 55, b: 45 };
+  const green = { r: 35, g: 155, b: 70 };
+  for (let x = 18; x <= 222; x += 1) {
+    const progress = (x - 18) / 204;
+    const blueY = Math.round(105 - 48 * progress + 6 * Math.sin(x / 19));
+    const redY = Math.round(40 + 42 * progress + 5 * Math.cos(x / 23));
+    for (let offset = -1; offset <= 1; offset += 1) {
+      setPixel(rgba, width, x, blueY + offset, blue);
+      setPixel(rgba, width, x, redY + offset, red);
+    }
+  }
+  // A coloured legend sample has plenty of pixels locally, but not enough
+  // horizontal persistence to become a curve suggestion.
+  for (let y = 24; y <= 31; y += 1) {
+    for (let x = 174; x <= 198; x += 1) setPixel(rgba, width, x, y, green);
+  }
+  const candidates = discoverColoredSeries({ rgba, width, height, plotRect });
+  assert.equal(candidates.length, 2, JSON.stringify(candidates));
+  assert.ok(candidates.every((candidate) => candidate.confidence >= 0.72));
+  assert.ok(candidates.every((candidate) => candidate.horizontalSpan > 0.9));
+  assert.ok(candidates.every((candidate) => candidate.seed.x > 12 && candidate.seed.x < 228));
+  const colors = candidates.map((candidate) => candidate.color);
+  assert.ok(colors.some((color) => compositedColorDistance(color.r, color.g, color.b, blue) < 45));
+  assert.ok(colors.some((color) => compositedColorDistance(color.r, color.g, color.b, red) < 45));
+  assert.ok(colors.every((color) => compositedColorDistance(color.r, color.g, color.b, green) > 45));
+});
+
+test("colour discovery excludes grayscale axes and respects accepted masks", () => {
+  const width = 180;
+  const height = 120;
+  const rgba = whiteImage(width, height);
+  const plotRect = { left: 10, top: 8, right: 170, bottom: 110, width: 161, height: 103 };
+  const black = { r: 8, g: 8, b: 8 };
+  const purple = { r: 135, g: 55, b: 185 };
+  drawLine(rgba, width, height, { x: 10, y: 8 }, { x: 170, y: 8 }, black, 2);
+  drawLine(rgba, width, height, { x: 10, y: 110 }, { x: 170, y: 110 }, black, 2);
+  drawLine(rgba, width, height, { x: 14, y: 94 }, { x: 166, y: 30 }, purple, 2);
+  const candidates = discoverColoredSeries({ rgba, width, height, plotRect });
+  assert.equal(candidates.length, 1);
+  assert.ok(compositedColorDistance(
+    candidates[0].color.r,
+    candidates[0].color.g,
+    candidates[0].color.b,
+    purple,
+  ) < 45);
+  assert.deepEqual(discoverColoredSeries({
+    rgba,
+    width,
+    height,
+    plotRect,
+    exclusions: [{ left: 10, top: 8, right: 170, bottom: 110 }],
+  }), []);
+});
+
 test("detectPlotRect finds a dark rectangular frame", () => {
   const width = 160;
   const height = 110;
@@ -1421,6 +2221,72 @@ test("detectPlotRect keeps outer frame edges inside the image", () => {
     { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom },
     { left: 0, right: width - 1, top: 0, bottom: height - 1 },
   );
+});
+
+test("detectPlotRect ignores a screenshot border when an inset axes frame exists", () => {
+  const width = 180;
+  const height = 128;
+  const rgba = whiteImage(width, height);
+  const black = { r: 8, g: 8, b: 8 };
+  drawLine(rgba, width, height, { x: 0, y: 0 }, { x: width - 1, y: 0 }, black);
+  drawLine(rgba, width, height, { x: 0, y: height - 1 }, { x: width - 1, y: height - 1 }, black);
+  drawLine(rgba, width, height, { x: 0, y: 0 }, { x: 0, y: height - 1 }, black);
+  drawLine(rgba, width, height, { x: width - 1, y: 0 }, { x: width - 1, y: height - 1 }, black);
+  const expected = { left: 18, top: 14, right: 164, bottom: 108 };
+  drawLine(rgba, width, height, { x: expected.left, y: expected.top }, { x: expected.right, y: expected.top }, black);
+  drawLine(rgba, width, height, { x: expected.left, y: expected.bottom }, { x: expected.right, y: expected.bottom }, black);
+  drawLine(rgba, width, height, { x: expected.left, y: expected.top }, { x: expected.left, y: expected.bottom }, black);
+  drawLine(rgba, width, height, { x: expected.right, y: expected.top }, { x: expected.right, y: expected.bottom }, black);
+
+  const rect = detectPlotRect(rgba, width, height);
+  assert.deepEqual(
+    { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom },
+    expected,
+  );
+  assert.ok(rect.confidence > 0.9);
+});
+
+test("interference-mask suggestions find a boxed legend without applying it", () => {
+  const width = 240;
+  const height = 170;
+  const rgba = whiteImage(width, height);
+  const plotRect = { left: 18, top: 14, right: 222, bottom: 152, width: 205, height: 139 };
+  drawLine(rgba, width, height, { x: 18, y: 14 }, { x: 222, y: 14 });
+  drawLine(rgba, width, height, { x: 18, y: 152 }, { x: 222, y: 152 });
+  drawLine(rgba, width, height, { x: 18, y: 14 }, { x: 18, y: 152 });
+  drawLine(rgba, width, height, { x: 222, y: 14 }, { x: 222, y: 152 });
+  drawLine(rgba, width, height, { x: 20, y: 130 }, { x: 220, y: 72 }, { r: 20, g: 120, b: 45 }, 2);
+  const legend = { left: 142, top: 25, right: 212, bottom: 80 };
+  drawLine(rgba, width, height, { x: legend.left, y: legend.top }, { x: legend.right, y: legend.top });
+  drawLine(rgba, width, height, { x: legend.left, y: legend.bottom }, { x: legend.right, y: legend.bottom });
+  drawLine(rgba, width, height, { x: legend.left, y: legend.top }, { x: legend.left, y: legend.bottom });
+  drawLine(rgba, width, height, { x: legend.right, y: legend.top }, { x: legend.right, y: legend.bottom });
+  for (const y of [37, 52, 67]) {
+    drawLine(rgba, width, height, { x: 148, y }, { x: 160, y }, { r: 40, g: 70, b: 180 }, 2);
+    for (let glyph = 0; glyph < 5; glyph += 1) {
+      drawLine(rgba, width, height, { x: 166 + glyph * 7, y: y - 3 }, { x: 169 + glyph * 7, y: y + 3 });
+    }
+  }
+  const suggestions = suggestInterferenceMasks({ rgba, width, height, plotRect });
+  assert.ok(suggestions.length >= 1);
+  const candidate = suggestions[0];
+  assert.equal(candidate.kind, "legend");
+  assert.ok(candidate.left <= legend.left && candidate.right >= legend.right);
+  assert.ok(candidate.top <= legend.top && candidate.bottom >= legend.bottom);
+  assert.ok(candidate.confidence >= 0.7);
+});
+
+test("interference-mask suggestions remain empty for an ordinary clean curve", () => {
+  const width = 180;
+  const height = 120;
+  const rgba = whiteImage(width, height);
+  const plotRect = { left: 12, top: 10, right: 168, bottom: 108, width: 157, height: 99 };
+  drawLine(rgba, width, height, { x: 12, y: 10 }, { x: 168, y: 10 });
+  drawLine(rgba, width, height, { x: 12, y: 108 }, { x: 168, y: 108 });
+  drawLine(rgba, width, height, { x: 12, y: 10 }, { x: 12, y: 108 });
+  drawLine(rgba, width, height, { x: 168, y: 10 }, { x: 168, y: 108 });
+  drawLine(rgba, width, height, { x: 14, y: 92 }, { x: 166, y: 28 }, { r: 35, g: 110, b: 210 }, 2);
+  assert.deepEqual(suggestInterferenceMasks({ rgba, width, height, plotRect }), []);
 });
 
 
@@ -1524,6 +2390,103 @@ test("edit sessions undo, redo, and restore an autosaved draft", () => {
   assert.equal(stored.has("test-draft"), false);
   value = 0;
   assert.equal(session.restoreDraft(), false);
+});
+
+test("draft discovery is read-only and fresh baselines preserve the old draft", () => {
+  const original = JSON.stringify({ savedAt: "2026-09-07", snapshot: { value: 42 } });
+  let stored = original;
+  let value = 0;
+  const session = createEditSession({
+    capture: () => ({ value }),
+    restore: (snapshot) => { value = snapshot.value; return true; },
+    storageKey: () => "draft",
+    storage: { getItem: () => stored, setItem: () => assert.fail("fresh startup must not save") },
+  });
+  session.reset();
+  assert.equal(session.readDraft().snapshot.value, 42);
+  assert.equal(value, 0);
+  value = 1; // An automatically detected frame becomes the initial baseline.
+  session.reset();
+  assert.equal(session.flushPendingSave(), false);
+  assert.equal(stored, original);
+  assert.equal(session.historyStatus().canUndo, false);
+  assert.equal(session.restoreDraft(), true);
+  assert.equal(value, 42);
+  assert.equal(stored, original);
+  for (stored of ["not JSON", "null", '{}', '{"snapshot":false}']) {
+    assert.equal(session.readDraft(), null);
+    assert.equal(session.restoreDraft(), false);
+    assert.equal(value, 42);
+  }
+});
+
+test("pending edits flush to the old image before switching and reset cancels stale timers", () => {
+  const drafts = new Map();
+  const timers = new Map();
+  let timerId = 0;
+  let key = "image-one";
+  let value = 0;
+  const session = createEditSession({
+    capture: () => ({ value }),
+    restore: (snapshot) => { value = snapshot.value; return true; },
+    storageKey: () => key,
+    storage: { getItem: (k) => drafts.get(k), setItem: (k, v) => drafts.set(k, v) },
+    setTimer: (callback) => { timers.set(++timerId, callback); return timerId; },
+    clearTimer: (id) => timers.delete(id),
+  });
+  session.reset();
+  value = 3;
+  session.commit("edit image one");
+  assert.equal(session.flushPendingSave(), true);
+  assert.equal(timers.size, 0);
+  assert.equal(JSON.parse(drafts.get(key)).snapshot.value, 3);
+  key = "image-two";
+  value = 0;
+  session.reset();
+  assert.equal(session.flushPendingSave(), false);
+  assert.equal(drafts.has(key), false);
+  value = 7;
+  session.commit("edit image two");
+  assert.equal(timers.size, 1);
+  session.reset();
+  assert.equal(timers.size, 0);
+  assert.equal(drafts.has(key), false);
+});
+
+test("inaccessible draft storage does not prevent a fresh session", () => {
+  const session = createEditSession({
+    capture: () => ({ value: 0 }),
+    restore: () => assert.fail("no draft to restore"),
+    storageKey: () => "draft",
+    storage: { getItem: () => { throw new Error("storage denied"); } },
+  });
+  session.reset();
+  assert.equal(session.readDraft(), null);
+  assert.equal(session.restoreDraft(), false);
+  assert.equal(session.flushPendingSave(), false);
+});
+
+test("edit sessions can absorb asynchronous derived results into the current undo step", () => {
+  let value = { guide: 0, path: 0 };
+  const session = createEditSession({
+    capture: () => structuredClone(value),
+    restore: (snapshot) => {
+      value = structuredClone(snapshot);
+      return true;
+    },
+    storageKey: () => null,
+    storage: null,
+    setTimer: null,
+  });
+  session.reset();
+  value.guide = 1;
+  assert.equal(session.commit("移动引导点"), true);
+  value.path = 42;
+  assert.equal(session.refreshCurrent(), true);
+  assert.deepEqual(session.navigate("undo"), { direction: "undo", label: "移动引导点" });
+  assert.deepEqual(value, { guide: 0, path: 0 });
+  assert.deepEqual(session.navigate("redo"), { direction: "redo", label: "移动引导点" });
+  assert.deepEqual(value, { guide: 1, path: 42 });
 });
 
 test("skew estimation recovers a rotated rectangular frame", () => {
