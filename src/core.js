@@ -1,4 +1,4 @@
-import { skeletonizeMask, buildMaskGraph } from "./mask-geometry.js?v=0.20.0-preview.3.21";
+import { skeletonizeMask, buildMaskGraph } from "./mask-geometry.js?v=0.20.0-preview.3.22";
 
 export function clamp(value, minimum, maximum) {
   return Math.max(minimum, Math.min(maximum, value));
@@ -934,12 +934,21 @@ function localPenGates(pixels, width, region) {
     const length = Math.hypot(dx, dy);
     if (!length) return null;
     const nx = dx / length, ny = dy / length;
-    // Put each gate beyond the painted cap, so rounded brush ends are covered
-    // too. Extension is allowed only beyond an entry/exit plane, never beside
-    // the middle of a stroke. A closed corridor has no exit planes.
+    // Locate the painted cap along the endpoint tangent. Extension is allowed
+    // only through an entry/exit aperture, never beside the middle of a stroke.
+    // A closed corridor has no exits.
     let offset = -Infinity;
     for (const index of pixels) offset = Math.max(offset, nx * (index % width) + ny * Math.floor(index / width));
-    return { nx, ny, offset };
+    const halfWidth = Math.max(1, pixels.length / nodes.length / 2);
+    // The curved edge of a round cap is not a wall across the tangent route.
+    // Start its entrance a few pixels before the furthest cap projection;
+    // lateral clearance below still prevents a side exit to parallel ink.
+    offset = Math.max(nx * nodes[endpoint].x + ny * nodes[endpoint].y,
+      offset - Math.min(4, halfWidth * 0.75));
+    return {
+      nx, ny, offset, x: nodes[endpoint].x, y: nodes[endpoint].y,
+      halfWidth,
+    };
   }).filter(Boolean);
 }
 
@@ -948,8 +957,9 @@ function localPenGates(pixels, width, region) {
  * just inside their bounding boxes. Only endwise extension remains available.
  * Strict mode permits only painted pixels. Manual guides remain authoritative.
  */
-export function prepareInclusionMask(data, width, height, mode = "local") {
+export function prepareInclusionMask(data, width, height, mode = "local", { erased = null } = {}) {
   if (!data || data.length !== width * height) throw new Error("Invalid Pen raster dimensions");
+  if (erased && erased.length !== data.length) throw new Error("Invalid Pen erasure dimensions");
   const columns = new Uint8Array(width);
   const rows = new Uint8Array(height);
   let activePixels = 0;
@@ -965,8 +975,19 @@ export function prepareInclusionMask(data, width, height, mode = "local") {
   const gates = [];
   const allowed = scope === "strict" ? data.slice() : new Uint8Array(data.length).fill(1);
   if (scope === "local") {
+    // An eraser cuts the searchable pixels, not the original local scope.
+    // Otherwise a cut creates new exit gates and allows a sideways bypass.
     const unseen = data.slice();
-    const queue = new Int32Array(activePixels);
+    let scopePixels = activePixels;
+    if (erased) {
+      for (let index = 0; index < data.length; index += 1) {
+        if (erased[index] && !unseen[index]) {
+          unseen[index] = 1;
+          scopePixels += 1;
+        }
+      }
+    }
+    const queue = new Int32Array(scopePixels);
     for (let seed = 0; seed < data.length; seed += 1) {
       if (!unseen[seed]) continue;
       let head = 0;
@@ -1001,17 +1022,39 @@ export function prepareInclusionMask(data, width, height, mode = "local") {
         for (let y = 0; y < height; y += 1) {
           for (let x = 0; x < width; x += 1) {
             if (!allowed[y * width + x] || data[y * width + x]) continue;
-            if (!ends.some(({ nx, ny, offset }) => nx * x + ny * y > offset + 1e-7)) allowed[y * width + x] = 0;
+            if (!ends.some((gate) => {
+              const projection = gate.nx * x + gate.ny * y;
+              if (projection <= gate.offset + 1e-7) return false;
+              const forward = projection - (gate.nx * gate.x + gate.ny * gate.y);
+              // A half-plane alone admits a remote parallel branch immediately
+              // beside an exit. Require a short, widening tangent entry first;
+              // beyond it local assistance resumes ordinary unrestricted search.
+              if (forward > Math.max(20, gate.halfWidth * 4)) return true;
+              const lateral = Math.abs(-gate.ny * (x - gate.x) + gate.nx * (y - gate.y));
+              return lateral <= gate.halfWidth + Math.max(0, forward) * 0.4 + 1;
+            })) allowed[y * width + x] = 0;
           }
         }
       }
-      for (let y = region.top; y <= region.bottom; y += 1) {
+      // Only directionless dabs need a rectangular fallback. For an open
+      // stroke, blank corners around a round cap can already be beyond an end
+      // gate; clearing its entire bounding box would block legitimate entry.
+      if (ends === null) for (let y = region.top; y <= region.bottom; y += 1) {
         allowed.fill(0, y * width + region.left, y * width + region.right + 1);
       }
     }
     for (let index = 0; index < data.length; index += 1) if (data[index]) allowed[index] = 1;
   }
-  return { data, columns, rows, allowed, mode: scope, regions, gates, activePixels };
+  const effectiveErased = erased ? erased.slice() : null;
+  if (effectiveErased) {
+    for (let index = 0; index < data.length; index += 1) {
+      // A later paint operation restores that pixel. Otherwise an explicit
+      // erasure overrides the local entry/exit extensions in every direction.
+      if (data[index]) effectiveErased[index] = 0;
+      else if (effectiveErased[index]) allowed[index] = 0;
+    }
+  }
+  return { data, columns, rows, allowed, erased: effectiveErased, mode: scope, regions, gates, activePixels };
 }
 
 export function inclusionMaskAllows(inclusionMask, width, x, y) {
@@ -1094,6 +1137,8 @@ function nearestInclusionPixel(inclusionMask, width, height, x, y, rect, maximum
   const column = Math.round(x);
   const row = Math.round(y);
   if (column >= 0 && column < width && row >= 0 && row < height
+    && inclusionMask.erased?.[row * width + column]) return null;
+  if (column >= 0 && column < width && row >= 0 && row < height
     && allowed[row * width + column]) {
     return { x, y, distance: 0 };
   }
@@ -1112,6 +1157,62 @@ function nearestInclusionPixel(inclusionMask, width, height, x, y, rect, maximum
     }
   }
   return nearest;
+}
+
+/** Inspect every raster cell traversed by the underlying continuous path.
+ * Pixel-boundary intervals, rather than output density, make even a one-pixel
+ * erasure detectable. Exported point circles are not connected: callers with
+ * a dense source path should validate that geometry, not sparse sampling chords.
+ */
+export function inclusionPathViolation(path, {
+  inclusionMask = null, width, height = null, rect, maximumCorrection = 1.5,
+} = {}) {
+  if (!inclusionMask?.data || !rect || !Number.isFinite(width) || path?.length < 2) return null;
+  const maskHeight = height ?? inclusionMask.data.length / width;
+  const isGuide = point => Boolean(point.anchor || point.userGuided);
+  const permitGuideExit = point => isGuide(point)
+    && !inclusionMaskAllows(inclusionMask, width, point.x, point.y);
+  const segmentCount = path.length - 1 + (path.some(point => point.closedPath) ? 1 : 0);
+  for (let index = 0; index < segmentCount; index += 1) {
+    const start = path[index], end = path[(index + 1) % path.length];
+    const dx = end.x - start.x, dy = end.y - start.y;
+    const boundaries = [0, 1];
+    for (const [origin, delta] of [[start.x, dx], [start.y, dy]]) {
+      if (!delta) continue;
+      const low = Math.min(origin, origin + delta), high = Math.max(origin, origin + delta);
+      for (let boundary = Math.floor(low + 0.5) + 0.5; boundary < high; boundary += 1) {
+        const fraction = (boundary - origin) / delta;
+        if (fraction > 0 && fraction < 1) boundaries.push(fraction);
+      }
+    }
+    boundaries.sort((a, b) => a - b);
+    const samples = [];
+    for (let position = 1; position < boundaries.length; position += 1) {
+      if (boundaries[position] - boundaries[position - 1] < 1e-10) continue;
+      const fraction = (boundaries[position] + boundaries[position - 1]) / 2;
+      const x = start.x + dx * fraction, y = start.y + dy * fraction;
+      const column = Math.round(x), row = Math.round(y);
+      const inside = column >= 0 && column < width && row >= 0 && row < maskHeight;
+      const pixel = row * width + column;
+      const erased = inside && Boolean(inclusionMask.erased?.[pixel]);
+      const valid = !erased && inside && (inclusionMaskAllows(inclusionMask, width, x, y)
+        || nearestInclusionPixel(inclusionMask, width, maskHeight, x, y, rect, maximumCorrection));
+      samples.push({ x, y, valid: Boolean(valid), erased });
+    }
+    const firstAllowed = samples.findIndex(sample => sample.valid);
+    const lastAllowed = samples.findLastIndex(sample => sample.valid);
+    const violation = samples.find((sample, position) => {
+      if (sample.valid) return false;
+      if (sample.erased) return true;
+      // An authoritative guide may sit outside Pen, but it cannot license a
+      // forbidden hole in the middle of the automatic route.
+      if (permitGuideExit(start) && (firstAllowed < 0 || position < firstAllowed)) return false;
+      if (permitGuideExit(end) && (lastAllowed < 0 || position > lastAllowed)) return false;
+      return true;
+    });
+    if (violation) return { segmentIndex: index, x: violation.x, y: violation.y, erased: violation.erased };
+  }
+  return null;
 }
 
 /**
@@ -1205,6 +1306,27 @@ export function clusterColumnCandidates(
   const closeRun = () => {
     if (!run) return;
     const y = (run.start + run.end) / 2;
+    // Local extension can expose a same-colour plot frame. A nearly full-height
+    // band is not a thin-curve centre; do not reconnect to its midpoint unless
+    // the user actually painted there. Vertical target ink is still available
+    // to vertical/2D tracing, and ordinary traces without Pen are unchanged.
+    if (inclusionMask?.mode === "local"
+      && !inclusionMask.data[Math.round(y) * width + x]) {
+      // Pen's tangent entrance can expose only a short piece of a long axis.
+      // Measure the original ink column, not the already masked run length.
+      const originalInk = row => {
+        const offset = (row * width + x) * 4;
+        return compositedColorDistance(rgba[offset], rgba[offset + 1], rgba[offset + 2], target) <= threshold;
+      };
+      if (originalInk(top) && originalInk(bottom)) {
+        let ink = 0;
+        for (let row = top; row <= bottom; row += 4) if (originalInk(row)) ink += 1;
+        if (ink >= Math.ceil((bottom - top + 1) / 4) * 0.75) {
+          run = null;
+          return;
+        }
+      }
+    }
     const inclusionRun = nearestInclusionRun(inclusionMask, width, x, y, top, bottom);
     candidates.push({
       y,
@@ -1555,6 +1677,25 @@ function candidateAvoidance(options, candidate, x) {
   };
 }
 
+function inclusionBridgeAllowed(inclusionMask, width, start, end) {
+  if (!inclusionMask?.data) return true;
+  const steps = Math.ceil(Math.max(Math.abs(end.x - start.x), Math.abs(end.y - start.y)));
+  const height = inclusionMask.data.length / width;
+  const rect = { left: 0, top: 0, right: width - 1, bottom: height - 1 };
+  for (let step = 1; step < steps; step += 1) {
+    const fraction = step / steps;
+    const x = start.x + (end.x - start.x) * fraction;
+    const y = start.y + (end.y - start.y) * fraction;
+    if (inclusionMaskAllows(inclusionMask, width, x, y)) continue;
+    // Scan candidates have not yet undergone stroke-centre/gap refinement.
+    // Allow a small preliminary margin at rounded caps, while the final
+    // validator still enforces its stricter 1.5 px raster-edge correction.
+    // Explicit erasures remain forbidden even within this search margin.
+    if (!nearestInclusionPixel(inclusionMask, width, height, x, y, rect, 4)) return false;
+  }
+  return true;
+}
+
 function traceDirection({
   rgba,
   width,
@@ -1585,6 +1726,11 @@ function traceDirection({
     : null;
   let gap = 0;
   const xLimit = limit ?? (direction > 0 ? rect.right : rect.left);
+  // Pen supplies an independent spatial constraint. Only in that assisted
+  // mode use a short observed tangent to stabilise the dash ruler; leave the
+  // ordinary tracer unchanged, especially its curved-pattern behaviour.
+  const stabilizePattern = isPatternedLineStyle(targetStyle) && Boolean(inclusionMask?.data);
+  const tangentSupport = previousObserved ? [previousObserved, lastObserved] : [lastObserved];
 
   for (let x = lastObserved.x + direction; direction > 0 ? x <= xLimit : x >= xLimit; x += direction) {
     const columnCandidates = clusterColumnCandidates(
@@ -1602,6 +1748,22 @@ function traceDirection({
     const velocity = previousObserved
       ? (lastObserved.y - previousObserved.y) / Math.max(1, Math.abs(lastObserved.x - previousObserved.x))
       : 0;
+    let patternSlope = velocity;
+    if (stabilizePattern && tangentSupport.length >= 3) {
+      const meanX = tangentSupport.reduce((sum, p) => sum + p.x, 0) / tangentSupport.length;
+      const meanY = tangentSupport.reduce((sum, p) => sum + p.y, 0) / tangentSupport.length;
+      const variance = tangentSupport.reduce((sum, p) => sum + (p.x - meanX) ** 2, 0);
+      const slope = variance > 0 ? tangentSupport.reduce((sum, p) => (
+        sum + (p.x - meanX) * (p.y - meanY)
+      ), 0) / variance : 0;
+      const residual = Math.sqrt(tangentSupport.reduce((sum, p) => (
+        sum + (p.y - meanY - slope * (p.x - meanX)) ** 2
+      ), 0) / tangentSupport.length);
+      // Thin, almost horizontal ink (also vertical ink after transposition)
+      // alternates flat raster steps with one-pixel jumps. Stabilise only a
+      // locally straight ruler, not curved segments or the motion prediction.
+      if (Math.abs(slope) <= 0.25 && residual <= 0.55) patternSlope = slope;
+    }
     const noisyMode = targetStyle === "noisy";
     const predictedY = lastObserved.y + velocity * dx * (noisyMode ? 0.22 : 1);
     const allowedJump = maxJump * (noisyMode ? 1.6 : 1) * Math.max(1, dx);
@@ -1620,6 +1782,11 @@ function traceDirection({
     for (const candidate of candidates) {
       const jump = Math.abs(candidate.y - predictedY);
       if (jump > allowedJump) continue;
+      // Valid endpoints do not make the intervening gap valid. In local Pen
+      // mode a remote same-colour axis can be outside an exit gate, yet its
+      // straight bridge crosses the protected section. Reject it before it
+      // changes the trace velocity or creates inferred pixels outside Pen.
+      if (!inclusionBridgeAllowed(inclusionMask, width, lastObserved, { x, y: candidate.y })) continue;
       const thicknessPenalty = candidateThicknessPenalty(candidate, targetStyle);
       const stylePenalty = patternedLinePenalty({
         rgba,
@@ -1631,7 +1798,7 @@ function traceDirection({
         targetStyle,
         styleReference,
         strokePatternCache,
-      }, candidate, x, velocity);
+      }, candidate, x, patternSlope);
       if (!Number.isFinite(stylePenalty)) continue;
       const colorPenalty = threshold > 0 ? candidate.distance / threshold : 0;
       const cost = jump * (noisyMode ? 0.58 : 1)
@@ -1695,6 +1862,11 @@ function traceDirection({
     points.push(point);
     previousObserved = lastObserved;
     lastObserved = point;
+    if (stabilizePattern) {
+      tangentSupport.push(point);
+      while (tangentSupport.length > 3 && (tangentSupport.length > 8
+        || Math.abs(point.x - tangentSupport[0].x) > 12)) tangentSupport.shift();
+    }
     gap = 0;
   }
 
@@ -1964,6 +2136,7 @@ function globalTraceDirection({
         const dx = Math.abs(x - previous.x);
         const occlusionBridge = exclusionBridgeBetween(exclusions, previous, { x, y: candidate.y });
         if (dx > maxGap + 1 && !occlusionBridge) continue;
+        if (!inclusionBridgeAllowed(inclusionMask, width, previous, { x, y: candidate.y })) continue;
         const slope = (candidate.y - previous.y) / Math.max(1, x - previous.x);
         const recentSlope = previous.slope ?? slope;
         const trendSlope = previous.trendSlope ?? recentSlope;
@@ -2132,6 +2305,7 @@ function globalGuidedSegment(options, start, end, {
           && !(candidate.anchor && options.strictGuideCorridor)
           && !occlusionBridge
         ) continue;
+        if (!inclusionBridgeAllowed(options.inclusionMask, options.width, previous, { x, y: candidate.y })) continue;
         const slope = (candidate.y - previous.y) / dx;
         const recentSlope = previous.slope ?? slope;
         const trendSlope = previous.trendSlope ?? recentSlope;

@@ -8,7 +8,7 @@
       content="SciDigitizer — 面向科学论文曲线的本地半自动数值提取工具"
     />
     <title>SciDigitizer</title>
-    <link rel="stylesheet" href="styles.css?v=0.20.0-preview.3.21" />
+    <link rel="stylesheet" href="styles.css?v=0.20.0-preview.3.22" />
   </head>
   <body>
     <header class="topbar">
@@ -308,41 +308,41 @@
               <button id="exclude-trace" class="button button-ghost" disabled>框选遮挡 / 图例</button>
             </div>
             <p id="target-style-hint" class="guide-help">普通曲线只需选择目标即可；分叉、重叠或遮挡时再添加引导点并打开可选辅助工具。</p>
-            <details id="trace-assist-tools" class="trace-assist-tools">
-              <summary>重叠 / 遮挡辅助（可选）</summary>
-              <p class="trace-assist-hint">普通曲线无需设置；只有自动追踪出现串线、重叠或遮挡时再打开。</p>
-              <label class="strict-guide-toggle" for="strict-guide">
-                <input id="strict-guide" type="checkbox" disabled />
-                <span>
-                  <strong>同色 / 遮挡强约束</strong>
-                  <small id="strict-guide-help">拒绝偏离引导走廊的同色分支；普通曲线无需开启</small>
-                </span>
-              </label>
-
-              <div class="trace-corridor-control">
-                <div class="trace-corridor-heading">
-                  <strong>Pen 曲线走廊</strong>
-                  <span id="trace-corridor-status">未绘制 · 全绘图区搜索</span>
-                </div>
-                <label class="field-label" for="trace-corridor-mode">Pen 范围</label>
-                <select id="trace-corridor-mode" class="select-control">
-                  <option value="strict" selected>仅在涂画区域提取（默认）</option>
-                  <option value="local">局部辅助（沿两端延伸）</option>
-                </select>
-                <p id="trace-corridor-help">默认只提取涂画区域。局部辅助会锁定已涂区段，只允许沿笔迹两端接续，不会从侧面绕到其它曲线。虚线表示入口和出口边界；转弯处请顺着曲线涂画。引导点保持固定。</p>
-                <div class="button-row compact-row trace-corridor-actions">
-                  <button id="draw-trace-corridor" class="button button-ghost" type="button" disabled>画走廊</button>
-                  <button id="erase-trace-corridor" class="button button-ghost" type="button" disabled>擦除</button>
-                  <button id="clear-trace-corridor" class="button button-ghost" type="button" disabled>清除</button>
-                </div>
-                <label class="range-label" for="trace-corridor-width">
-                  <span>Pen 宽度 / px</span>
-                  <output id="trace-corridor-width-output">24</output>
-                </label>
-                <input id="trace-corridor-width" type="range" min="4" max="80" step="1" value="24" />
-              </div>
-            </details>
           </div>
+          <details id="trace-assist-tools" class="trace-assist-tools">
+            <summary>重叠 / 遮挡辅助（可选）</summary>
+            <p class="trace-assist-hint">普通曲线无需设置；只有自动追踪出现串线、重叠或遮挡时再打开。</p>
+            <label class="strict-guide-toggle" for="strict-guide">
+              <input id="strict-guide" type="checkbox" disabled />
+              <span>
+                <strong>同色 / 遮挡强约束</strong>
+                <small id="strict-guide-help">拒绝偏离引导走廊的同色分支；普通曲线无需开启</small>
+              </span>
+            </label>
+
+            <div class="trace-corridor-control">
+              <div class="trace-corridor-heading">
+                <strong>Pen 曲线走廊</strong>
+                <span id="trace-corridor-status">未绘制 · 全绘图区搜索</span>
+              </div>
+              <label class="field-label" for="trace-corridor-mode">Pen 范围</label>
+              <select id="trace-corridor-mode" class="select-control">
+                <option value="strict" selected>仅在涂画区域提取（默认）</option>
+                <option value="local">局部辅助（沿两端延伸）</option>
+              </select>
+              <p id="trace-corridor-help">默认只提取涂画区域。局部辅助会锁定已涂区段，只允许沿笔迹两端接续，不会从侧面绕到其它曲线。虚线表示入口和出口边界；转弯处请顺着曲线涂画。引导点保持固定。</p>
+              <div class="button-row compact-row trace-corridor-actions">
+                <button id="draw-trace-corridor" class="button button-ghost" type="button" disabled>画走廊</button>
+                <button id="erase-trace-corridor" class="button button-ghost" type="button" disabled>擦除</button>
+                <button id="clear-trace-corridor" class="button button-ghost" type="button" disabled>清除</button>
+              </div>
+              <label class="range-label" for="trace-corridor-width">
+                <span>Pen 宽度 / px</span>
+                <output id="trace-corridor-width-output">24</output>
+              </label>
+              <input id="trace-corridor-width" type="range" min="4" max="80" step="1" value="24" />
+            </div>
+          </details>
 
           <details id="trace-output-options" class="trace-option-details trace-output-options" hidden>
             <summary>
@@ -611,10 +611,10 @@
       (() => {
         const appScript = document.createElement("script");
         if (window.location.protocol === "file:") {
-          appScript.src = "dist/app-file.js?v=0.20.0-preview.3.21";
+          appScript.src = "dist/app-file.js?v=0.20.0-preview.3.22";
         } else {
           appScript.type = "module";
-          appScript.src = "src/app.js?v=0.20.0-preview.3.21";
+          appScript.src = "src/app.js?v=0.20.0-preview.3.22";
         }
         document.body.appendChild(appScript);
       })();

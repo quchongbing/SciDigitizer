@@ -98,17 +98,25 @@ cases.push({
     [[211, 197], [240, 209], [260, 225], [280, 238], [320, 265], [354, 284]]],
 });
 
-function localPenMask(strokes, width, height) {
+const partialPenCase = cases.at(-1);
+for (const penWidth of [8, 12, 24]) for (const guideCount of [1, 3]) {
+  cases.push({ ...partialPenCase, penWidth,
+    name: `fig1 blue dashed local Pen ${penWidth}px / ${guideCount} guides`,
+    anchors: partialPenCase.anchors.slice(0, guideCount),
+  });
+}
+function localPenMask(strokes, width, height, diameter = 20) {
   if (!strokes) return null;
   const data = new Uint8Array(width * height);
+  const radius = diameter / 2;
   for (const points of strokes) for (let index = 1; index < points.length; index += 1) {
     const [x0, y0] = points[index - 1], [x1, y1] = points[index];
     const steps = Math.ceil(Math.hypot(x1 - x0, y1 - y0));
     for (let step = 0; step <= steps; step += 1) {
       const x = x0 + (x1 - x0) * step / steps, y = y0 + (y1 - y0) * step / steps;
-      for (let yy = Math.max(0, Math.floor(y - 10)); yy <= Math.min(height - 1, y + 10); yy += 1) {
-        for (let xx = Math.max(0, Math.floor(x - 10)); xx <= Math.min(width - 1, x + 10); xx += 1) {
-          if (Math.hypot(xx - x, yy - y) <= 10) data[yy * width + xx] = 1;
+      for (let yy = Math.max(0, Math.floor(y - radius)); yy <= Math.min(height - 1, y + radius); yy += 1) {
+        for (let xx = Math.max(0, Math.floor(x - radius)); xx <= Math.min(width - 1, x + radius); xx += 1) {
+          if (Math.hypot(xx - x, yy - y) <= radius) data[yy * width + xx] = 1;
         }
       }
     }
@@ -172,7 +180,7 @@ const results = [];
 for (const config of cases) {
   if (!cache.has(config.image)) cache.set(config.image, decodePng(join(images, config.image)));
   const image = cache.get(config.image);
-  const inclusionMask = localPenMask(config.penStrokes, image.width, image.height);
+  const inclusionMask = localPenMask(config.penStrokes, image.width, image.height, config.penWidth);
   const rect = detectPlotRect(image.rgba, image.width, image.height);
   const anchors = config.anchors.map(([x, y], index) => ({ x, y, anchorId: `guide-${index + 1}`, userGuided: true }));
   const target = sampleRepresentativeColor(image.rgba, image.width, image.height, anchors[0]);
@@ -237,7 +245,7 @@ for (const config of cases) {
   };
   const exports = [];
   for (const count of [null, 200]) {
-    const exported = prepareTraceOutput(displayed, { ...outputOptions, count }).path;
+    const exported = prepareTraceOutput(displayed, { ...outputOptions, geometryPath: path, count }).path;
     assert.equal(exported.length, count ?? displayed.length, `${config.name}: export density was not retained`);
     assertGuides(exported, anchors, `${config.name} / export ${count ?? "curve"}`);
     const metrics = assertGeometry(exported, config, `export ${count ?? "curve"}`, { interpolate: true });

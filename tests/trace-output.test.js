@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { prepareInclusionMask, inclusionMaskAllows, constrainPathToInclusionMask, clusterColumnCandidates } from "../src/core.js";
-import { isDuplicateGuidePoint, prepareTraceOutput, prepareRestoredTrace } from "../src/trace-output.js";
+import { isDuplicateGuidePoint, prepareTraceOutput, prepareRestoredTrace, selectExistingDataPoints } from "../src/trace-output.js";
 import { runComputeOperation } from "../src/compute-engine.js";
 import { translateMessage } from "../src/i18n.js";
 
@@ -20,7 +20,8 @@ test("Pen local and strict scopes are explicit and invariant across trace orient
   const local = bentMask("local");
   const strict = bentMask("strict");
   assert.deepEqual(local.regions, [{ left: 20, top: 20, right: 50, bottom: 50 }]);
-  assert.equal(inclusionMaskAllows(local, width, 5, 60), true);
+  assert.equal(inclusionMaskAllows(local, width, 5, 20), true);
+  assert.equal(inclusionMaskAllows(local, width, 5, 60), false, "an end gate is not an unrestricted half-plane");
   assert.equal(inclusionMaskAllows(strict, width, 5, 60), false);
   assert.equal(inclusionMaskAllows(local, width, 30, 40), false);
   assert.equal(inclusionMaskAllows(strict, width, 50, 30), true);
@@ -103,6 +104,163 @@ test("a closed local Pen loop has no external exit and uses only painted pixels"
   assert.deepEqual(mask.allowed, data);
 });
 
+test("local Pen eraser cuts remain forbidden after splitting a stroke in either orientation", () => {
+  for (const vertical of [false, true]) {
+    const data = new Uint8Array(width * height);
+    const erased = new Uint8Array(data.length);
+    const transform = (x, y) => vertical ? { x: y, y: x } : { x, y };
+    for (let x = 10; x <= 90; x += 1) for (let y = 43; y <= 51; y += 1) {
+      const p = transform(x, y);
+      (x >= 45 && x <= 55 ? erased : data)[p.y * width + p.x] = 1;
+    }
+    const mask = prepareInclusionMask(data, width, height, "local", { erased });
+    assert.equal(mask.regions.length, 1);
+    assert.equal(mask.gates.length, 2);
+    const forbidden = transform(50, 47);
+    const bypass = transform(50, 20);
+    const edge = transform(45, 47);
+    const extension = transform(5, 47);
+    assert.equal(inclusionMaskAllows(mask, width, forbidden.x, forbidden.y), false);
+    assert.equal(inclusionMaskAllows(mask, width, bypass.x, bypass.y), false);
+    assert.equal(inclusionMaskAllows(mask, width, extension.x, extension.y), true);
+    for (const orientation of ["horizontal", "vertical", "parametric"]) {
+      // Deliberate erasure is not a raster-edge error, even just 1 px from ink.
+      assert.throws(() => prepareTraceOutput([edge], {
+        inclusionMask: mask, width, height, rect, orientation,
+      }), { code: "PEN_OUTSIDE" });
+      assert.throws(() => prepareTraceOutput([forbidden], {
+        inclusionMask: mask, width, height, rect, orientation, count: 100,
+      }), { code: "PEN_OUTSIDE" });
+    }
+  }
+});
+
+test("repainting restores erased pixels without changing the supplied erasure raster", () => {
+  const data = new Uint8Array(width * height);
+  const erased = new Uint8Array(data.length);
+  for (let x = 20; x <= 90; x += 1) data[40 * width + x] = 1;
+  erased[40 * width + 50] = 1;
+  const mask = prepareInclusionMask(data, width, height, "local", { erased });
+  assert.equal(inclusionMaskAllows(mask, width, 50, 40), true);
+  assert.equal(mask.erased[40 * width + 50], 0);
+  assert.equal(erased[40 * width + 50], 1);
+  assert.throws(() => prepareInclusionMask(data, width, height, "local", {
+    erased: new Uint8Array(1),
+  }), /Invalid Pen erasure dimensions/);
+});
+
+test("continuous Pen validation detects a one-pixel cut independently of output density and direction", () => {
+  for (const scope of ["local", "strict"]) for (const orientation of ["horizontal", "vertical", "parametric"]) {
+    const transform = (x, y) => orientation === "vertical" ? { x: y, y: x } : { x, y };
+    const data = new Uint8Array(width * height), erased = new Uint8Array(data.length);
+    for (let x = 5; x <= 95; x += 1) for (let y = 18; y <= 22; y += 1) {
+      const p = transform(x, y);
+      (x === 50 ? erased : data)[p.y * width + p.x] = 1;
+    }
+    const inclusionMask = prepareInclusionMask(data, width, height, scope, { erased });
+    const path = [transform(5, 20), transform(95, 20)];
+    for (const count of [null, 2, 3, 50, 100, 101, 200]) {
+      assert.throws(() => prepareTraceOutput(path, {
+        inclusionMask, width, height, rect, orientation, count,
+      }), { code: "PEN_OUTSIDE" }, JSON.stringify({ scope, orientation, count }));
+    }
+    const outsideGuide = { ...transform(0, 20), anchor: true, userGuided: true, anchorId: "outside" };
+    assert.throws(() => prepareTraceOutput([outsideGuide, path[1]], {
+      inclusionMask, width, height, rect, orientation,
+    }), { code: "PEN_OUTSIDE" }, "an outside guide cannot exempt an internal eraser cut");
+    const retained = prepareRestoredTrace({ path, rawPath: path }, { inclusionMask, width, height, rect });
+    assert.equal(retained.traceStale, true);
+    assert.equal(retained.path, path, "keep legacy data recoverable, but do not export the invalid connection");
+  }
+});
+
+test("continuous validation checks disconnected components and the last closed-path edge", () => {
+  const mask = bentMask("strict");
+  assert.throws(() => prepareTraceOutput([{ x: 20, y: 20 }, { x: 50, y: 50 }], {
+    inclusionMask: mask, width, height, rect, count: null,
+  }), { code: "PEN_OUTSIDE" });
+  const closed = [{ x: 20, y: 20 }, { x: 50, y: 20 }, { x: 50, y: 50, closedPath: true }];
+  assert.throws(() => prepareTraceOutput(closed, {
+    inclusionMask: mask, width, height, rect, count: 2, orientation: "parametric",
+  }), { code: "PEN_OUTSIDE" });
+});
+
+test("sparse point circles use their dense geometry on restore and export, not shortcut chords", () => {
+  const geometryPath = [{ x: 20, y: 20 }, { x: 50, y: 20 }, { x: 50, y: 50 }];
+  const options = { inclusionMask: bentMask("strict"), width, height, rect, orientation: "parametric" };
+  const sparse = prepareTraceOutput(geometryPath, { ...options, count: 2 }).path;
+  assert.equal(sparse.length, 2);
+  const exported = prepareTraceOutput(sparse, { ...options, geometryPath, count: 100 });
+  assert.equal(exported.path.length, 100);
+  assert.ok(exported.path.every(p => inclusionMaskAllows(options.inclusionMask, width, p.x, p.y)));
+  const restored = prepareRestoredTrace({ path: sparse, rawPath: geometryPath }, options);
+  assert.equal(restored.traceStale, false);
+  assert.throws(() => prepareTraceOutput(sparse, { ...options, geometryPath: [{ x: NaN, y: 20 }] }), {
+    code: "INVALID_PATH",
+  });
+});
+
+test("discrete markers are not connected by continuous Pen validation", () => {
+  const data = new Uint8Array(width * height);
+  data[20 * width + 20] = data[80 * width + 90] = 1;
+  const path = [{ x: 20, y: 20 }, { x: 90, y: 80 }];
+  const options = { inclusionMask: prepareInclusionMask(data, width, height, "strict"), width, height, rect };
+  assert.equal(prepareTraceOutput(path, { ...options, markerData: true, count: 100 }).path.length, 2);
+  assert.throws(() => prepareTraceOutput(path, options), { code: "PEN_OUTSIDE" });
+});
+
+test("reducing discrete markers retains guides and remains exportable and restorable", () => {
+  const raw = Array.from({ length: 11 }, (_, i) => ({ x: 10 + i * 9, y: 30 + i, marker: true,
+    ...([3, 5, 8].includes(i) ? { anchor: true, userGuided: true, anchorId: `g${i}` } : {}),
+  }));
+  const data = new Uint8Array(width * height);
+  for (const p of raw) data[p.y * width + p.x] = 1;
+  const options = { markerData: true, inclusionMask: prepareInclusionMask(data, width, height, "strict"), width, height, rect };
+  for (const count of [1, 2, 3, 4, 5, 7, 11, 50]) {
+    const path = selectExistingDataPoints(raw, count);
+    assert.equal(path.length, Math.min(raw.length, Math.max(count, 3)));
+    assert.equal(new Set(path.map(p => p.x)).size, path.length);
+    for (const p of path) assert.ok(raw.some(source => source.x === p.x && source.y === p.y));
+    for (const guide of raw.filter(p => p.anchor)) assert.ok(path.some(p => p.anchorId === guide.anchorId));
+    assert.doesNotThrow(() => prepareTraceOutput(path, { ...options, geometryPath: raw, count: 200 }));
+    assert.equal(prepareRestoredTrace({ path, rawPath: raw, traceStale: false }, options).traceStale, false);
+  }
+});
+
+test("a guide outside Pen stays exact and must also exist in the dense geometry", () => {
+  const guide = { x: 0, y: 20, anchor: true, anchorId: "outside", userGuided: true };
+  const path = [guide, { x: 20, y: 20 }, { x: 50, y: 20 }];
+  const options = { inclusionMask: bentMask("strict"), width, height, rect };
+  assert.equal(prepareTraceOutput(path, options).path[0].x, guide.x);
+  assert.throws(() => prepareTraceOutput(path, { ...options, geometryPath: path.slice(1) }), { code: "MISSING_GUIDE" });
+});
+
+test("draft and project restoration checks stored guides even if the old result was marked valid", () => {
+  const guide = { x: 40, y: 20, anchorId: "saved-guide", userGuided: true };
+  const regular = [{ x: 20, y: 20 }, { x: 50, y: 20 }];
+  const complete = [regular[0], { ...guide, anchor: true }, regular[1]];
+  for (const markerData of [false, true]) {
+    for (const [path, rawPath] of [[regular, regular], [regular, complete], [complete, regular]]) {
+      const curve = { path, rawPath, anchors: [guide], traceStale: false };
+      const restored = prepareRestoredTrace(curve, { markerData, rect, width, height });
+      assert.equal(restored.traceStale, true, "missing guides must not be silently accepted");
+      assert.equal(restored.path, path, "failed validation must preserve recoverable coordinates");
+    }
+    assert.equal(prepareRestoredTrace({
+      path: complete, rawPath: complete, anchors: [guide], traceStale: false,
+    }, { markerData, rect, width, height }).traceStale, false);
+  }
+  // Marker guides select an existing measured centre, unlike continuous-line
+  // anchors, whose exact coordinates are part of the output contract.
+  const markerGuide = { ...guide, x: 40.4, y: 20.4 };
+  assert.equal(prepareRestoredTrace({
+    path: complete, rawPath: complete, anchors: [markerGuide],
+  }, { markerData: true, rect, width, height }).traceStale, false);
+  assert.equal(prepareRestoredTrace({
+    path: complete, rawPath: complete, anchors: [markerGuide],
+  }, { rect, width, height }).traceStale, true);
+});
+
 test("small raster-edge corrections are inferred; distant points fail without modifying the input", () => {
   const inclusionMask = bentMask("strict");
   const source = [{ x: 50.7, y: 30, observed: true, imageObserved: true, uncertaintyPx: 0.1, confidence: 1 }];
@@ -142,7 +300,7 @@ test("legacy project/draft validation keeps invalid data and flags both raw and 
 
 test("local Pen assistance does not apply a false image-centre preference outside its region", () => {
   const rgba = new Uint8ClampedArray(width * height * 4).fill(255);
-  rgba.set([0, 0, 0, 255], (60 * width + 5) * 4);
+  rgba.set([0, 0, 0, 255], (20 * width + 5) * 4);
   const candidates = clusterColumnCandidates(rgba, width, 5, 0, height - 1,
     { r: 0, g: 0, b: 0 }, 9, [], bentMask("local"));
   assert.equal(candidates.length, 1);

@@ -7,9 +7,10 @@ import {
   preferOrdinaryTraceFallback,
   refinePathCenterline,
   traceCurveThroughAnchors,
-} from "./core.js?v=0.20.0-preview.3.21";
+} from "./core.js?v=0.20.0-preview.3.22";
 
-import { traceParametricCurve } from "./parametric-trace.js?v=0.20.0-preview.3.21";
+import { traceParametricCurve } from "./parametric-trace.js?v=0.20.0-preview.3.22";
+import { prepareTraceOutput } from "./trace-output.js?v=0.20.0-preview.3.22";
 
 function requireImage(image) {
   if (
@@ -114,6 +115,7 @@ function transposeInclusionMask(mask, width, height) {
   if (!mask?.data) return null;
   const data = new Uint8Array(width * height);
   const allowed = mask.allowed ? new Uint8Array(width * height) : null;
+  const erased = mask.erased ? new Uint8Array(width * height) : null;
   const columns = new Uint8Array(height);
   for (let y = 0; y < height; y += 1) {
     let rowPainted = false;
@@ -121,11 +123,12 @@ function transposeInclusionMask(mask, width, height) {
       const painted = Boolean(mask.data[y * width + x]);
       data[x * height + y] = painted ? 1 : 0;
       if (allowed) allowed[x * height + y] = mask.allowed[y * width + x];
+      if (erased) erased[x * height + y] = mask.erased[y * width + x];
       rowPainted ||= painted;
     }
     columns[y] = rowPainted ? 1 : 0;
   }
-  return { data, columns, allowed, mode: mask.mode };
+  return { data, columns, allowed, erased, mode: mask.mode };
 }
 
 function transposeTracePayload(payload, width, height) {
@@ -154,6 +157,31 @@ function traceEvidence(result, rect, orientation) {
   return directionSpan(path, rect, orientation) * 0.64
     + observedFraction * 0.23
     + meanConfidence * 0.13;
+}
+
+function penTraceEvidence(path, mask, width, rect) {
+  if (!path?.length) return { score: 0, support: 0, span: 0 };
+  const height = mask.data.length / width;
+  let total = 0, observed = 0, confidence = 0, support = 0;
+  let left = Infinity, right = -Infinity, top = Infinity, bottom = -Infinity;
+  for (let index = 0; index < path.length; index++) {
+    const point = path[index];
+    left = Math.min(left, point.x); right = Math.max(right, point.x);
+    top = Math.min(top, point.y); bottom = Math.max(bottom, point.y);
+    // Compare image distances, not numbers of X columns versus Y rows. Cap
+    // endpoint weights so a long inferred jump cannot count as observed ink.
+    const step = neighbor => neighbor ? Math.min(8, Math.hypot(point.x - neighbor.x, point.y - neighbor.y)) : 0;
+    const weight = (step(path[index - 1]) + step(path[index + 1])) / 2;
+    total += weight;
+    confidence += weight * Number(point.confidence ?? 0);
+    if (!point.observed || point.anchor || point.userGuided) continue;
+    observed += weight;
+    const x = Math.round(point.x), y = Math.round(point.y);
+    if (x >= 0 && x < width && y >= 0 && y < height && mask.data[y * width + x]) support += weight;
+  }
+  const span = Math.hypot(right - left, bottom - top);
+  const coverage = span / Math.max(1, Math.hypot(rect.width, rect.height));
+  return { support, span, score: coverage * 0.64 + (observed * 0.23 + confidence * 0.13) / Math.max(1, total) };
 }
 
 function pathArcLength(path, closed = false) {
@@ -286,22 +314,41 @@ function traceLine(image, payload) {
     : "auto";
   const tracePayload = { ...payload };
   delete tracePayload.orientationMode;
+  let penFailure = null;
+  const validateCandidate = (result) => {
+    if (!tracePayload.inclusionMask?.data || !result.path?.length) return result;
+    try {
+      const prepared = prepareTraceOutput(result.path, {
+        inclusionMask: tracePayload.inclusionMask, width: image.width, height: image.height,
+        rect: tracePayload.rect, orientation: result.orientation ?? "horizontal",
+        guides: tracePayload.anchors,
+      });
+      return { ...result, path: prepared.rawPath };
+    } catch (error) {
+      penFailure ??= error;
+      return { ...result, path: [], penRejected: true };
+    }
+  };
+  const requireCandidate = (result) => {
+    if (result.penRejected) throw penFailure;
+    return result;
+  };
   if (orientationMode === "parametric") {
-    const forced = traceLineParametric(image, tracePayload, tracePayload.targetStyle);
+    const forced = requireCandidate(validateCandidate(traceLineParametric(image, tracePayload, tracePayload.targetStyle)));
     if (!forced.path.length) {
       throw new Error("未找到可信的二维目标路径；请增加引导点、画 Pen 走廊，或改回自动判断");
     }
     return forced;
   }
-  if (orientationMode === "vertical") return traceLineVertical(image, tracePayload);
+  if (orientationMode === "vertical") return requireCandidate(validateCandidate(traceLineVertical(image, tracePayload)));
 
   const horizontal = traceLineInFrame(image, tracePayload);
-  const horizontalResult = {
+  const horizontalResult = validateCandidate({
     ...horizontal,
     path: markOrientation(horizontal.path, "horizontal"),
     orientation: "horizontal",
-  };
-  if (orientationMode === "horizontal") return horizontalResult;
+  });
+  if (orientationMode === "horizontal") return requireCandidate(horizontalResult);
 
   const horizontalCoverage = directionSpan(horizontalResult.path, tracePayload.rect, "horizontal");
   const horizontalObserved = horizontalResult.path.length
@@ -311,27 +358,44 @@ function traceLine(image, payload) {
   const requireGuided2d = guidesRequireMixedDirectionPath(tracePayload.anchors, tracePayload.rect);
   const guideAssisted2d = requireGuided2d || (Boolean(tracePayload.inclusionMask?.data)
     && (tracePayload.anchors?.length ?? 0) >= 3);
+  const hasPen = Boolean(tracePayload.inclusionMask?.data);
   // A healthy ordinary curve returns immediately. The transposed fallback is
-  // only evaluated when the x-column model fails to cover the plot, keeping
-  // the established one-click path fast and byte-for-byte equivalent.
+  // only evaluated when the x-column model fails or the user supplies a Pen,
+  // keeping ordinary one-click tracing fast and byte-for-byte equivalent.
   if (
     horizontalCoverage >= 0.78
     && horizontalObserved >= 0.68
     && horizontalAmbiguity < 0.42
     && !guideAssisted2d
+    && !hasPen
     && retainsEveryGuide(horizontalResult.path, tracePayload.anchors)
   ) return horizontalResult;
 
   let selected = horizontalResult;
-  if (horizontalCoverage < 0.78 || horizontalObserved < 0.68
+  if (hasPen || horizontalCoverage < 0.78 || horizontalObserved < 0.68
     || !retainsEveryGuide(horizontalResult.path, tracePayload.anchors)) {
-    const verticalResult = traceLineVertical(image, tracePayload);
+    const verticalResult = validateCandidate(traceLineVertical(image, tracePayload));
     const horizontalScore = traceEvidence(horizontalResult, tracePayload.rect, "horizontal");
     const verticalScore = traceEvidence(verticalResult, tracePayload.rect, "vertical");
     const verticalCoverage = directionSpan(verticalResult.path, tracePayload.rect, "vertical");
+    // A local Pen deliberately permits endwise extension, where same-colour
+    // axes can dominate the global X span. Prefer substantially stronger pixel
+    // support INSIDE the painted route instead of calling that axis a healthy
+    // horizontal result. No extra scan is added to ordinary one-click tracing.
+    const verticalPen = hasPen
+      ? penTraceEvidence(verticalResult.path, tracePayload.inclusionMask, image.width, tracePayload.rect) : null;
+    const horizontalPen = hasPen
+      ? penTraceEvidence(horizontalResult.path, tracePayload.inclusionMask, image.width, tracePayload.rect) : null;
+    const strongerVerticalPenSupport = hasPen
+      && verticalPen.support > horizontalPen.support * 1.25 + 8
+      && verticalPen.span >= horizontalPen.span * 0.85;
+    const betterPenTrace = hasPen && verticalPen.score > horizontalPen.score + 0.035
+      && verticalPen.support >= horizontalPen.support * 0.9;
     const chooseVertical = retainsEveryGuide(verticalResult.path, tracePayload.anchors)
       && (!retainsEveryGuide(horizontalResult.path, tracePayload.anchors)
-        || (verticalCoverage >= horizontalCoverage + 0.12 && verticalScore >= horizontalScore + 0.07));
+        || strongerVerticalPenSupport
+        || betterPenTrace
+        || (!hasPen && verticalCoverage >= horizontalCoverage + 0.12 && verticalScore >= horizontalScore + 0.07));
     if (chooseVertical) selected = verticalResult;
   }
 
@@ -349,9 +413,9 @@ function traceLine(image, payload) {
   if (!shouldInspectParametric || ![
     "auto", "line", "noisy", "dashed", "dotted", "dashdot",
   ].includes(tracePayload.targetStyle)) {
-    return selected;
+    return requireCandidate(selected);
   }
-  const parametric = traceLineParametric(image, tracePayload, selected.targetStyle);
+  const parametric = validateCandidate(traceLineParametric(image, tracePayload, selected.targetStyle));
   const diagnostics = parametric.parametricDiagnostics;
   const selectedLength = pathArcLength(selected.path);
   const parametricLength = diagnostics?.arcLength ?? pathArcLength(parametric.path, true);
@@ -389,7 +453,7 @@ function traceLine(image, payload) {
   if (requireGuided2d) {
     throw new Error("二维 Pen 路径不连续；请沿目标曲线补涂完整走廊，并在转弯或交叉两侧保留引导点");
   }
-  return selected;
+  return requireCandidate(selected);
 }
 
 /**

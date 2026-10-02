@@ -62,6 +62,17 @@ async function waitForComputeIdle(timeoutMs = 20_000) {
   await waitFor("document.documentElement.dataset.computeBusy === 'idle'", timeoutMs);
 }
 
+function downloadText(selector) {
+  return evaluate(`(async () => {
+    let blob;
+    const create=URL.createObjectURL, revoke=URL.revokeObjectURL, click=HTMLAnchorElement.prototype.click;
+    URL.createObjectURL=value=>{blob=value;return 'blob:smoke-download';};
+    URL.revokeObjectURL=()=>{}; HTMLAnchorElement.prototype.click=()=>{};
+    try {document.querySelector(${JSON.stringify(selector)}).click();return blob ? await blob.text() : null;}
+    finally {URL.createObjectURL=create;URL.revokeObjectURL=revoke;HTMLAnchorElement.prototype.click=click;}
+  })()`);
+}
+
 function untranslatedVisibleEnglish() {
   return evaluate(`document.body.innerText
     .split('\\n')
@@ -114,6 +125,16 @@ async function dragNaturalPoint(fromX, fromY, toX, toY) {
   await command("Input.dispatchMouseEvent", { type: "mousePressed", ...from, button: "left", buttons: 1, clickCount: 1 });
   await command("Input.dispatchMouseEvent", { type: "mouseMoved", ...to, button: "left", buttons: 1 });
   await command("Input.dispatchMouseEvent", { type: "mouseReleased", ...to, button: "left", buttons: 0, clickCount: 1 });
+}
+
+async function paintNaturalRoute(route) {
+  const from = await clientPoint(...route[0]);
+  await command("Input.dispatchMouseEvent", { type: "mouseMoved", ...from });
+  await command("Input.dispatchMouseEvent", { type: "mousePressed", ...from, button: "left", buttons: 1, clickCount: 1 });
+  for (const point of route.slice(1)) {
+    await command("Input.dispatchMouseEvent", { type: "mouseMoved", ...await clientPoint(...point), button: "left", buttons: 1 });
+  }
+  await command("Input.dispatchMouseEvent", { type: "mouseReleased", ...await clientPoint(...route.at(-1)), button: "left", buttons: 0, clickCount: 1 });
 }
 
 async function paintGreenPeakCorridor() {
@@ -418,6 +439,8 @@ if (!await evaluate("document.querySelector('#plot-status').textContent.includes
 }
 await waitFor("document.querySelector('#plot-status').textContent.includes('73–548')");
 await waitFor("!document.querySelector('#suggest-exclusions').dataset.scanning");
+assert.equal(await evaluate("document.querySelector('#exclusion-suggestion-review').hidden"), true,
+  "opening an image must not display unsolicited legend/text suggestion boxes");
 await waitFor("!document.querySelector('#color-suggestions').hidden");
 assert.equal(await evaluate("document.documentElement.dataset.computeMode"), expectedComputeMode);
 const discoveredColorState = await evaluate(`({
@@ -439,6 +462,8 @@ assert.equal(await evaluate("document.querySelector('#color-suggestions').hidden
 assert.match(await evaluate("document.querySelector('#seed-status').textContent"), /RGB\(/);
 await evaluate("document.querySelector('#clear-curve').click()");
 await waitFor("document.querySelector('#seed-status').textContent === '尚未选择曲线' && !document.querySelector('#color-suggestions').hidden");
+await evaluate("document.querySelector('#suggest-exclusions').click()");
+await waitFor("!document.querySelector('#suggest-exclusions').dataset.scanning");
 assert.equal(await evaluate("document.querySelector('#exclusion-suggestion-review').hidden"), false);
 assert.match(await evaluate("document.querySelector('#exclusion-suggestion-status').textContent"), /可信度/);
 assert.match(await evaluate("document.querySelector('#plot-status').textContent"), /待复核干扰建议/);
@@ -771,7 +796,7 @@ const exportedProject = await evaluate(`(async () => {
 })()`);
 const parsedProject = JSON.parse(exportedProject);
 assert.equal(parsedProject.schemaVersion, 8);
-assert.equal(parsedProject.extractor.version, "0.20.0-preview.3.21");
+assert.equal(parsedProject.extractor.version, "0.20.0-preview.3.22");
 assert.equal("calibrationSuggestion" in parsedProject, false);
 assert.deepEqual(parsedProject.calibrationReferenceCounts, { x: 2, y: 2 });
 assert.equal(parsedProject.calibrationSnapEnabled, true);
@@ -1250,6 +1275,71 @@ assert.match(await evaluate("document.querySelector('#target-style-hint').textCo
 const untranslatedMarkerEnglish = await untranslatedVisibleEnglish();
 assert.deepEqual(untranslatedMarkerEnglish, [], `untranslated marker English UI: ${untranslatedMarkerEnglish.join(' | ')}`);
 
+// Disconnected marker dabs must remain disconnected on restoration. Reducing
+// their count may select existing measurements, but cannot discard guides.
+await evaluate(`(() => {
+  document.querySelector('#x-scale').value='linear'; document.querySelector('#y-scale').value='linear';
+  document.querySelector('#x-value-1').value='0'; document.querySelector('#x-value-2').value='1';
+  document.querySelector('#y-value-1').value='0'; document.querySelector('#y-value-2').value='1';
+  document.querySelector('#calibration-snap').checked=false;
+})()`);
+for (const [selector,x,y] of [['#pick-x-1',20,160],['#pick-x-2',240,160],['#pick-y-1',20,160],['#pick-y-2',20,15]]) {
+  await clickAtNaturalPoint(selector,x,y);
+}
+for (const point of [[125,97],[179,88]]) {
+  await clickAtNaturalPoint('#add-guide',...point);
+  await waitForComputeIdle();
+}
+await evaluate(`(() => {
+  const section=document.querySelector('[data-panel-step="trace"]');
+  if(section.classList.contains('is-collapsed'))section.querySelector('.section-heading').click();
+  document.querySelector('#trace-assist-tools').open=true;
+  document.querySelector('#trace-corridor-width').value=12;
+  document.querySelector('#trace-corridor-width').dispatchEvent(new Event('input'));
+  document.querySelector('#draw-trace-corridor').click();
+})()`);
+for(let i=0;i<11;i++) {
+  const x=35+i*18, y=125-i*5+Math.round(3*Math.sin(i));
+  await dragNaturalPoint(x,y,x,y);
+  await waitForComputeIdle();
+}
+assert.equal(await evaluate("document.querySelector('#trace-error').hidden"),true);
+const allMarkers = JSON.parse(await downloadText('#export-project')).activeCurve;
+assert.equal(allMarkers.path.length,11);
+const markerGuides = allMarkers.path.filter(point=>point.anchor);
+assert.equal(markerGuides.length,3);
+await evaluate("document.querySelector('#trace-point-count').value=2;document.querySelector('#trace-point-count').dispatchEvent(new Event('change'))");
+const reducedMarkers = JSON.parse(await downloadText('#export-project')).activeCurve;
+assert.equal(reducedMarkers.path.length,3,"guide count takes precedence over a smaller requested point count");
+assert.equal(await evaluate("document.querySelector('#trace-point-count').value"),'3');
+for(const guide of markerGuides) assert.ok(reducedMarkers.path.some(p=>p.anchorId===guide.anchorId&&p.x===guide.x&&p.y===guide.y));
+for(const selector of ['#export-csv','#export-txt']) {
+  const content=await downloadText(selector);
+  assert.ok(content,`${selector} must not fail after reducing a guided marker series`);
+  assert.equal(content.trim().split('\n').length,5,"do not interpolate new measurements for marker export density");
+}
+await evaluate("document.querySelector('#save-series').click();document.querySelector('[data-action=\"edit\"]').click()");
+await waitFor("document.querySelector('#autosave-status').textContent==='Draft saved'");
+await evaluate(`(async()=>{
+  const key=Object.keys(localStorage).find(k=>k.startsWith('scidigitizer:draft:v1:')
+    && JSON.parse(localStorage.getItem(k)).snapshot.sourceFingerprint.startsWith('260x180-'));
+  const stored=JSON.parse(localStorage.getItem(key));
+  delete stored.snapshot.geometry.traceStale; delete stored.snapshot.geometry.traceError;
+  localStorage.setItem(key,JSON.stringify(stored));
+  const blob=await new Promise(resolve=>document.querySelector('#plot-image-canvas').toBlob(resolve,'image/png'));
+  const transfer=new DataTransfer();transfer.items.add(new File([blob],'marker-smoke.png',{type:'image/png'}));
+  const drop=new Event('drop',{bubbles:true,cancelable:true});Object.defineProperty(drop,'dataTransfer',{value:transfer});
+  document.dispatchEvent(drop);
+})()`);
+await waitFor("document.querySelector('#restore-draft').hidden===false");
+await evaluate("document.querySelector('#restore-draft').click()");
+assert.equal(await evaluate("document.querySelector('#trace-error').hidden"),true,
+  "legacy marker dabs must not be validated as connected line segments");
+const restoredMarkerProject=JSON.parse(await downloadText('#export-project'));
+assert.equal(restoredMarkerProject.activeCurve.path.length,3);
+assert.equal(restoredMarkerProject.series[0].traceStale,false,"saved marker curves need the same restore contract");
+assert.ok(await downloadText('#export-csv'));
+
 // A separate vertical fixture exercises the UI, Worker, output validation and
 // export together. Repeated X coordinates are essential, not duplicate guides.
 await evaluate(`(async () => {
@@ -1276,8 +1366,24 @@ await clickAtNaturalPoint('#pick-x-1',10,290);
 await clickAtNaturalPoint('#pick-x-2',290,290);
 await clickAtNaturalPoint('#pick-y-1',10,290);
 await clickAtNaturalPoint('#pick-y-2',10,10);
+// Paint first, THEN select a target. This is a supported initial workflow,
+// unlike replacing an existing target, which deliberately clears old aids.
+assert.equal(await evaluate("document.querySelector('#trace-assist-tools').hidden"),false);
+await evaluate(`(() => {
+  const section=document.querySelector('[data-panel-step="trace"]');
+  if (section.classList.contains('is-collapsed')) section.querySelector('.section-heading').click();
+})()`);
+await evaluate("document.querySelector('#trace-assist-tools').open=true");
+assert.equal(await evaluate("document.querySelector('#draw-trace-corridor').checkVisibility()"),true,
+  "Pen must be visibly accessible before the first target pick");
+await evaluate("document.querySelector('#draw-trace-corridor').click()");
+await dragNaturalPoint(140,30,140,270);
+assert.equal(await evaluate("document.querySelector('#clear-trace-corridor').disabled"),false);
 await clickAtNaturalPoint('#pick-seed',140,50);
 await waitForComputeIdle();
+assert.equal(await evaluate("document.querySelector('#clear-trace-corridor').disabled"),false,
+  "the first target pick must preserve a deliberately prepared Pen corridor");
+assert.equal(await evaluate("document.querySelector('#trace-corridor-status').textContent"),'Painted area only');
 await clickAtNaturalPoint('#add-guide',140,180);
 await waitForComputeIdle();
 await clickAtNaturalPoint('#add-guide',140,240);
@@ -1314,16 +1420,19 @@ await evaluate("document.querySelector('#save-series').click(); document.querySe
 assert.equal(await evaluate("document.querySelector('#trace-corridor-mode').value"),'strict');
 assert.deepEqual(await evaluate(`[...document.querySelectorAll('.guide-point')].map(row => [...row.querySelectorAll('input')].map(input=>Number(input.value)))`), verticalGuideRows);
 
-// Old autosave snapshots have no traceStale/scope fields and do not pass through
-// project-file import. They must also be validated, without deleting their data.
+// Both legacy and newer drafts must be revalidated with current Pen rules.
+// An old traceStale:false flag is not proof that a path is still valid.
+for (const legacy of [true, false]) {
 await waitFor("document.querySelector('#autosave-status').textContent === 'Draft saved'");
 await evaluate(`(async () => {
   const key=Object.keys(localStorage).find(key => key.startsWith('scidigitizer:draft:v1:')
     && JSON.parse(localStorage.getItem(key)).snapshot.sourceFingerprint.startsWith('300x300-'));
   if (!key) throw new Error('vertical draft is missing');
   const stored=JSON.parse(localStorage.getItem(key));
-  delete stored.snapshot.geometry.traceStale; delete stored.snapshot.geometry.traceError;
-  delete stored.snapshot.controls['#trace-corridor-mode'];
+  if (${legacy}) {
+    delete stored.snapshot.geometry.traceStale; delete stored.snapshot.geometry.traceError;
+    delete stored.snapshot.controls['#trace-corridor-mode'];
+  } else {stored.snapshot.geometry.traceStale=false;stored.snapshot.geometry.traceError=null;}
   stored.snapshot.geometry.traceOrientation='parametric';
   stored.snapshot.geometry.series=[]; stored.snapshot.geometry.editingSeriesId=null;
   stored.snapshot.geometry.path.find(p=>!p.anchor).x=260;
@@ -1353,7 +1462,113 @@ await evaluate("document.querySelector('#retry-trace').click()");
 await waitForComputeIdle();
 assert.equal(await evaluate("document.querySelector('#trace-error').hidden"),true);
 assert.deepEqual(await evaluate(`[...document.querySelectorAll('.guide-point')].map(row => [...row.querySelectorAll('input')].map(input=>Number(input.value)))`), verticalGuideRows);
+}
+
+// A cut across the entire local corridor must not reopen as a blank gap
+// between two separate strokes. Repainting the cut restores the route.
+await evaluate("document.querySelector('#trace-corridor-mode').value='local'; document.querySelector('#trace-corridor-mode').dispatchEvent(new Event('change'))");
+await waitForComputeIdle();
+assert.equal(await evaluate("document.querySelector('#trace-error').hidden"),true,
+  `the intact local corridor must trace before erasing: ${await evaluate("document.querySelector('#trace-error-message').textContent")}`);
+const beforeErasedCut = await evaluate(`[...document.querySelectorAll('.data-point-row')].map(row => row.title)`);
+await evaluate("document.querySelector('#erase-trace-corridor').click()");
+await dragNaturalPoint(140,105,140,115);
+await waitForComputeIdle();
+assert.equal(await evaluate("document.querySelector('#trace-error').hidden"),false,
+  "a full-width eraser cut must not be traversed by local Pen extension");
+assert.equal(await evaluate("document.querySelector('#export-csv').disabled"),true);
+assert.deepEqual(await evaluate(`[...document.querySelectorAll('.data-point-row')].map(row => row.title)`),beforeErasedCut);
+await evaluate("document.querySelector('#draw-trace-corridor').click()");
+await dragNaturalPoint(140,105,140,115);
+await waitForComputeIdle();
+assert.equal(await evaluate("document.querySelector('#trace-error').hidden"),true,
+  `repainting an erased cut must restore the trace: ${await evaluate("document.querySelector('#trace-error').textContent")}`);
+assert.equal(await evaluate("document.querySelector('#export-csv').disabled"),false);
+
+// The actual Canvas raster (including antialiased round caps) once sent local
+// dashed tracing to the solid-blue branch at 12 px and rejected it at 24 px.
+// Exercise the mouse workflow in both Worker and file-bundle modes, not merely
+// an idealized binary brush mask. Only the two ambiguous sections are painted.
+const { prepareInclusionMask, inclusionMaskAllows, inclusionPathViolation } = await import("../src/core.js");
+const localPenResults = [];
+for (const penWidth of [12, 24]) {
+  await command("Page.navigate", { url: appUrl });
+  await waitFor("document.querySelector('#source-meta')?.textContent.includes('578 × 450')");
+  await evaluate(`(() => {
+    document.querySelector('#x-value-1').value='0'; document.querySelector('#x-value-2').value='8';
+    document.querySelector('#y-value-1').value='7'; document.querySelector('#y-value-2').value='1';
+    document.querySelector('#calibration-snap').checked=false;
+  })()`);
+  await clickAtNaturalPoint('#pick-x-1',75,324);
+  await clickAtNaturalPoint('#pick-x-2',546,324);
+  await clickAtNaturalPoint('#pick-y-1',75,31);
+  await clickAtNaturalPoint('#pick-y-2',75,324);
+  await evaluate(`(() => {
+    const section=document.querySelector('[data-panel-step="trace"]');
+    if(section.classList.contains('is-collapsed')) section.querySelector('.section-heading').click();
+    document.querySelector('#trace-assist-tools').open=true;
+    const scope=document.querySelector('#trace-corridor-mode'); scope.value='local'; scope.dispatchEvent(new Event('change'));
+    document.querySelector('#target-style').value='dashed';
+    const brush=document.querySelector('#trace-corridor-width'); brush.value=${penWidth}; brush.dispatchEvent(new Event('input'));
+    document.querySelector('#draw-trace-corridor').click();
+  })()`);
+  await paintNaturalRoute([[95,147],[130,151],[160,166]]);
+  await paintNaturalRoute([[211,197],[240,209],[260,225],[280,238],[320,265],[354,284]]);
+  await clickAtNaturalPoint('#pick-seed',140,153.5);
+  await waitForComputeIdle();
+  for (const guide of [[240,209],[260,225]]) {
+    await clickAtNaturalPoint('#add-guide',...guide);
+    await waitForComputeIdle();
+  }
+  assert.equal(await evaluate("document.querySelector('#trace-error').hidden"),true,
+    `local Pen ${penWidth}px: ${await evaluate("document.querySelector('#trace-error-message').textContent")}`);
+  assert.equal(await evaluate("document.querySelector('#export-csv').disabled"),false);
+  const project = await evaluate(`(async () => {
+    let blob; const oldCreate=URL.createObjectURL, oldRevoke=URL.revokeObjectURL, oldClick=HTMLAnchorElement.prototype.click;
+    URL.createObjectURL=b=>{blob=b;return 'blob:local-pen-project';}; URL.revokeObjectURL=()=>{};
+    HTMLAnchorElement.prototype.click=()=>{};
+    try { document.querySelector('#export-project').click(); return blob ? JSON.parse(await blob.text()) : null; }
+    finally { URL.createObjectURL=oldCreate; URL.revokeObjectURL=oldRevoke; HTMLAnchorElement.prototype.click=oldClick; }
+  })()`);
+  assert.ok(project);
+  const curve = project.activeCurve;
+  assert.equal(curve.traceStale,false);
+  assert.equal(curve.path.length,100);
+  assert.equal(curve.anchors.length,3);
+  const span = Math.max(...curve.rawPath.map(p=>p.x))-Math.min(...curve.rawPath.map(p=>p.x));
+  assert.ok(span>=450, `local Pen ${penWidth}px stopped prematurely: ${span}px`);
+  const errors = [[90,141.5],[130,150],[170,168.5],[200,185],[240,209],[280,238],[340,277]].map(([x,y]) => {
+    const nearest=curve.rawPath.reduce((a,b)=>Math.abs(a.x-x)<Math.abs(b.x-x)?a:b);
+    return Math.abs(nearest.y-y);
+  });
+  assert.ok(Math.max(...errors)<=3, `local Pen ${penWidth}px switched blue branches: ${errors}`);
+  for (const guide of curve.anchors) {
+    assert.ok(curve.path.some(p=>p.anchorId===guide.anchorId && Math.hypot(p.x-guide.x,p.y-guide.y)<1e-7));
+  }
+  const paintedPixels = await evaluate(`(() => {
+    const operations=${JSON.stringify(curve.traceCorridorOperations)};
+    const canvas=document.createElement('canvas'); canvas.width=578; canvas.height=450;
+    const ctx=canvas.getContext('2d'); ctx.strokeStyle=ctx.fillStyle='#fff'; ctx.lineCap=ctx.lineJoin='round';
+    for (const op of operations) {
+      ctx.globalCompositeOperation=op.mode==='erase'?'destination-out':'source-over'; ctx.lineWidth=op.width;
+      ctx.beginPath();
+      if(op.points.length===1) {ctx.arc(op.points[0].x,op.points[0].y,op.width/2,0,Math.PI*2);ctx.fill();}
+      else {ctx.moveTo(op.points[0].x,op.points[0].y);for(const p of op.points.slice(1))ctx.lineTo(p.x,p.y);ctx.stroke();}
+    }
+    const rgba=ctx.getImageData(0,0,578,450).data;
+    const indices=[];for(let i=0;i<578*450;i++)if(rgba[i*4+3]>=32)indices.push(i);
+    return indices;
+  })()`);
+  const data = new Uint8Array(578*450);
+  for (const index of paintedPixels) data[index]=1;
+  const inclusionMask=prepareInclusionMask(data,578,450,'local');
+  assert.ok(curve.path.every(p=>p.anchor||p.userGuided||inclusionMaskAllows(inclusionMask,578,p.x,p.y)));
+  assert.equal(inclusionPathViolation(curve.rawPath, {
+    inclusionMask, width:578, height:450, rect:project.plotRect,
+  }),null, "the dense underlying route must obey Pen independently of display density");
+  localPenResults.push({penWidth,span,maxReferenceError:Math.max(...errors),points:curve.path.length});
+}
 assert.deepEqual(consoleErrors, []);
 
-process.stdout.write(`${JSON.stringify({ beforeSave, afterSave, consoleErrors }, null, 2)}\n`);
+process.stdout.write(`${JSON.stringify({ beforeSave, afterSave, localPenResults, consoleErrors }, null, 2)}\n`);
 socket.close();

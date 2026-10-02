@@ -179,6 +179,49 @@ test("vertical tracing preserves every manually placed guide exactly", () => {
   }
 });
 
+test("local Pen tails do not reconnect to same-colour frame lines through forbidden pixels", () => {
+  for (const vertical of [false, true]) {
+    for (const guided of [false, true]) {
+      const image = whiteImage(300, 300);
+      const target = { r: 17, g: 17, b: 17 };
+      const rect = { left: 10, top: 10, right: 290, bottom: 290, width: 281, height: 281 };
+      const transform = (x, y) => vertical ? { x: y, y: x } : { x, y };
+      const data = new Uint8Array(image.width * image.height);
+      for (const edge of [9, 10, 289, 290]) for (let along = 9; along <= 290; along += 1) {
+        setPixel(image, edge, along, target); setPixel(image, along, edge, target);
+      }
+      for (let x = 30; x <= 269; x += 1) for (const y of [139, 140]) {
+        const point = transform(x, y);
+        setPixel(image, point.x, point.y, target);
+      }
+      for (let x = 18; x <= 282; x += 1) for (let y = 128; y <= 152; y += 1) {
+        if (Math.hypot(x - Math.max(30, Math.min(270, x)), y - 140) <= 12) {
+          const painted = transform(x, y);
+          data[painted.y * image.width + painted.x] = 1;
+        }
+      }
+      const inclusionMask = prepareInclusionMask(data, image.width, image.height, "local");
+      const anchors = (guided ? [50, 180, 240] : [50]).map((x, index) => ({
+        ...transform(x, 140), anchorId: `guide-${index}`, userGuided: true,
+      }));
+      const result = runComputeOperation("trace-line", {
+        rect, anchors, target, threshold: 5, inclusionMask,
+        maxJump: 14, maxGap: 24, targetStyle: "line", refinementMode: "full", orientationMode: "auto",
+      }, image);
+      const orientation = vertical ? "vertical" : "horizontal";
+      assert.equal(result.orientation, orientation, JSON.stringify({vertical, guided}));
+      assert.ok(result.path.length >= 235, "retain the whole isolated stroke");
+      assert.ok(result.path.every(point => Math.abs((vertical ? point.x : point.y) - 140) < 1),
+        JSON.stringify({vertical, guided, outside: result.path.filter(point => Math.abs((vertical ? point.x : point.y) - 140) >= 1).map(point=>({x:point.x,y:point.y})).slice(0, 5)}));
+      const output = prepareTraceOutput(result.path, {
+        inclusionMask, width: image.width, height: image.height, rect, orientation, guides: anchors, count: 100,
+      });
+      assert.equal(output.path.length, 100);
+      assert.ok(output.path.every(point => inclusionMaskAllows(inclusionMask, image.width, point.x, point.y)));
+    }
+  }
+});
+
 test("a Pen corridor is transposed into row-local constraints for vertical tracing", () => {
   const image = whiteImage(68, 94);
   const target = { r: 210, g: 75, b: 145 };

@@ -1045,12 +1045,21 @@ function localPenGates(pixels, width, region) {
     const length = Math.hypot(dx, dy);
     if (!length) return null;
     const nx = dx / length, ny = dy / length;
-    // Put each gate beyond the painted cap, so rounded brush ends are covered
-    // too. Extension is allowed only beyond an entry/exit plane, never beside
-    // the middle of a stroke. A closed corridor has no exit planes.
+    // Locate the painted cap along the endpoint tangent. Extension is allowed
+    // only through an entry/exit aperture, never beside the middle of a stroke.
+    // A closed corridor has no exits.
     let offset = -Infinity;
     for (const index of pixels) offset = Math.max(offset, nx * (index % width) + ny * Math.floor(index / width));
-    return { nx, ny, offset };
+    const halfWidth = Math.max(1, pixels.length / nodes.length / 2);
+    // The curved edge of a round cap is not a wall across the tangent route.
+    // Start its entrance a few pixels before the furthest cap projection;
+    // lateral clearance below still prevents a side exit to parallel ink.
+    offset = Math.max(nx * nodes[endpoint].x + ny * nodes[endpoint].y,
+      offset - Math.min(4, halfWidth * 0.75));
+    return {
+      nx, ny, offset, x: nodes[endpoint].x, y: nodes[endpoint].y,
+      halfWidth,
+    };
   }).filter(Boolean);
 }
 
@@ -1059,8 +1068,9 @@ function localPenGates(pixels, width, region) {
  * just inside their bounding boxes. Only endwise extension remains available.
  * Strict mode permits only painted pixels. Manual guides remain authoritative.
  */
-function prepareInclusionMask(data, width, height, mode = "local") {
+function prepareInclusionMask(data, width, height, mode = "local", { erased = null } = {}) {
   if (!data || data.length !== width * height) throw new Error("Invalid Pen raster dimensions");
+  if (erased && erased.length !== data.length) throw new Error("Invalid Pen erasure dimensions");
   const columns = new Uint8Array(width);
   const rows = new Uint8Array(height);
   let activePixels = 0;
@@ -1076,8 +1086,19 @@ function prepareInclusionMask(data, width, height, mode = "local") {
   const gates = [];
   const allowed = scope === "strict" ? data.slice() : new Uint8Array(data.length).fill(1);
   if (scope === "local") {
+    // An eraser cuts the searchable pixels, not the original local scope.
+    // Otherwise a cut creates new exit gates and allows a sideways bypass.
     const unseen = data.slice();
-    const queue = new Int32Array(activePixels);
+    let scopePixels = activePixels;
+    if (erased) {
+      for (let index = 0; index < data.length; index += 1) {
+        if (erased[index] && !unseen[index]) {
+          unseen[index] = 1;
+          scopePixels += 1;
+        }
+      }
+    }
+    const queue = new Int32Array(scopePixels);
     for (let seed = 0; seed < data.length; seed += 1) {
       if (!unseen[seed]) continue;
       let head = 0;
@@ -1112,17 +1133,39 @@ function prepareInclusionMask(data, width, height, mode = "local") {
         for (let y = 0; y < height; y += 1) {
           for (let x = 0; x < width; x += 1) {
             if (!allowed[y * width + x] || data[y * width + x]) continue;
-            if (!ends.some(({ nx, ny, offset }) => nx * x + ny * y > offset + 1e-7)) allowed[y * width + x] = 0;
+            if (!ends.some((gate) => {
+              const projection = gate.nx * x + gate.ny * y;
+              if (projection <= gate.offset + 1e-7) return false;
+              const forward = projection - (gate.nx * gate.x + gate.ny * gate.y);
+              // A half-plane alone admits a remote parallel branch immediately
+              // beside an exit. Require a short, widening tangent entry first;
+              // beyond it local assistance resumes ordinary unrestricted search.
+              if (forward > Math.max(20, gate.halfWidth * 4)) return true;
+              const lateral = Math.abs(-gate.ny * (x - gate.x) + gate.nx * (y - gate.y));
+              return lateral <= gate.halfWidth + Math.max(0, forward) * 0.4 + 1;
+            })) allowed[y * width + x] = 0;
           }
         }
       }
-      for (let y = region.top; y <= region.bottom; y += 1) {
+      // Only directionless dabs need a rectangular fallback. For an open
+      // stroke, blank corners around a round cap can already be beyond an end
+      // gate; clearing its entire bounding box would block legitimate entry.
+      if (ends === null) for (let y = region.top; y <= region.bottom; y += 1) {
         allowed.fill(0, y * width + region.left, y * width + region.right + 1);
       }
     }
     for (let index = 0; index < data.length; index += 1) if (data[index]) allowed[index] = 1;
   }
-  return { data, columns, rows, allowed, mode: scope, regions, gates, activePixels };
+  const effectiveErased = erased ? erased.slice() : null;
+  if (effectiveErased) {
+    for (let index = 0; index < data.length; index += 1) {
+      // A later paint operation restores that pixel. Otherwise an explicit
+      // erasure overrides the local entry/exit extensions in every direction.
+      if (data[index]) effectiveErased[index] = 0;
+      else if (effectiveErased[index]) allowed[index] = 0;
+    }
+  }
+  return { data, columns, rows, allowed, erased: effectiveErased, mode: scope, regions, gates, activePixels };
 }
 
 function inclusionMaskAllows(inclusionMask, width, x, y) {
@@ -1205,6 +1248,8 @@ function nearestInclusionPixel(inclusionMask, width, height, x, y, rect, maximum
   const column = Math.round(x);
   const row = Math.round(y);
   if (column >= 0 && column < width && row >= 0 && row < height
+    && inclusionMask.erased?.[row * width + column]) return null;
+  if (column >= 0 && column < width && row >= 0 && row < height
     && allowed[row * width + column]) {
     return { x, y, distance: 0 };
   }
@@ -1223,6 +1268,62 @@ function nearestInclusionPixel(inclusionMask, width, height, x, y, rect, maximum
     }
   }
   return nearest;
+}
+
+/** Inspect every raster cell traversed by the underlying continuous path.
+ * Pixel-boundary intervals, rather than output density, make even a one-pixel
+ * erasure detectable. Exported point circles are not connected: callers with
+ * a dense source path should validate that geometry, not sparse sampling chords.
+ */
+function inclusionPathViolation(path, {
+  inclusionMask = null, width, height = null, rect, maximumCorrection = 1.5,
+} = {}) {
+  if (!inclusionMask?.data || !rect || !Number.isFinite(width) || path?.length < 2) return null;
+  const maskHeight = height ?? inclusionMask.data.length / width;
+  const isGuide = point => Boolean(point.anchor || point.userGuided);
+  const permitGuideExit = point => isGuide(point)
+    && !inclusionMaskAllows(inclusionMask, width, point.x, point.y);
+  const segmentCount = path.length - 1 + (path.some(point => point.closedPath) ? 1 : 0);
+  for (let index = 0; index < segmentCount; index += 1) {
+    const start = path[index], end = path[(index + 1) % path.length];
+    const dx = end.x - start.x, dy = end.y - start.y;
+    const boundaries = [0, 1];
+    for (const [origin, delta] of [[start.x, dx], [start.y, dy]]) {
+      if (!delta) continue;
+      const low = Math.min(origin, origin + delta), high = Math.max(origin, origin + delta);
+      for (let boundary = Math.floor(low + 0.5) + 0.5; boundary < high; boundary += 1) {
+        const fraction = (boundary - origin) / delta;
+        if (fraction > 0 && fraction < 1) boundaries.push(fraction);
+      }
+    }
+    boundaries.sort((a, b) => a - b);
+    const samples = [];
+    for (let position = 1; position < boundaries.length; position += 1) {
+      if (boundaries[position] - boundaries[position - 1] < 1e-10) continue;
+      const fraction = (boundaries[position] + boundaries[position - 1]) / 2;
+      const x = start.x + dx * fraction, y = start.y + dy * fraction;
+      const column = Math.round(x), row = Math.round(y);
+      const inside = column >= 0 && column < width && row >= 0 && row < maskHeight;
+      const pixel = row * width + column;
+      const erased = inside && Boolean(inclusionMask.erased?.[pixel]);
+      const valid = !erased && inside && (inclusionMaskAllows(inclusionMask, width, x, y)
+        || nearestInclusionPixel(inclusionMask, width, maskHeight, x, y, rect, maximumCorrection));
+      samples.push({ x, y, valid: Boolean(valid), erased });
+    }
+    const firstAllowed = samples.findIndex(sample => sample.valid);
+    const lastAllowed = samples.findLastIndex(sample => sample.valid);
+    const violation = samples.find((sample, position) => {
+      if (sample.valid) return false;
+      if (sample.erased) return true;
+      // An authoritative guide may sit outside Pen, but it cannot license a
+      // forbidden hole in the middle of the automatic route.
+      if (permitGuideExit(start) && (firstAllowed < 0 || position < firstAllowed)) return false;
+      if (permitGuideExit(end) && (lastAllowed < 0 || position > lastAllowed)) return false;
+      return true;
+    });
+    if (violation) return { segmentIndex: index, x: violation.x, y: violation.y, erased: violation.erased };
+  }
+  return null;
 }
 
 /**
@@ -1316,6 +1417,27 @@ function clusterColumnCandidates(
   const closeRun = () => {
     if (!run) return;
     const y = (run.start + run.end) / 2;
+    // Local extension can expose a same-colour plot frame. A nearly full-height
+    // band is not a thin-curve centre; do not reconnect to its midpoint unless
+    // the user actually painted there. Vertical target ink is still available
+    // to vertical/2D tracing, and ordinary traces without Pen are unchanged.
+    if (inclusionMask?.mode === "local"
+      && !inclusionMask.data[Math.round(y) * width + x]) {
+      // Pen's tangent entrance can expose only a short piece of a long axis.
+      // Measure the original ink column, not the already masked run length.
+      const originalInk = row => {
+        const offset = (row * width + x) * 4;
+        return compositedColorDistance(rgba[offset], rgba[offset + 1], rgba[offset + 2], target) <= threshold;
+      };
+      if (originalInk(top) && originalInk(bottom)) {
+        let ink = 0;
+        for (let row = top; row <= bottom; row += 4) if (originalInk(row)) ink += 1;
+        if (ink >= Math.ceil((bottom - top + 1) / 4) * 0.75) {
+          run = null;
+          return;
+        }
+      }
+    }
     const inclusionRun = nearestInclusionRun(inclusionMask, width, x, y, top, bottom);
     candidates.push({
       y,
@@ -1666,6 +1788,25 @@ function candidateAvoidance(options, candidate, x) {
   };
 }
 
+function inclusionBridgeAllowed(inclusionMask, width, start, end) {
+  if (!inclusionMask?.data) return true;
+  const steps = Math.ceil(Math.max(Math.abs(end.x - start.x), Math.abs(end.y - start.y)));
+  const height = inclusionMask.data.length / width;
+  const rect = { left: 0, top: 0, right: width - 1, bottom: height - 1 };
+  for (let step = 1; step < steps; step += 1) {
+    const fraction = step / steps;
+    const x = start.x + (end.x - start.x) * fraction;
+    const y = start.y + (end.y - start.y) * fraction;
+    if (inclusionMaskAllows(inclusionMask, width, x, y)) continue;
+    // Scan candidates have not yet undergone stroke-centre/gap refinement.
+    // Allow a small preliminary margin at rounded caps, while the final
+    // validator still enforces its stricter 1.5 px raster-edge correction.
+    // Explicit erasures remain forbidden even within this search margin.
+    if (!nearestInclusionPixel(inclusionMask, width, height, x, y, rect, 4)) return false;
+  }
+  return true;
+}
+
 function traceDirection({
   rgba,
   width,
@@ -1696,6 +1837,11 @@ function traceDirection({
     : null;
   let gap = 0;
   const xLimit = limit ?? (direction > 0 ? rect.right : rect.left);
+  // Pen supplies an independent spatial constraint. Only in that assisted
+  // mode use a short observed tangent to stabilise the dash ruler; leave the
+  // ordinary tracer unchanged, especially its curved-pattern behaviour.
+  const stabilizePattern = isPatternedLineStyle(targetStyle) && Boolean(inclusionMask?.data);
+  const tangentSupport = previousObserved ? [previousObserved, lastObserved] : [lastObserved];
 
   for (let x = lastObserved.x + direction; direction > 0 ? x <= xLimit : x >= xLimit; x += direction) {
     const columnCandidates = clusterColumnCandidates(
@@ -1713,6 +1859,22 @@ function traceDirection({
     const velocity = previousObserved
       ? (lastObserved.y - previousObserved.y) / Math.max(1, Math.abs(lastObserved.x - previousObserved.x))
       : 0;
+    let patternSlope = velocity;
+    if (stabilizePattern && tangentSupport.length >= 3) {
+      const meanX = tangentSupport.reduce((sum, p) => sum + p.x, 0) / tangentSupport.length;
+      const meanY = tangentSupport.reduce((sum, p) => sum + p.y, 0) / tangentSupport.length;
+      const variance = tangentSupport.reduce((sum, p) => sum + (p.x - meanX) ** 2, 0);
+      const slope = variance > 0 ? tangentSupport.reduce((sum, p) => (
+        sum + (p.x - meanX) * (p.y - meanY)
+      ), 0) / variance : 0;
+      const residual = Math.sqrt(tangentSupport.reduce((sum, p) => (
+        sum + (p.y - meanY - slope * (p.x - meanX)) ** 2
+      ), 0) / tangentSupport.length);
+      // Thin, almost horizontal ink (also vertical ink after transposition)
+      // alternates flat raster steps with one-pixel jumps. Stabilise only a
+      // locally straight ruler, not curved segments or the motion prediction.
+      if (Math.abs(slope) <= 0.25 && residual <= 0.55) patternSlope = slope;
+    }
     const noisyMode = targetStyle === "noisy";
     const predictedY = lastObserved.y + velocity * dx * (noisyMode ? 0.22 : 1);
     const allowedJump = maxJump * (noisyMode ? 1.6 : 1) * Math.max(1, dx);
@@ -1731,6 +1893,11 @@ function traceDirection({
     for (const candidate of candidates) {
       const jump = Math.abs(candidate.y - predictedY);
       if (jump > allowedJump) continue;
+      // Valid endpoints do not make the intervening gap valid. In local Pen
+      // mode a remote same-colour axis can be outside an exit gate, yet its
+      // straight bridge crosses the protected section. Reject it before it
+      // changes the trace velocity or creates inferred pixels outside Pen.
+      if (!inclusionBridgeAllowed(inclusionMask, width, lastObserved, { x, y: candidate.y })) continue;
       const thicknessPenalty = candidateThicknessPenalty(candidate, targetStyle);
       const stylePenalty = patternedLinePenalty({
         rgba,
@@ -1742,7 +1909,7 @@ function traceDirection({
         targetStyle,
         styleReference,
         strokePatternCache,
-      }, candidate, x, velocity);
+      }, candidate, x, patternSlope);
       if (!Number.isFinite(stylePenalty)) continue;
       const colorPenalty = threshold > 0 ? candidate.distance / threshold : 0;
       const cost = jump * (noisyMode ? 0.58 : 1)
@@ -1806,6 +1973,11 @@ function traceDirection({
     points.push(point);
     previousObserved = lastObserved;
     lastObserved = point;
+    if (stabilizePattern) {
+      tangentSupport.push(point);
+      while (tangentSupport.length > 3 && (tangentSupport.length > 8
+        || Math.abs(point.x - tangentSupport[0].x) > 12)) tangentSupport.shift();
+    }
     gap = 0;
   }
 
@@ -2075,6 +2247,7 @@ function globalTraceDirection({
         const dx = Math.abs(x - previous.x);
         const occlusionBridge = exclusionBridgeBetween(exclusions, previous, { x, y: candidate.y });
         if (dx > maxGap + 1 && !occlusionBridge) continue;
+        if (!inclusionBridgeAllowed(inclusionMask, width, previous, { x, y: candidate.y })) continue;
         const slope = (candidate.y - previous.y) / Math.max(1, x - previous.x);
         const recentSlope = previous.slope ?? slope;
         const trendSlope = previous.trendSlope ?? recentSlope;
@@ -2243,6 +2416,7 @@ function globalGuidedSegment(options, start, end, {
           && !(candidate.anchor && options.strictGuideCorridor)
           && !occlusionBridge
         ) continue;
+        if (!inclusionBridgeAllowed(options.inclusionMask, options.width, previous, { x, y: candidate.y })) continue;
         const slope = (candidate.y - previous.y) / dx;
         const recentSlope = previous.slope ?? slope;
         const trendSlope = previous.trendSlope ?? recentSlope;
@@ -5662,11 +5836,12 @@ function csvEscape(value) {
   const text = String(value);
   return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
 }
-return Object.freeze({ clamp, normalizeRect, fitCalibrationModel, calibrationError, validateCalibration, assessCalibrationQuality, pixelToValue, valueToPixel, calibrationUncertaintyAtPixel, snapCalibrationPoint, valueStepForPixelNudge, rgbDistanceSquared, compositedColorDistance, pixelAt, sampleRepresentativeColor, estimateColorThreshold, snapTargetPoint, prepareInclusionMask, inclusionMaskAllows, constrainPathToInclusionMask, clusterColumnCandidates, inferLineStyle, traceCurve, traceCurveThroughAnchors, refinePathCenterline, fitInferredPathGaps, extractMarkerCenters, inferMarkerSeries, discoverColoredSeries, detectPlotRects, detectPlotRect, suggestInterferenceMasks, pathToData, resamplePixelPath, resamplePixelPathArcLength, includeMandatoryParametricPoints, includeMandatoryPoints, resamplePixelPathGeometry, resamplePixelPathAdaptive, resamplePixelPathRoughness, resamplePath, findMostInformativeAmbiguity, findPathReviewRegions, assessPathQuality, preferOrdinaryTraceFallback, formatNumber, buildPairedCurveRows, csvEscape });
+return Object.freeze({ clamp, normalizeRect, fitCalibrationModel, calibrationError, validateCalibration, assessCalibrationQuality, pixelToValue, valueToPixel, calibrationUncertaintyAtPixel, snapCalibrationPoint, valueStepForPixelNudge, rgbDistanceSquared, compositedColorDistance, pixelAt, sampleRepresentativeColor, estimateColorThreshold, snapTargetPoint, prepareInclusionMask, inclusionMaskAllows, inclusionPathViolation, constrainPathToInclusionMask, clusterColumnCandidates, inferLineStyle, traceCurve, traceCurveThroughAnchors, refinePathCenterline, fitInferredPathGaps, extractMarkerCenters, inferMarkerSeries, discoverColoredSeries, detectPlotRects, detectPlotRect, suggestInterferenceMasks, pathToData, resamplePixelPath, resamplePixelPathArcLength, includeMandatoryParametricPoints, includeMandatoryPoints, resamplePixelPathGeometry, resamplePixelPathAdaptive, resamplePixelPathRoughness, resamplePath, findMostInformativeAmbiguity, findPathReviewRegions, assessPathQuality, preferOrdinaryTraceFallback, formatNumber, buildPairedCurveRows, csvEscape });
 })();
 const SciTraceOutput = (() => {
 const {
 constrainPathToInclusionMask,
+  inclusionPathViolation,
   includeMandatoryParametricPoints,
   includeMandatoryPoints,
   resamplePixelPath,
@@ -5688,6 +5863,27 @@ function isDuplicateGuidePoint(anchors, point) {
 
 function transpose(point) {
   return { ...point, x: point.y, y: point.x };
+}
+
+/** Reduce a discrete series using only measured points, retaining every guide. */
+function selectExistingDataPoints(path, count) {
+  if (!path?.length) return [];
+  const requested = Number.isFinite(Number(count)) ? Math.max(1, Math.round(Number(count))) : path.length;
+  const mandatory = new Set(path.flatMap((point, index) => point.anchor || point.userGuided ? [index] : []));
+  const targetCount = Math.min(path.length, Math.max(requested, mandatory.size));
+  const selected = new Set(Array.from({ length: targetCount }, (_, index) => (
+    targetCount === 1 ? 0 : Math.round(index * (path.length - 1) / (targetCount - 1))
+  )));
+  for (const index of mandatory) {
+    if (selected.has(index)) continue;
+    const replaceable = [...selected].filter(candidate => !mandatory.has(candidate));
+    const nearest = replaceable.reduce((best, candidate) => (
+      best === null || Math.abs(candidate - index) < Math.abs(best - index) ? candidate : best
+    ), null);
+    if (nearest !== null) selected.delete(nearest);
+    selected.add(index);
+  }
+  return [...selected].sort((a, b) => a - b).map(index => ({ ...path[index] }));
 }
 
 function sampleTracePath(path, count, parameters = {}, orientation = "horizontal") {
@@ -5712,7 +5908,8 @@ function retainTraceGuides(sampled, mandatory, count, orientation = "horizontal"
 }
 
 /** Shared by tracing, density edits, restore and export. No DOM or state writes.
- * Only one-pixel raster-edge corrections are allowed; large errors fail closed.
+ * Only small raster-edge corrections (at most 1.5 px by default) are allowed;
+ * large errors fail closed.
  * A failure never partially installs a new raw path in the application state.
  */
 function prepareTraceOutput(path, {
@@ -5721,16 +5918,20 @@ function prepareTraceOutput(path, {
   orientation = "horizontal",
   guides = [],
   markerData = false,
+  geometryPath = null,
   ...corridor
 } = {}) {
   if (!path?.length) throw outputError("EMPTY_PATH", "未找到可用路径；请补充引导点或调整 Pen 后重新追踪");
-  if (path.some((point) => !Number.isFinite(point?.x) || !Number.isFinite(point?.y))) {
+  if ([...path, ...(geometryPath ?? [])].some((point) => !Number.isFinite(point?.x) || !Number.isFinite(point?.y))) {
     throw outputError("INVALID_PATH", "路径包含无效坐标；未替换上一次结果");
   }
+  // Marker guides identify a measured centre by ID; the click need not equal
+  // that centre. Continuous-line guides instead require exact coordinates.
   for (const guide of guides) {
     if (!path.some((point) => (
       (!guide.anchorId || point.anchorId === guide.anchorId)
-      && Math.hypot(point.x - guide.x, point.y - guide.y) < 1e-7
+      && ((markerData && guide.anchorId && (point.anchor || point.userGuided))
+        || Math.hypot(point.x - guide.x, point.y - guide.y) < 1e-7)
     ))) throw outputError("MISSING_GUIDE", "路径未经过全部引导点；请调整走廊或切换二维追踪");
   }
   const constrain = (points) => {
@@ -5742,9 +5943,20 @@ function prepareTraceOutput(path, {
   };
   // Reindex before sampling, so guide positions and interpolated positions use
   // the same parameter domain even after editing or loading a saved project.
-  const rawPath = constrain(path.map((point, index) => ({ ...point, parametricOrder: index })));
+  const rawPath = constrain((geometryPath?.length ? geometryPath : path)
+    .map((point, index) => ({ ...point, parametricOrder: index })));
+  if (!markerData && inclusionPathViolation(rawPath, corridor)) {
+    throw outputError("PEN_OUTSIDE", "路径超出 Pen 约束范围；请补涂走廊或调整引导点后重试");
+  }
+  const displayed = geometryPath?.length ? constrain(path) : rawPath;
+  for (const guide of displayed.filter(point => point.anchor || point.userGuided)) {
+    if (!rawPath.some(point => point.x === guide.x && point.y === guide.y
+      && (!guide.anchorId || point.anchorId === guide.anchorId))) {
+      throw outputError("MISSING_GUIDE", "路径未经过全部引导点；请调整走廊或切换二维追踪");
+    }
+  }
   const mandatory = rawPath.filter((point) => point.anchor || point.userGuided);
-  let sampled = rawPath;
+  let sampled = displayed;
   if (count !== null && !markerData) {
     sampled = retainTraceGuides(
       sampleTracePath(rawPath, count, parameters, orientation), mandatory, count, orientation,
@@ -5775,16 +5987,20 @@ function prepareTraceOutput(path, {
 /** Migrate old projects/drafts without losing their data on validation errors. */
 function prepareRestoredTrace(curve, options = {}) {
   if (curve.traceStale || !curve.path?.length) return { ...curve };
+  const restoreOptions = {
+    ...options,
+    guides: options.guides ?? (curve.anchors?.length ? curve.anchors : (curve.seed ? [curve.seed] : [])),
+  };
   try {
     const rawPath = curve.rawPath?.length
-      ? prepareTraceOutput(curve.rawPath, { ...options, count: null }).path : (curve.rawPath ?? []);
-    const path = prepareTraceOutput(curve.path, options).path;
+      ? prepareTraceOutput(curve.rawPath, { ...restoreOptions, count: null }).path : (curve.rawPath ?? []);
+    const path = prepareTraceOutput(curve.path, { ...restoreOptions, geometryPath: rawPath }).path;
     return { ...curve, path, rawPath, traceStale: false, traceError: null };
   } catch (error) {
     return { ...curve, traceStale: true, traceError: error.message };
   }
 }
-return Object.freeze({ isDuplicateGuidePoint, sampleTracePath, retainTraceGuides, prepareTraceOutput, prepareRestoredTrace });
+return Object.freeze({ isDuplicateGuidePoint, selectExistingDataPoints, sampleTracePath, retainTraceGuides, prepareTraceOutput, prepareRestoredTrace });
 })();
 const SciParametricTrace = (() => {
 const {
@@ -7440,6 +7656,9 @@ discoverColoredSeries,
 const {
 traceParametricCurve
 } = SciParametricTrace;
+const {
+prepareTraceOutput
+} = SciTraceOutput;
 
 function requireImage(image) {
   if (
@@ -7544,6 +7763,7 @@ function transposeInclusionMask(mask, width, height) {
   if (!mask?.data) return null;
   const data = new Uint8Array(width * height);
   const allowed = mask.allowed ? new Uint8Array(width * height) : null;
+  const erased = mask.erased ? new Uint8Array(width * height) : null;
   const columns = new Uint8Array(height);
   for (let y = 0; y < height; y += 1) {
     let rowPainted = false;
@@ -7551,11 +7771,12 @@ function transposeInclusionMask(mask, width, height) {
       const painted = Boolean(mask.data[y * width + x]);
       data[x * height + y] = painted ? 1 : 0;
       if (allowed) allowed[x * height + y] = mask.allowed[y * width + x];
+      if (erased) erased[x * height + y] = mask.erased[y * width + x];
       rowPainted ||= painted;
     }
     columns[y] = rowPainted ? 1 : 0;
   }
-  return { data, columns, allowed, mode: mask.mode };
+  return { data, columns, allowed, erased, mode: mask.mode };
 }
 
 function transposeTracePayload(payload, width, height) {
@@ -7584,6 +7805,31 @@ function traceEvidence(result, rect, orientation) {
   return directionSpan(path, rect, orientation) * 0.64
     + observedFraction * 0.23
     + meanConfidence * 0.13;
+}
+
+function penTraceEvidence(path, mask, width, rect) {
+  if (!path?.length) return { score: 0, support: 0, span: 0 };
+  const height = mask.data.length / width;
+  let total = 0, observed = 0, confidence = 0, support = 0;
+  let left = Infinity, right = -Infinity, top = Infinity, bottom = -Infinity;
+  for (let index = 0; index < path.length; index++) {
+    const point = path[index];
+    left = Math.min(left, point.x); right = Math.max(right, point.x);
+    top = Math.min(top, point.y); bottom = Math.max(bottom, point.y);
+    // Compare image distances, not numbers of X columns versus Y rows. Cap
+    // endpoint weights so a long inferred jump cannot count as observed ink.
+    const step = neighbor => neighbor ? Math.min(8, Math.hypot(point.x - neighbor.x, point.y - neighbor.y)) : 0;
+    const weight = (step(path[index - 1]) + step(path[index + 1])) / 2;
+    total += weight;
+    confidence += weight * Number(point.confidence ?? 0);
+    if (!point.observed || point.anchor || point.userGuided) continue;
+    observed += weight;
+    const x = Math.round(point.x), y = Math.round(point.y);
+    if (x >= 0 && x < width && y >= 0 && y < height && mask.data[y * width + x]) support += weight;
+  }
+  const span = Math.hypot(right - left, bottom - top);
+  const coverage = span / Math.max(1, Math.hypot(rect.width, rect.height));
+  return { support, span, score: coverage * 0.64 + (observed * 0.23 + confidence * 0.13) / Math.max(1, total) };
 }
 
 function pathArcLength(path, closed = false) {
@@ -7716,22 +7962,41 @@ function traceLine(image, payload) {
     : "auto";
   const tracePayload = { ...payload };
   delete tracePayload.orientationMode;
+  let penFailure = null;
+  const validateCandidate = (result) => {
+    if (!tracePayload.inclusionMask?.data || !result.path?.length) return result;
+    try {
+      const prepared = prepareTraceOutput(result.path, {
+        inclusionMask: tracePayload.inclusionMask, width: image.width, height: image.height,
+        rect: tracePayload.rect, orientation: result.orientation ?? "horizontal",
+        guides: tracePayload.anchors,
+      });
+      return { ...result, path: prepared.rawPath };
+    } catch (error) {
+      penFailure ??= error;
+      return { ...result, path: [], penRejected: true };
+    }
+  };
+  const requireCandidate = (result) => {
+    if (result.penRejected) throw penFailure;
+    return result;
+  };
   if (orientationMode === "parametric") {
-    const forced = traceLineParametric(image, tracePayload, tracePayload.targetStyle);
+    const forced = requireCandidate(validateCandidate(traceLineParametric(image, tracePayload, tracePayload.targetStyle)));
     if (!forced.path.length) {
       throw new Error("未找到可信的二维目标路径；请增加引导点、画 Pen 走廊，或改回自动判断");
     }
     return forced;
   }
-  if (orientationMode === "vertical") return traceLineVertical(image, tracePayload);
+  if (orientationMode === "vertical") return requireCandidate(validateCandidate(traceLineVertical(image, tracePayload)));
 
   const horizontal = traceLineInFrame(image, tracePayload);
-  const horizontalResult = {
+  const horizontalResult = validateCandidate({
     ...horizontal,
     path: markOrientation(horizontal.path, "horizontal"),
     orientation: "horizontal",
-  };
-  if (orientationMode === "horizontal") return horizontalResult;
+  });
+  if (orientationMode === "horizontal") return requireCandidate(horizontalResult);
 
   const horizontalCoverage = directionSpan(horizontalResult.path, tracePayload.rect, "horizontal");
   const horizontalObserved = horizontalResult.path.length
@@ -7741,27 +8006,44 @@ function traceLine(image, payload) {
   const requireGuided2d = guidesRequireMixedDirectionPath(tracePayload.anchors, tracePayload.rect);
   const guideAssisted2d = requireGuided2d || (Boolean(tracePayload.inclusionMask?.data)
     && (tracePayload.anchors?.length ?? 0) >= 3);
+  const hasPen = Boolean(tracePayload.inclusionMask?.data);
   // A healthy ordinary curve returns immediately. The transposed fallback is
-  // only evaluated when the x-column model fails to cover the plot, keeping
-  // the established one-click path fast and byte-for-byte equivalent.
+  // only evaluated when the x-column model fails or the user supplies a Pen,
+  // keeping ordinary one-click tracing fast and byte-for-byte equivalent.
   if (
     horizontalCoverage >= 0.78
     && horizontalObserved >= 0.68
     && horizontalAmbiguity < 0.42
     && !guideAssisted2d
+    && !hasPen
     && retainsEveryGuide(horizontalResult.path, tracePayload.anchors)
   ) return horizontalResult;
 
   let selected = horizontalResult;
-  if (horizontalCoverage < 0.78 || horizontalObserved < 0.68
+  if (hasPen || horizontalCoverage < 0.78 || horizontalObserved < 0.68
     || !retainsEveryGuide(horizontalResult.path, tracePayload.anchors)) {
-    const verticalResult = traceLineVertical(image, tracePayload);
+    const verticalResult = validateCandidate(traceLineVertical(image, tracePayload));
     const horizontalScore = traceEvidence(horizontalResult, tracePayload.rect, "horizontal");
     const verticalScore = traceEvidence(verticalResult, tracePayload.rect, "vertical");
     const verticalCoverage = directionSpan(verticalResult.path, tracePayload.rect, "vertical");
+    // A local Pen deliberately permits endwise extension, where same-colour
+    // axes can dominate the global X span. Prefer substantially stronger pixel
+    // support INSIDE the painted route instead of calling that axis a healthy
+    // horizontal result. No extra scan is added to ordinary one-click tracing.
+    const verticalPen = hasPen
+      ? penTraceEvidence(verticalResult.path, tracePayload.inclusionMask, image.width, tracePayload.rect) : null;
+    const horizontalPen = hasPen
+      ? penTraceEvidence(horizontalResult.path, tracePayload.inclusionMask, image.width, tracePayload.rect) : null;
+    const strongerVerticalPenSupport = hasPen
+      && verticalPen.support > horizontalPen.support * 1.25 + 8
+      && verticalPen.span >= horizontalPen.span * 0.85;
+    const betterPenTrace = hasPen && verticalPen.score > horizontalPen.score + 0.035
+      && verticalPen.support >= horizontalPen.support * 0.9;
     const chooseVertical = retainsEveryGuide(verticalResult.path, tracePayload.anchors)
       && (!retainsEveryGuide(horizontalResult.path, tracePayload.anchors)
-        || (verticalCoverage >= horizontalCoverage + 0.12 && verticalScore >= horizontalScore + 0.07));
+        || strongerVerticalPenSupport
+        || betterPenTrace
+        || (!hasPen && verticalCoverage >= horizontalCoverage + 0.12 && verticalScore >= horizontalScore + 0.07));
     if (chooseVertical) selected = verticalResult;
   }
 
@@ -7779,9 +8061,9 @@ function traceLine(image, payload) {
   if (!shouldInspectParametric || ![
     "auto", "line", "noisy", "dashed", "dotted", "dashdot",
   ].includes(tracePayload.targetStyle)) {
-    return selected;
+    return requireCandidate(selected);
   }
-  const parametric = traceLineParametric(image, tracePayload, selected.targetStyle);
+  const parametric = validateCandidate(traceLineParametric(image, tracePayload, selected.targetStyle));
   const diagnostics = parametric.parametricDiagnostics;
   const selectedLength = pathArcLength(selected.path);
   const parametricLength = diagnostics?.arcLength ?? pathArcLength(parametric.path, true);
@@ -7819,7 +8101,7 @@ function traceLine(image, payload) {
   if (requireGuided2d) {
     throw new Error("二维 Pen 路径不连续；请沿目标曲线补涂完整走廊，并在转弯或交叉两侧保留引导点");
   }
-  return selected;
+  return requireCandidate(selected);
 }
 
 /**
@@ -9546,6 +9828,7 @@ const {
 isDuplicateGuidePoint,
   prepareRestoredTrace,
   prepareTraceOutput,
+  selectExistingDataPoints,
 } = SciTraceOutput;
 
 const {
@@ -9694,7 +9977,7 @@ let targetSelectionSequence = 0;
 let traceTaskSequence = 0;
 
 const computeClient = createComputeClient({
-  workerUrl: new URL("src/trace-worker.js?v=0.20.0-preview.3.21", document.baseURI).href,
+  workerUrl: new URL("src/trace-worker.js?v=0.20.0-preview.3.22", document.baseURI).href,
 });
 
 function currentComputeImage() {
@@ -9714,7 +9997,7 @@ function runBackgroundOperation(operation, payload) {
   const mask = payload.inclusionMask;
   const numericalPayload = { ...payload, inclusionMask: mask ? {
     data: mask.data, columns: mask.columns, rows: mask.rows,
-    allowed: mask.allowed, mode: mask.mode,
+    allowed: mask.allowed, erased: mask.erased, mode: mask.mode,
   } : null };
   return computeClient.run(
     operation,
@@ -10159,11 +10442,13 @@ function restoreEditableSnapshot(snapshot) {
     targetStyle.dataset.autoDetected = "markers";
     targetStyle.dataset.autoConfidence = String(state.automaticMarkerConfidence);
   }
-  if (!Object.hasOwn(geometry, "traceStale")) {
-    // Old autosaved drafts bypass project-file import. Validate them once as
-    // well, instead of displaying/exporting their old out-of-Pen results as current.
+  {
+    // A saved "current" flag can predate stronger Pen checks. Revalidate both
+    // draft and history restoration with the current contract; preserve an
+    // explicitly pending/stale result, and keep discrete markers unconnected.
     const restored = prepareRestoredTrace(state, {
       orientation: state.traceOrientation, inclusionMask: traceCorridorMask(),
+      markerData: targetStyle.value === "markers",
       width: canvas.width, height: canvas.height, rect: state.plotRect,
     });
     for (const key of ["path", "rawPath", "traceStale", "traceError"]) state[key] = restored[key];
@@ -10172,6 +10457,7 @@ function restoreEditableSnapshot(snapshot) {
       const corridorMode = series.parameters?.corridorMode ?? (orientation === "parametric" ? "strict" : "local");
       return prepareRestoredTrace({ ...series, parameters: { ...series.parameters, corridorMode } }, {
         orientation, inclusionMask: buildTraceCorridorMask(series.traceCorridorOperations, corridorMode),
+        markerData: series.parameters?.targetStyle === "markers",
         width: canvas.width, height: canvas.height, rect: state.plotRect,
       });
     });
@@ -10462,7 +10748,22 @@ function buildTraceCorridorMask(operations, mode = "local") {
     if (rgba[index * 4 + 3] < 32) continue;
     data[index] = 1;
   }
-  const mask = prepareInclusionMask(data, canvas.width, canvas.height, mode);
+  // Keep deliberate erasures distinct from gaps between separately painted
+  // strokes. Local endwise extension must not reopen a cut made by the eraser.
+  let erased = null;
+  if (operations.some(operation => operation.mode === "erase")) {
+    const paintCanvas = document.createElement("canvas");
+    paintCanvas.width = canvas.width;
+    paintCanvas.height = canvas.height;
+    const paintContext = paintCanvas.getContext("2d", { willReadFrequently: true });
+    renderTraceCorridorOperations(paintContext, operations.filter(operation => operation.mode !== "erase"));
+    const painted = paintContext.getImageData(0, 0, canvas.width, canvas.height).data;
+    erased = new Uint8Array(data.length);
+    for (let index = 0; index < data.length; index += 1) {
+      if (!data[index] && painted[index * 4 + 3] >= 32) erased[index] = 1;
+    }
+  }
+  const mask = prepareInclusionMask(data, canvas.width, canvas.height, mode, { erased });
   if (!mask) return null;
 
   const displayCanvas = document.createElement("canvas");
@@ -12088,6 +12389,7 @@ function updateUi() {
   const hasTarget = Boolean(state.seedColor);
   $("#trace-primary-action").classList.toggle("has-target", hasTarget);
   $("#trace-refinement-tools").hidden = !hasTarget;
+  $("#trace-assist-tools").hidden = !state.plotRect;
   $("#trace-output-options").hidden = !hasTarget;
   $("#trace-current-actions").hidden = !hasTarget && !state.editingSeriesId;
   $("#save-series").hidden = !state.path.length && !state.series.length;
@@ -13085,7 +13387,7 @@ function syncExclusionSuggestionUi() {
   $("#next-exclusion-suggestion").disabled = state.exclusionSuggestions.length <= 1;
 }
 
-async function scanInterferenceSuggestions({ automatic = false } = {}) {
+async function scanInterferenceSuggestions() {
   if (!state.imageData || !state.plotRect) return [];
   const scanId = ++interferenceScanSequence;
   const plotRect = { ...state.plotRect };
@@ -13107,11 +13409,9 @@ async function scanInterferenceSuggestions({ automatic = false } = {}) {
   delete button.dataset.scanning;
   updateUi();
   draw();
-  if (!automatic) {
-    showToast(suggestions.length
-      ? `发现 ${suggestions.length} 个可能的图例或文字干扰区；请逐个复核后接受`
-      : "未发现足够可靠的图例或文字干扰区；不会自动添加屏蔽");
-  }
+  showToast(suggestions.length
+    ? `发现 ${suggestions.length} 个可能的图例或文字干扰区；请逐个复核后接受`
+    : "未发现足够可靠的图例或文字干扰区；不会自动添加屏蔽");
   return suggestions;
 }
 
@@ -13350,6 +13650,8 @@ async function selectTraceTarget(point) {
     point,
     sampledColor,
   );
+  const replacingTarget = Boolean(state.seedColor);
+  const initialCorridor = replacingTarget ? null : traceCorridorMask();
   const snappedPoint = snapTargetPoint({
     rgba: state.imageData.data,
     width: canvas.width,
@@ -13359,13 +13661,15 @@ async function selectTraceTarget(point) {
     target: sampledColor,
     threshold: preliminaryThreshold,
     exclusions: state.exclusions,
+    inclusionMask: initialCorridor,
   });
-  // Picking a target begins a fresh, simple trace. Pen and strict-guide
-  // constraints are opt-in aids for ambiguities and must never leak from a
-  // previous attempt into an ordinary one-click trace.
-  state.traceCorridorOperations = [];
-  state.draftTraceCorridor = null;
-  invalidateTraceCorridor();
+  // A different target starts fresh. But a Pen deliberately painted before
+  // the FIRST pick belongs to this curve and must constrain that first trace.
+  if (replacingTarget) {
+    state.traceCorridorOperations = [];
+    state.draftTraceCorridor = null;
+    invalidateTraceCorridor();
+  }
   $("#strict-guide").checked = false;
   // A target pick is the ordinary one-click entry point. A forced direction
   // restored from an older draft or previous attempt must not silently turn a
@@ -13373,7 +13677,7 @@ async function selectTraceTarget(point) {
   // choose a manual direction after the first automatic result when needed.
   $("#trace-orientation").value = "auto";
   state.traceOrientation = "horizontal";
-  $("#trace-assist-tools").open = false;
+  $("#trace-assist-tools").open = Boolean(initialCorridor);
   state.seed = createGuideAnchor(snappedPoint);
   state.traceStale = false;
   state.traceError = null;
@@ -13412,6 +13716,7 @@ async function selectTraceTarget(point) {
         target: sampledColor,
         threshold: Number($("#color-threshold").value),
         exclusions: state.exclusions,
+        inclusionMask: initialCorridor,
       });
       if (selectionId !== targetSelectionSequence || state.seed?.anchorId !== selectedAnchorId) return false;
       const inferredStyle = markerInference.detected ? {
@@ -13764,7 +14069,6 @@ canvas.addEventListener("pointerup", (event) => {
       setMode(null);
       showToast("绘图区已设置；下一步点击坐标刻度进行标定");
       commitHistory("手动设置绘图区");
-      void scanInterferenceSuggestions({ automatic: true });
       void scanColorSuggestions();
     }
   } else if (state.mode === "exclude" && state.dragStart) {
@@ -14157,7 +14461,6 @@ function suggestPlotRect({ automatic = false } = {}) {
     setMode(null);
     showToast(`已切换到图框建议 ${state.plotSuggestionIndex + 1}/${state.plotSuggestions.length}`);
     commitHistory("切换绘图区建议");
-    void scanInterferenceSuggestions({ automatic: true });
     void scanColorSuggestions();
     return;
   }
@@ -14199,7 +14502,6 @@ function suggestPlotRect({ automatic = false } = {}) {
     // Initial frame detection is a fresh baseline, not an edit/autosave.
     if (automatic) resetHistorySession();
     else commitHistory("自动选择绘图区");
-    void scanInterferenceSuggestions({ automatic: true });
     void scanColorSuggestions();
   });
 }
@@ -14511,15 +14813,6 @@ for (const selector of ["#noise-density", "#noise-window"]) {
   });
 }
 
-function selectExistingDataPoints(path, count) {
-  if (count >= path.length) return [...path];
-  if (count <= 1) return [{ ...path[0] }];
-  return Array.from({ length: count }, (_, index) => {
-    const sourceIndex = Math.round((index / (count - 1)) * (path.length - 1));
-    return { ...path[sourceIndex] };
-  });
-}
-
 $("#trace-point-count").addEventListener("change", (event) => {
   if (state.computeBusy || state.traceStale) return;
   const pointCount = normalizeTracePointCount(event.target.value);
@@ -14816,6 +15109,7 @@ function buildCurveExportRows() {
     const preserveDiscreteMarkers = series.parameters?.targetStyle === "markers";
     const orientation = resolvedTraceOrientation(series.parameters, series.path);
     const prepared = prepareTraceOutput(series.path, {
+      geometryPath: series.rawPath,
       count: density === "curve" ? null : normalizeTracePointCount(density),
       parameters: series.parameters ?? { samplingMode: "geometry" },
       markerData: preserveDiscreteMarkers, orientation,
@@ -14938,7 +15232,7 @@ $("#export-project").addEventListener("click", async () => {
       calibration: currentCalibrationSnapshot(),
       calibrationBeforeSeriesEdit: state.calibrationBeforeSeriesEdit,
     },
-    extractor: { name: "SciDigitizer", version: "0.20.0-preview.3.21", engine: "parametric-orientation-adaptive-bilingual-occlusion-pattern-gap-ensemble-risk-ranked-review-low-friction-import-responsive-worker-guided-color-centerline-multicurve-core" },
+    extractor: { name: "SciDigitizer", version: "0.20.0-preview.3.22", engine: "parametric-orientation-adaptive-bilingual-occlusion-pattern-gap-ensemble-risk-ranked-review-low-friction-import-responsive-worker-guided-color-centerline-multicurve-core" },
   };
   const saved = await downloadBlob(`${JSON.stringify(project, null, 2)}\n`, "application/json", `${baseName()}-project.json`);
   if (saved) showToast("项目文件已保存，可恢复标定、参数和路径");

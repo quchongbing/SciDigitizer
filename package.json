@@ -1,6 +1,6 @@
 {
   "name": "scidigitizer",
-  "version": "0.20.0-preview.3.21",
+  "version": "0.20.0-preview.3.22",
   "private": true,
   "license": "MIT",
   "type": "module",
@@ -9,6 +9,7 @@
     "serve": "python tools/serve.py",
     "build:file": "node tools/build-file-bundle.mjs",
     "test": "node tests/core.test.js && node tests/compute.test.js && node tests/trace-output.test.js && node tests/neutral-trace.test.js && node tests/image-import.test.js && node tests/i18n.test.js && node tests/desktop-bridge.test.js",
+    "test:pen": "node tools/pen-stress.mjs",
     "check": "node --check src/app.js && node --check src/mask-geometry.js && node --check src/core.js && node --check src/trace-output.js && node --check src/parametric-trace.js && node --check src/compute-engine.js && node --check src/compute-client.js && node --check src/trace-worker.js && node --check src/image-import.js && node --check src/i18n.js && node --check src/image-geometry.js && node --check src/edit-session.js && node --check src/image-transform.js && node --check tools/accuracy-fixtures.mjs && node --check tools/parametric-fixtures.mjs && node --check tools/accuracy-benchmark.mjs && node --check tools/real-node-smoke.mjs && node --check tools/real-pen-smoke.mjs && node --check tools/app-smoke.mjs && node --check tools/run-app-smoke.mjs && node --check tools/build-file-bundle.mjs && node --check tools/package-desktop.mjs && node --check tools/verify-release.mjs && node --check tools/sync-public.mjs && node tools/build-file-bundle.mjs --check",
     "public:sync": "node tools/sync-public.mjs",
     "desktop:prepare": "npm run build:file && node tools/prepare-desktop.mjs",

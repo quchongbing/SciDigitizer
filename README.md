@@ -7,9 +7,9 @@
 
 **[Open SciDigitizer online / 在线使用](https://quchongbing.github.io/SciDigitizer/)** · **[Desktop downloads / 桌面版下载](https://github.com/quchongbing/SciDigitizer/releases)** · **[Installation guide / 安装指南](docs/installation.md)**
 
-![Version](https://img.shields.io/badge/version-0.20.0--preview.3.21-1666d8)
+![Version](https://img.shields.io/badge/version-0.20.0--preview.3.22-1666d8)
 ![Local](https://img.shields.io/badge/data-local--only-00a9a5)
-![Tests](https://img.shields.io/badge/tests-174%20passing-2f8f5b)
+![Tests](https://img.shields.io/badge/tests-184%20passing-2f8f5b)
 ![License](https://img.shields.io/badge/license-MIT-f0c040)
 
 SciDigitizer 从 PNG、JPEG 或 WebP 图像中提取曲线数据。通常只需选择曲线颜色；遇到同色分支、交叉或遮挡时，再添加少量引导点。图像和数据始终保留在浏览器本地。
@@ -42,7 +42,7 @@ SciDigitizer is a personal open-source project created by Chongbing Qu (瞿崇�
 - 亚像素线宽中心校正；长遮挡段会比较直线、正则平滑、Hermite 和二次趋势，并显示随无像素支撑距离增长的不确定度。
 - 引导点始终作为追踪基准；支持多条同色曲线避让。
 - Pen 曲线走廊可局部限定普通追踪；对折返或横竖混合曲线，涂完整路径并添加至少 3 个引导点（顺序不限），可在同色交叉处选择连续二维路径。此类有分支结果会明确要求复核。
-- 自动扫描绘图区内较可信的图例和文字块，以橙色候选框供用户复核；接受前绝不会屏蔽像素或改变追踪结果。
+- 可按需扫描绘图区内的图例和文字块，以橙色候选框供用户复核；启动时不显示，接受前不会屏蔽像素或改变追踪结果。
 - 选中标定点或数据点后，方向键移动 1 px，`Shift` + 方向键微调 0.1 px。
 - 智能消歧会定位最值得确认的同色分叉；点击一次正确分支即可加入受保护基准并全局重追踪。
 - 导出 CSV、TXT、项目 JSON 和 Overlay PNG。
@@ -59,7 +59,7 @@ SciDigitizer is a personal open-source project created by Chongbing Qu (瞿崇�
 1. 打开、拖入或粘贴图片，确认方向和绘图区。
 2. 输入 X/Y 已知刻度值，并点击图中对应刻度完成标定。通常每轴两点即可；需要复核精度时可增加参考点，黄色提示会指出拟合残差或疑似误点。
 3. 点击目标曲线取色，程序会立即追踪；也可直接点程序发现的候选色块，从可靠位置一键开始。
-4. 如绘图区摘要显示干扰建议，可展开并复核橙色框；普通图片无需处理。多曲线重合或邻近时，用“Pen 曲线走廊”涂出目标的大致路径。若曲线折返、横竖混合或穿过同色线，请涂完整路径，并在交叉和转弯前后添加至少 3 个引导点；添加顺序不限，程序会沿 Pen 路径自动整理。遮挡处可框选“遮挡 / 图例”。
+4. 需要排除图例或文字时，可在绘图区中点击扫描并复核橙色框；普通图片无需处理。多曲线重合或邻近时，用“Pen 曲线走廊”涂出目标的大致路径，可先画 Pen 再首次选择曲线。若曲线折返、横竖混合或穿过同色线，请涂完整路径，并在交叉和转弯前后添加至少 3 个引导点；添加顺序不限，程序会沿 Pen 路径自动整理。遮挡处可框选“遮挡 / 图例”。
 5. 若出现“智能消歧”，点击“定位并确认分支”，再在高亮候选中点击一次正确曲线；其他低置信度区域仍可拖动或编辑。
 6. 保存曲线；如下一条曲线使用平移后的 Y 轴，可重新标定，已保存曲线的坐标不会改变。最后导出数据。
 
@@ -87,7 +87,7 @@ SciDigitizer is a personal open-source project created by Chongbing Qu (瞿崇�
 - Refines the subpixel stroke center; long occlusions compare linear, regularized smooth, Hermite, and quadratic models, with uncertainty increasing with unsupported distance.
 - Keeps every guide point as an exact tracing constraint and avoids saved same-color curves.
 - Uses an optional Pen corridor locally for ordinary traces. For a hairpin or mixed-direction curve, painting the full route and adding at least three guides in any order selects a continuous 2D path through same-colour crossings; branched results remain explicitly review-required.
-- Conservatively suggests likely in-plot legends or text blocks for review; orange candidates never mask pixels or alter a trace until you accept them.
+- Scans for likely in-plot legends or text blocks on demand, not at startup; orange candidates never mask pixels or alter a trace until you accept them.
 - Moves selected calibration or data points by 1 px with arrow keys, or 0.1 px with `Shift` + arrow keys.
 - Locates the most informative same-color branch ambiguity; one click adds a protected guide and retraces the whole curve globally.
 - Exports CSV, TXT, project JSON, and overlay PNG files.
@@ -104,7 +104,7 @@ SciDigitizer is a personal open-source project created by Chongbing Qu (瞿崇�
 1. Open, drop, or paste an image and confirm its orientation and plot area.
 2. Enter known X/Y tick values and click the matching ticks. Two references per axis are normally enough; add references when you want residual checks and misplaced-point warnings.
 3. Click a clear part of the target curve to sample its colour and trace it, or use a discovered colour chip to start from a reliable point in one click.
-4. If the plot-area summary reports interference suggestions, expand it and review the orange boxes; ordinary images need no action. For overlapping or nearby curves, paint an approximate Pen corridor. For a hairpin, mixed-direction curve, or same-colour crossing, paint the full route and add at least three guides around crossings and turns in any order; the app orders them along the Pen route. For an occlusion, mask the covering object.
+4. To exclude legends or text, request a scan under Plot area and review the orange boxes; ordinary images need no action. For overlapping or nearby curves, paint an approximate Pen corridor; you may paint before the first target pick. For a hairpin, mixed-direction curve, or same-colour crossing, paint the full route and add at least three guides around crossings and turns in any order; the app orders them along the Pen route. For an occlusion, mask the covering object.
 5. If Smart disambiguation appears, choose **Locate and confirm branch**, then click the correct highlighted candidate once. Drag or edit any remaining low-confidence points if needed.
 6. Save the curve. Recalibrate Y for a vertically offset series when needed; saved coordinates remain unchanged. Then export the data.
 

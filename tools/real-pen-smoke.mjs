@@ -16,16 +16,17 @@ const anchors = [[195, 423], [721, 329], [790, 522], [789, 398]].map(([x, y], in
 }));
 const route = [[126, 438], [195, 423], [300, 401], [430, 374], [550, 349], [640, 329],
   [670, 324], [705, 327], [738, 336], [765, 351], [781, 369], [789, 386], [789, 691]];
-function penMask(points, mode) {
+function penMask(points, mode, penWidth = 24) {
   const data = new Uint8Array(width * height);
+  const radius = penWidth / 2;
   for (let index = 1; index < points.length; index += 1) {
     const [x0, y0] = points[index - 1], [x1, y1] = points[index];
     const steps = Math.ceil(Math.hypot(x1 - x0, y1 - y0));
     for (let step = 0; step <= steps; step += 1) {
       const x = x0 + (x1 - x0) * step / steps, y = y0 + (y1 - y0) * step / steps;
-      for (let yy = Math.max(0, Math.floor(y - 12)); yy <= Math.min(height - 1, y + 12); yy += 1) {
-        for (let xx = Math.max(0, Math.floor(x - 12)); xx <= Math.min(width - 1, x + 12); xx += 1) {
-          if (Math.hypot(xx - x, yy - y) <= 12) data[yy * width + xx] = 1;
+      for (let yy = Math.max(0, Math.floor(y - radius)); yy <= Math.min(height - 1, y + radius); yy += 1) {
+        for (let xx = Math.max(0, Math.floor(x - radius)); xx <= Math.min(width - 1, x + radius); xx += 1) {
+          if (Math.hypot(xx - x, yy - y) <= radius) data[yy * width + xx] = 1;
         }
       }
     }
@@ -34,12 +35,16 @@ function penMask(points, mode) {
 }
 const cases = [
   { name: "guides only", mask: null },
-  { name: "local Pen", mask: penMask(route.slice(4), "local") },
-  { name: "full strict Pen", mask: penMask(route, "strict") },
+  ...[12, 24, 40].flatMap(penWidth => [
+    { name: `local Pen ${penWidth}px`, mask: penMask(route.slice(4), "local", penWidth) },
+    { name: `full strict Pen ${penWidth}px`, mask: penMask(route, "strict", penWidth) },
+  ]),
 ];
 const reports = [];
 for (const threshold of [9, 15]) {
-  const options = { rect, anchors, target: { r: 0, g: 0, b: 0 }, threshold, maxJump: 14, maxGap: 24,
+for (const reverseGuides of [false, true]) {
+  const options = { rect, anchors: reverseGuides ? [...anchors].reverse() : anchors,
+    target: { r: 0, g: 0, b: 0 }, threshold, maxJump: 14, maxGap: 24,
     targetStyle: "line", refinementMode: "full", orientationMode: "auto" };
   for (const { name, mask: inclusionMask } of cases) {
     const result = runComputeOperation("trace-line", { ...options, inclusionMask }, image);
@@ -60,11 +65,12 @@ for (const threshold of [9, 15]) {
     assert.ok(vertical.filter(point => point.y < 681).every(point => Math.abs(point.x - 789) <= 3));
     if (inclusionMask?.mode !== "strict") assert.ok(vertical.every(point => Math.abs(point.x - 789) <= 3),
       "must not extend along the bottom axis");
-    reports.push({ name, threshold, points: path.length, verticalPoints: vertical.length,
+    reports.push({ name, threshold, reverseGuides, points: path.length, verticalPoints: vertical.length,
       penEntryBridges: result.parametricDiagnostics.penEntryBridges });
   }
   assert.throws(() => runComputeOperation("trace-line", {
     ...options, inclusionMask: penMask(route.slice(4), "strict"),
   }, image), /二维 Pen 路径不连续/);
+}
 }
 console.log(JSON.stringify(reports, null, 2));

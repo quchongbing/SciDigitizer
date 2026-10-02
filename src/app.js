@@ -24,22 +24,23 @@ import {
   validateCalibration,
   valueStepForPixelNudge,
   valueToPixel,
-} from "./core.js?v=0.20.0-preview.3.21";
+} from "./core.js?v=0.20.0-preview.3.22";
 
 import {
   isDuplicateGuidePoint,
   prepareRestoredTrace,
   prepareTraceOutput,
-} from "./trace-output.js?v=0.20.0-preview.3.21";
+  selectExistingDataPoints,
+} from "./trace-output.js?v=0.20.0-preview.3.22";
 
-import { runComputeOperation } from "./compute-engine.js?v=0.20.0-preview.3.21";
-import { createComputeClient } from "./compute-client.js?v=0.20.0-preview.3.21";
+import { runComputeOperation } from "./compute-engine.js?v=0.20.0-preview.3.22";
+import { createComputeClient } from "./compute-client.js?v=0.20.0-preview.3.22";
 
 import {
   pickRasterImageFile,
   rasterImageDisplayName,
   validateRasterImageFile,
-} from "./image-import.js?v=0.20.0-preview.3.21";
+} from "./image-import.js?v=0.20.0-preview.3.22";
 
 import {
   alignmentCorrectionDegrees,
@@ -47,27 +48,27 @@ import {
   normalizeRotationDegrees,
   renderRotatedImage,
   splitRotationDegrees,
-} from "./image-transform.js?v=0.20.0-preview.3.21";
+} from "./image-transform.js?v=0.20.0-preview.3.22";
 
 import {
   cloneSerializable,
   createEditSession,
   fingerprintImageData,
-} from "./edit-session.js?v=0.20.0-preview.3.21";
+} from "./edit-session.js?v=0.20.0-preview.3.22";
 
 import {
   detectFrameQuadrilateral,
   detectPerspectiveFrame,
   estimateAxisSkew,
   warpPerspectiveRgba,
-} from "./image-geometry.js?v=0.20.0-preview.3.21";
+} from "./image-geometry.js?v=0.20.0-preview.3.22";
 
 import {
   initializeI18n,
   refreshTranslations,
   setLanguage,
   translateMessage,
-} from "./i18n.js?v=0.20.0-preview.3.21";
+} from "./i18n.js?v=0.20.0-preview.3.22";
 
 initializeI18n();
 
@@ -174,7 +175,7 @@ let targetSelectionSequence = 0;
 let traceTaskSequence = 0;
 
 const computeClient = createComputeClient({
-  workerUrl: new URL("src/trace-worker.js?v=0.20.0-preview.3.21", document.baseURI).href,
+  workerUrl: new URL("src/trace-worker.js?v=0.20.0-preview.3.22", document.baseURI).href,
 });
 
 function currentComputeImage() {
@@ -194,7 +195,7 @@ function runBackgroundOperation(operation, payload) {
   const mask = payload.inclusionMask;
   const numericalPayload = { ...payload, inclusionMask: mask ? {
     data: mask.data, columns: mask.columns, rows: mask.rows,
-    allowed: mask.allowed, mode: mask.mode,
+    allowed: mask.allowed, erased: mask.erased, mode: mask.mode,
   } : null };
   return computeClient.run(
     operation,
@@ -639,11 +640,13 @@ function restoreEditableSnapshot(snapshot) {
     targetStyle.dataset.autoDetected = "markers";
     targetStyle.dataset.autoConfidence = String(state.automaticMarkerConfidence);
   }
-  if (!Object.hasOwn(geometry, "traceStale")) {
-    // Old autosaved drafts bypass project-file import. Validate them once as
-    // well, instead of displaying/exporting their old out-of-Pen results as current.
+  {
+    // A saved "current" flag can predate stronger Pen checks. Revalidate both
+    // draft and history restoration with the current contract; preserve an
+    // explicitly pending/stale result, and keep discrete markers unconnected.
     const restored = prepareRestoredTrace(state, {
       orientation: state.traceOrientation, inclusionMask: traceCorridorMask(),
+      markerData: targetStyle.value === "markers",
       width: canvas.width, height: canvas.height, rect: state.plotRect,
     });
     for (const key of ["path", "rawPath", "traceStale", "traceError"]) state[key] = restored[key];
@@ -652,6 +655,7 @@ function restoreEditableSnapshot(snapshot) {
       const corridorMode = series.parameters?.corridorMode ?? (orientation === "parametric" ? "strict" : "local");
       return prepareRestoredTrace({ ...series, parameters: { ...series.parameters, corridorMode } }, {
         orientation, inclusionMask: buildTraceCorridorMask(series.traceCorridorOperations, corridorMode),
+        markerData: series.parameters?.targetStyle === "markers",
         width: canvas.width, height: canvas.height, rect: state.plotRect,
       });
     });
@@ -942,7 +946,22 @@ function buildTraceCorridorMask(operations, mode = "local") {
     if (rgba[index * 4 + 3] < 32) continue;
     data[index] = 1;
   }
-  const mask = prepareInclusionMask(data, canvas.width, canvas.height, mode);
+  // Keep deliberate erasures distinct from gaps between separately painted
+  // strokes. Local endwise extension must not reopen a cut made by the eraser.
+  let erased = null;
+  if (operations.some(operation => operation.mode === "erase")) {
+    const paintCanvas = document.createElement("canvas");
+    paintCanvas.width = canvas.width;
+    paintCanvas.height = canvas.height;
+    const paintContext = paintCanvas.getContext("2d", { willReadFrequently: true });
+    renderTraceCorridorOperations(paintContext, operations.filter(operation => operation.mode !== "erase"));
+    const painted = paintContext.getImageData(0, 0, canvas.width, canvas.height).data;
+    erased = new Uint8Array(data.length);
+    for (let index = 0; index < data.length; index += 1) {
+      if (!data[index] && painted[index * 4 + 3] >= 32) erased[index] = 1;
+    }
+  }
+  const mask = prepareInclusionMask(data, canvas.width, canvas.height, mode, { erased });
   if (!mask) return null;
 
   const displayCanvas = document.createElement("canvas");
@@ -2568,6 +2587,7 @@ function updateUi() {
   const hasTarget = Boolean(state.seedColor);
   $("#trace-primary-action").classList.toggle("has-target", hasTarget);
   $("#trace-refinement-tools").hidden = !hasTarget;
+  $("#trace-assist-tools").hidden = !state.plotRect;
   $("#trace-output-options").hidden = !hasTarget;
   $("#trace-current-actions").hidden = !hasTarget && !state.editingSeriesId;
   $("#save-series").hidden = !state.path.length && !state.series.length;
@@ -3565,7 +3585,7 @@ function syncExclusionSuggestionUi() {
   $("#next-exclusion-suggestion").disabled = state.exclusionSuggestions.length <= 1;
 }
 
-async function scanInterferenceSuggestions({ automatic = false } = {}) {
+async function scanInterferenceSuggestions() {
   if (!state.imageData || !state.plotRect) return [];
   const scanId = ++interferenceScanSequence;
   const plotRect = { ...state.plotRect };
@@ -3587,11 +3607,9 @@ async function scanInterferenceSuggestions({ automatic = false } = {}) {
   delete button.dataset.scanning;
   updateUi();
   draw();
-  if (!automatic) {
-    showToast(suggestions.length
-      ? `发现 ${suggestions.length} 个可能的图例或文字干扰区；请逐个复核后接受`
-      : "未发现足够可靠的图例或文字干扰区；不会自动添加屏蔽");
-  }
+  showToast(suggestions.length
+    ? `发现 ${suggestions.length} 个可能的图例或文字干扰区；请逐个复核后接受`
+    : "未发现足够可靠的图例或文字干扰区；不会自动添加屏蔽");
   return suggestions;
 }
 
@@ -3830,6 +3848,8 @@ async function selectTraceTarget(point) {
     point,
     sampledColor,
   );
+  const replacingTarget = Boolean(state.seedColor);
+  const initialCorridor = replacingTarget ? null : traceCorridorMask();
   const snappedPoint = snapTargetPoint({
     rgba: state.imageData.data,
     width: canvas.width,
@@ -3839,13 +3859,15 @@ async function selectTraceTarget(point) {
     target: sampledColor,
     threshold: preliminaryThreshold,
     exclusions: state.exclusions,
+    inclusionMask: initialCorridor,
   });
-  // Picking a target begins a fresh, simple trace. Pen and strict-guide
-  // constraints are opt-in aids for ambiguities and must never leak from a
-  // previous attempt into an ordinary one-click trace.
-  state.traceCorridorOperations = [];
-  state.draftTraceCorridor = null;
-  invalidateTraceCorridor();
+  // A different target starts fresh. But a Pen deliberately painted before
+  // the FIRST pick belongs to this curve and must constrain that first trace.
+  if (replacingTarget) {
+    state.traceCorridorOperations = [];
+    state.draftTraceCorridor = null;
+    invalidateTraceCorridor();
+  }
   $("#strict-guide").checked = false;
   // A target pick is the ordinary one-click entry point. A forced direction
   // restored from an older draft or previous attempt must not silently turn a
@@ -3853,7 +3875,7 @@ async function selectTraceTarget(point) {
   // choose a manual direction after the first automatic result when needed.
   $("#trace-orientation").value = "auto";
   state.traceOrientation = "horizontal";
-  $("#trace-assist-tools").open = false;
+  $("#trace-assist-tools").open = Boolean(initialCorridor);
   state.seed = createGuideAnchor(snappedPoint);
   state.traceStale = false;
   state.traceError = null;
@@ -3892,6 +3914,7 @@ async function selectTraceTarget(point) {
         target: sampledColor,
         threshold: Number($("#color-threshold").value),
         exclusions: state.exclusions,
+        inclusionMask: initialCorridor,
       });
       if (selectionId !== targetSelectionSequence || state.seed?.anchorId !== selectedAnchorId) return false;
       const inferredStyle = markerInference.detected ? {
@@ -4244,7 +4267,6 @@ canvas.addEventListener("pointerup", (event) => {
       setMode(null);
       showToast("绘图区已设置；下一步点击坐标刻度进行标定");
       commitHistory("手动设置绘图区");
-      void scanInterferenceSuggestions({ automatic: true });
       void scanColorSuggestions();
     }
   } else if (state.mode === "exclude" && state.dragStart) {
@@ -4637,7 +4659,6 @@ function suggestPlotRect({ automatic = false } = {}) {
     setMode(null);
     showToast(`已切换到图框建议 ${state.plotSuggestionIndex + 1}/${state.plotSuggestions.length}`);
     commitHistory("切换绘图区建议");
-    void scanInterferenceSuggestions({ automatic: true });
     void scanColorSuggestions();
     return;
   }
@@ -4679,7 +4700,6 @@ function suggestPlotRect({ automatic = false } = {}) {
     // Initial frame detection is a fresh baseline, not an edit/autosave.
     if (automatic) resetHistorySession();
     else commitHistory("自动选择绘图区");
-    void scanInterferenceSuggestions({ automatic: true });
     void scanColorSuggestions();
   });
 }
@@ -4991,15 +5011,6 @@ for (const selector of ["#noise-density", "#noise-window"]) {
   });
 }
 
-function selectExistingDataPoints(path, count) {
-  if (count >= path.length) return [...path];
-  if (count <= 1) return [{ ...path[0] }];
-  return Array.from({ length: count }, (_, index) => {
-    const sourceIndex = Math.round((index / (count - 1)) * (path.length - 1));
-    return { ...path[sourceIndex] };
-  });
-}
-
 $("#trace-point-count").addEventListener("change", (event) => {
   if (state.computeBusy || state.traceStale) return;
   const pointCount = normalizeTracePointCount(event.target.value);
@@ -5296,6 +5307,7 @@ function buildCurveExportRows() {
     const preserveDiscreteMarkers = series.parameters?.targetStyle === "markers";
     const orientation = resolvedTraceOrientation(series.parameters, series.path);
     const prepared = prepareTraceOutput(series.path, {
+      geometryPath: series.rawPath,
       count: density === "curve" ? null : normalizeTracePointCount(density),
       parameters: series.parameters ?? { samplingMode: "geometry" },
       markerData: preserveDiscreteMarkers, orientation,
@@ -5418,7 +5430,7 @@ $("#export-project").addEventListener("click", async () => {
       calibration: currentCalibrationSnapshot(),
       calibrationBeforeSeriesEdit: state.calibrationBeforeSeriesEdit,
     },
-    extractor: { name: "SciDigitizer", version: "0.20.0-preview.3.21", engine: "parametric-orientation-adaptive-bilingual-occlusion-pattern-gap-ensemble-risk-ranked-review-low-friction-import-responsive-worker-guided-color-centerline-multicurve-core" },
+    extractor: { name: "SciDigitizer", version: "0.20.0-preview.3.22", engine: "parametric-orientation-adaptive-bilingual-occlusion-pattern-gap-ensemble-risk-ranked-review-low-friction-import-responsive-worker-guided-color-centerline-multicurve-core" },
   };
   const saved = await downloadBlob(`${JSON.stringify(project, null, 2)}\n`, "application/json", `${baseName()}-project.json`);
   if (saved) showToast("项目文件已保存，可恢复标定、参数和路径");
