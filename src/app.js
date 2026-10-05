@@ -24,23 +24,23 @@ import {
   validateCalibration,
   valueStepForPixelNudge,
   valueToPixel,
-} from "./core.js?v=0.20.0-preview.3.22";
+} from "./core.js?v=0.20.0-preview.3.23";
 
 import {
   isDuplicateGuidePoint,
   prepareRestoredTrace,
   prepareTraceOutput,
   selectExistingDataPoints,
-} from "./trace-output.js?v=0.20.0-preview.3.22";
+} from "./trace-output.js?v=0.20.0-preview.3.23";
 
-import { runComputeOperation } from "./compute-engine.js?v=0.20.0-preview.3.22";
-import { createComputeClient } from "./compute-client.js?v=0.20.0-preview.3.22";
+import { runComputeOperation } from "./compute-engine.js?v=0.20.0-preview.3.23";
+import { createComputeClient } from "./compute-client.js?v=0.20.0-preview.3.23";
 
 import {
   pickRasterImageFile,
   rasterImageDisplayName,
   validateRasterImageFile,
-} from "./image-import.js?v=0.20.0-preview.3.22";
+} from "./image-import.js?v=0.20.0-preview.3.23";
 
 import {
   alignmentCorrectionDegrees,
@@ -48,27 +48,27 @@ import {
   normalizeRotationDegrees,
   renderRotatedImage,
   splitRotationDegrees,
-} from "./image-transform.js?v=0.20.0-preview.3.22";
+} from "./image-transform.js?v=0.20.0-preview.3.23";
 
 import {
   cloneSerializable,
   createEditSession,
   fingerprintImageData,
-} from "./edit-session.js?v=0.20.0-preview.3.22";
+} from "./edit-session.js?v=0.20.0-preview.3.23";
 
 import {
   detectFrameQuadrilateral,
   detectPerspectiveFrame,
   estimateAxisSkew,
   warpPerspectiveRgba,
-} from "./image-geometry.js?v=0.20.0-preview.3.22";
+} from "./image-geometry.js?v=0.20.0-preview.3.23";
 
 import {
   initializeI18n,
   refreshTranslations,
   setLanguage,
   translateMessage,
-} from "./i18n.js?v=0.20.0-preview.3.22";
+} from "./i18n.js?v=0.20.0-preview.3.23";
 
 initializeI18n();
 
@@ -175,7 +175,7 @@ let targetSelectionSequence = 0;
 let traceTaskSequence = 0;
 
 const computeClient = createComputeClient({
-  workerUrl: new URL("src/trace-worker.js?v=0.20.0-preview.3.22", document.baseURI).href,
+  workerUrl: new URL("src/trace-worker.js?v=0.20.0-preview.3.23", document.baseURI).href,
 });
 
 function currentComputeImage() {
@@ -1141,6 +1141,7 @@ function calibrationPointAt(position) {
 function drawDataPointCircle(point, drawingContext = context, transform = null, {
   active = false,
   color = "#111111",
+  stale = false,
 } = {}) {
   if (!point) return;
   const position = transform ? transform(point) : point;
@@ -1152,6 +1153,19 @@ function drawDataPointCircle(point, drawingContext = context, transform = null, 
   const dragged = active && point.pointId === state.draggedPointId;
   const inferred = point.observed === false || point.occlusionInferred;
   drawingContext.save();
+  if (stale) {
+    // Keep the last successful result as a read-only reference, not as a
+    // current observation. The persistent warning explains these grey rings.
+    drawingContext.strokeStyle = "#7c8591";
+    drawingContext.globalAlpha *= 0.6;
+    drawingContext.lineWidth = transform ? 1.5 : Math.max(1, 1.5 / state.zoom);
+    drawingContext.setLineDash(transform ? [2, 2] : [2 / state.zoom, 2 / state.zoom]);
+    drawingContext.beginPath();
+    drawingContext.arc(position.x, position.y, radius, 0, Math.PI * 2);
+    drawingContext.stroke();
+    drawingContext.restore();
+    return;
+  }
   if (highlighted || dragged) {
     drawingContext.fillStyle = "#ff3154";
     drawingContext.strokeStyle = "#ffffff";
@@ -1504,21 +1518,23 @@ function drawDataPoints(path, {
   transform = null,
   active = false,
   color = "#111111",
+  includeStale = true,
 } = {}) {
   if (!path?.length) return;
-  if (active && state.traceStale) return;
-  for (const point of path) drawDataPointCircle(point, drawingContext, transform, { active, color });
+  const stale = active && state.traceStale;
+  if (stale && !includeStale) return;
+  for (const point of path) drawDataPointCircle(point, drawingContext, transform, { active, color, stale });
 }
 
-function drawPointLayers({ includeAllSaved = false } = {}) {
+function drawPointLayers({ includeAllSaved = false, includeStale = true } = {}) {
   state.series.forEach((series, index) => {
     if (series.id === state.editingSeriesId || !(includeAllSaved || series.visible)) return;
     drawDataPoints(series.path, { color: seriesTargetColor(series, index) });
   });
-  drawDataPoints(state.path, { active: true, color: colorToCss(state.seedColor) });
+  drawDataPoints(state.path, { active: true, color: colorToCss(state.seedColor), includeStale });
 }
 
-function draw({ includeAllSaved = false, includeGuides = true, includeCorridor = true } = {}) {
+function draw({ includeAllSaved = false, includeGuides = true, includeCorridor = true, includeStale = true } = {}) {
   const displayImage = currentDisplayImage();
   if (!displayImage) return;
   context.clearRect(0, 0, canvas.width, canvas.height);
@@ -1588,7 +1604,7 @@ function draw({ includeAllSaved = false, includeGuides = true, includeCorridor =
 
   if (!includeAllSaved) drawCurrentReviewRegion();
   if (!includeAllSaved) drawAmbiguityResolutionTarget();
-  drawPointLayers({ includeAllSaved });
+  drawPointLayers({ includeAllSaved, includeStale });
   if (includeGuides) drawGuideAnchors();
   drawCalibrationPoints();
   if (state.cursor && state.mode && state.mode !== "plot") {
@@ -2565,12 +2581,14 @@ function updateUi() {
       vertical: "纵向追踪",
       parametric: "二维路径追踪",
     }[state.traceOrientation] ?? "横向追踪";
+    const automaticGuidanceText = state.rawPath.some(point => point.automaticGuidance)
+      ? " · 同色竞争已自动局部增强" : "";
     $("#seed-status").textContent = state.computeBusy
       ? `RGB(${r}, ${g}, ${b}) · 正在后台${state.computeBusy === "classify" ? "识别目标" : "追踪曲线"}…`
       : state.traceStale
         ? `RGB(${r}, ${g}, ${b}) · ${guideText} · ${translateMessage("追踪未完成")}`
       : state.path.length
-        ? `RGB(${r}, ${g}, ${b}) · ${styleText} · ${orientationText} · ${guideText} · ${state.path.length} 个数据点`
+        ? `RGB(${r}, ${g}, ${b}) · ${styleText} · ${orientationText} · ${guideText} · ${state.path.length} 个数据点${automaticGuidanceText}`
         : `RGB(${r}, ${g}, ${b}) · ${styleText} · ${guideText} · 等待自动追踪`;
   } else {
     $("#seed-swatch").removeAttribute("style");
@@ -3403,11 +3421,13 @@ async function traceCurrentCurve({ silent = false, refreshHistory = true } = {})
           ? "波动自适应"
           : $("#sampling-mode").value === "geometry" ? "几何自适应" : "等间距";
       const hiddenGuideCount = rawPath.filter((point) => point.anchor && point.occlusionGuide).length;
+      const automaticGuidanceLabel = rawPath.some(point => point.automaticGuidance)
+        ? "同色竞争已自动局部增强" : "";
       const guidanceLabel = nextOrientation === "parametric" ? "二维引导路径" : $("#strict-guide").checked
         ? "同色/遮挡强约束"
         : hiddenGuideCount
-          ? `${hiddenGuideCount} 个遮挡内引导点已自动局部强约束`
-          : "柔性引导";
+          ? [`${hiddenGuideCount} 个遮挡内引导点已自动局部强约束`, automaticGuidanceLabel].filter(Boolean).join(" · ")
+          : automaticGuidanceLabel || "柔性引导";
       const detectedStyleLabels = {
         line: "连续线",
         dashed: "虚线",
@@ -5359,7 +5379,8 @@ $("#export-txt").addEventListener("click", () => {
 });
 
 $("#export-overlay").addEventListener("click", () => {
-  draw({ includeAllSaved: true, includeGuides: false, includeCorridor: false });
+  if (state.computeBusy || state.traceStale || curvesForExport().some(curve => curve.traceStale)) return;
+  draw({ includeAllSaved: true, includeGuides: false, includeCorridor: false, includeStale: false });
   const exportCanvas = document.createElement("canvas");
   exportCanvas.width = canvas.width;
   exportCanvas.height = canvas.height;
@@ -5430,7 +5451,7 @@ $("#export-project").addEventListener("click", async () => {
       calibration: currentCalibrationSnapshot(),
       calibrationBeforeSeriesEdit: state.calibrationBeforeSeriesEdit,
     },
-    extractor: { name: "SciDigitizer", version: "0.20.0-preview.3.22", engine: "parametric-orientation-adaptive-bilingual-occlusion-pattern-gap-ensemble-risk-ranked-review-low-friction-import-responsive-worker-guided-color-centerline-multicurve-core" },
+    extractor: { name: "SciDigitizer", version: "0.20.0-preview.3.23", engine: "parametric-orientation-adaptive-bilingual-occlusion-pattern-gap-ensemble-risk-ranked-review-low-friction-import-responsive-worker-guided-color-centerline-multicurve-core" },
   };
   const saved = await downloadBlob(`${JSON.stringify(project, null, 2)}\n`, "application/json", `${baseName()}-project.json`);
   if (saved) showToast("项目文件已保存，可恢复标定、参数和路径");

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 
 const debuggingPort = process.env.CHROME_DEBUG_PORT ?? "9222";
 const appOrigin = process.env.SCIDITIZER_ORIGIN ?? "http://127.0.0.1:8000";
@@ -691,6 +691,17 @@ await evaluate("document.querySelector('#draw-trace-corridor').click()");
 assert.equal(await evaluate("document.querySelector('#plot-canvas').classList.contains('corridor-mode')"), false);
 await evaluate("document.querySelector('#erase-trace-corridor').click()");
 const beforeInvalidPen = await evaluate(`[...document.querySelectorAll('.data-point-row')].map(row => row.title)`);
+await evaluate(`(() => {
+  const ctx = document.querySelector('#plot-canvas').getContext('2d');
+  window.__staleRings = [];
+  window.__originalPointArc = ctx.arc;
+  ctx.arc = function(...args) {
+    if (this.strokeStyle === '#7c8591' && this.globalAlpha < 1 && this.getLineDash().length) {
+      window.__staleRings.push(args.slice(0, 2));
+    }
+    return window.__originalPointArc.apply(this, args);
+  };
+})()`);
 await dragNaturalPoint(298, 146, 302, 158);
 await waitForComputeIdle();
 assert.match(await evaluate("document.querySelector('#trace-corridor-status').textContent"), /涂画区段内约束/);
@@ -702,6 +713,10 @@ assert.equal(await evaluate("document.querySelector('#point-list').inert"), true
 assert.equal(await evaluate("document.querySelector('#point-list-stale').hidden"), false);
 assert.equal(await evaluate("document.querySelector('#trace-error').parentElement.classList.contains('workspace')"), true);
 assert.equal(await evaluate("document.documentElement.dataset.traceState"), 'stale');
+assert.ok(await evaluate("window.__staleRings.length >= 100"),
+  'a failed retrace must still draw the previous points as grey dashed reference rings');
+assert.match(await evaluate("document.querySelector('#trace-error-history').textContent"), /灰色虚线圆点/);
+assert.equal(await evaluate("document.querySelector('#export-overlay').disabled"), true);
 assert.equal(await evaluate(`(() => {
   const warning = document.querySelector('#trace-error').getBoundingClientRect();
   const plot = document.querySelector('#canvas-scroller').getBoundingClientRect();
@@ -711,6 +726,7 @@ await evaluate("document.querySelector('#undo-action').click()");
 await waitForComputeIdle();
 assert.equal(await evaluate("document.querySelector('#trace-error').hidden"), true);
 assert.equal(await evaluate("document.querySelector('#point-list').inert"), false);
+await evaluate("document.querySelector('#plot-canvas').getContext('2d').arc = window.__originalPointArc; delete window.__originalPointArc; delete window.__staleRings");
 await evaluate("if (document.querySelector('#erase-trace-corridor').classList.contains('active')) document.querySelector('#erase-trace-corridor').click()");
 const exportedCsv = await evaluate(`(async () => {
   let exportedBlob = null;
@@ -796,7 +812,7 @@ const exportedProject = await evaluate(`(async () => {
 })()`);
 const parsedProject = JSON.parse(exportedProject);
 assert.equal(parsedProject.schemaVersion, 8);
-assert.equal(parsedProject.extractor.version, "0.20.0-preview.3.22");
+assert.equal(parsedProject.extractor.version, "0.20.0-preview.3.23");
 assert.equal("calibrationSuggestion" in parsedProject, false);
 assert.deepEqual(parsedProject.calibrationReferenceCounts, { x: 2, y: 2 });
 assert.equal(parsedProject.calibrationSnapEnabled, true);
@@ -1568,7 +1584,100 @@ for (const penWidth of [12, 24]) {
   }),null, "the dense underlying route must obey Pen independently of display density");
   localPenResults.push({penWidth,span,maxReferenceError:Math.max(...errors),points:curve.path.length});
 }
+// Exercise automatic competitive guidance through actual UI actions with the
+// manual constraint left off. Both endpoint guides are on visible target ink,
+// so hidden-guide handling cannot accidentally mask a broken automatic rule.
+await evaluate(`(async () => {
+  const c=document.createElement('canvas');c.width=240;c.height=100;
+  const ctx=c.getContext('2d');ctx.fillStyle='#fff';ctx.fillRect(0,0,240,100);
+  ctx.strokeStyle='#111';ctx.lineWidth=1;ctx.strokeRect(5.5,5.5,229,89);
+  ctx.fillStyle='rgb(220 30 40)';
+  for(let x=6;x<234;x++) {
+    if(x<112||x>188)ctx.fillRect(x,50,1,1);
+    if(x>=60&&x<=200&&x%12<7)ctx.fillRect(x,65,1,1);
+  }
+  const blob=await new Promise(resolve=>c.toBlob(resolve,'image/png'));
+  const transfer=new DataTransfer();transfer.items.add(new File([blob],'same-color-guidance-smoke.png',{type:'image/png'}));
+  const drop=new Event('drop',{bubbles:true,cancelable:true});Object.defineProperty(drop,'dataTransfer',{value:transfer});
+  document.dispatchEvent(drop);
+})()`);
+await waitFor("document.querySelector('#workspace-title').textContent==='same-color-guidance-smoke.png'");
+await waitForComputeIdle();
+assert.equal(await evaluate("document.querySelector('#strict-guide').checked"),false);
+await evaluate(`(() => {
+  document.querySelector('#target-style').value='line';
+  document.querySelector('#target-style').dispatchEvent(new Event('change'));
+})()`);
+await clickAtNaturalPoint('#pick-seed',50,50);
+await waitForComputeIdle();
+for(const x of [10,210]) {
+  await clickAtNaturalPoint('#add-guide',x,50);
+  await waitForComputeIdle();
+}
+assert.equal(await evaluate("document.querySelector('#trace-error').hidden"),true);
+const automaticGuidanceProject=JSON.parse(await downloadText('#export-project'));
+const automaticCurve=automaticGuidanceProject.activeCurve;
+assert.equal(automaticCurve.traceStale,false);
+assert.equal(automaticCurve.path.length,100);
+assert.equal(automaticCurve.parameters.strictGuidance,false);
+assert.ok(automaticCurve.anchors.every(guide=>!guide.occlusionGuide));
+assert.ok(automaticCurve.rawPath.some(p=>p.automaticGuidance));
+assert.ok(automaticCurve.path.some(p=>p.automaticGuidance));
+assert.ok(automaticCurve.rawPath.every(p=>Math.abs(p.y-50)<0.35));
+assert.ok(automaticCurve.rawPath.filter(p=>p.x>112&&p.x<188).every(p=>!p.observed));
+for(const guide of automaticCurve.anchors) assert.ok(automaticCurve.path.some(p=>p.anchorId===guide.anchorId&&p.x===guide.x&&p.y===guide.y));
+await evaluate("document.querySelector('[data-language=\"en\"]').click()");
+assert.match(await evaluate("document.querySelector('#seed-status').textContent"),/same-color guidance strengthened locally/);
+await evaluate("document.querySelector('[data-language=\"zh\"]').click()");
+assert.match(await evaluate("document.querySelector('#seed-status').textContent"),/同色竞争已自动局部增强/);
+assert.equal(await evaluate("document.querySelector('#strict-guide').checked"),false);
 assert.deepEqual(consoleErrors, []);
 
-process.stdout.write(`${JSON.stringify({ beforeSave, afterSave, localPenResults, consoleErrors }, null, 2)}\n`);
+// Optional reproduction against the reported XRD screenshot. The image stays
+// local and is not a repository asset. Default CI covers the geometry in the
+// deterministic compute tests; local runs can also exercise real UI guides.
+let xrdResult = null;
+if (process.env.SCIDIGITIZER_XRD_IMAGE) {
+  const encodedImage = readFileSync(process.env.SCIDIGITIZER_XRD_IMAGE).toString('base64');
+  await evaluate(`(() => {
+    const bytes = Uint8Array.from(atob(${JSON.stringify(encodedImage)}), c => c.charCodeAt(0));
+    const transfer = new DataTransfer();
+    transfer.items.add(new File([bytes], 'reported-xrd.png', { type: 'image/png' }));
+    const drop = new Event('drop', { bubbles: true, cancelable: true });
+    Object.defineProperty(drop, 'dataTransfer', { value: transfer });
+    document.dispatchEvent(drop);
+  })()`);
+  await waitFor("document.querySelector('#workspace-title').textContent === 'reported-xrd.png'");
+  await waitForComputeIdle();
+  assert.equal(await evaluate("document.querySelector('#plot-canvas').width"), 1858);
+  assert.equal(await evaluate("document.querySelector('#plot-canvas').height"), 1477);
+  await evaluate("document.querySelector('#target-style').value = 'line'; document.querySelector('#target-style').dispatchEvent(new Event('change'))");
+  await clickAtNaturalPoint('#pick-seed', 620, 1087);
+  await waitForComputeIdle();
+  for (const guide of [[440,1219], [713,607], [738,353], [1030,878], [1720,742]]) {
+    await clickAtNaturalPoint('#add-guide', ...guide);
+    await waitForComputeIdle();
+    assert.equal(await evaluate("document.querySelector('#trace-error').hidden"), true,
+      `XRD guide ${guide}: ${await evaluate("document.querySelector('#trace-error-message').textContent")}`);
+  }
+  const project = JSON.parse(await downloadText('#export-project'));
+  const curve = project.activeCurve;
+  assert.equal(curve.traceStale, false);
+  assert.equal(curve.parameters.resolvedOrientation, 'horizontal');
+  assert.equal(curve.traceCorridorOperations.length, 0);
+  assert.equal(curve.path.length, 100);
+  assert.equal(curve.anchors.length, 6);
+  assert.ok(Math.max(...curve.rawPath.map(p => p.x)) - Math.min(...curve.rawPath.map(p => p.x)) >= 1400);
+  for (const guide of curve.anchors) assert.ok(curve.path.some(p => p.anchorId === guide.anchorId
+    && p.x === guide.x && p.y === guide.y));
+  xrdResult = { points: curve.path.length, guides: curve.anchors.length, orientation: curve.parameters.resolvedOrientation,
+    rawPoints: curve.rawPath.length, penStrokes: curve.traceCorridorOperations.length };
+  assert.deepEqual(consoleErrors, []);
+}
+
+process.stdout.write(`${JSON.stringify({ beforeSave, afterSave, localPenResults, automaticGuidance: {
+  points: automaticCurve.path.length, guides: automaticCurve.anchors.length,
+  enhancedRawPoints: automaticCurve.rawPath.filter(p=>p.automaticGuidance).length,
+  manualConstraint: automaticCurve.parameters.strictGuidance,
+}, xrdResult, consoleErrors }, null, 2)}\n`);
 socket.close();

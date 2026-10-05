@@ -18,6 +18,7 @@ Optional environment variables:
   CHROME_BIN        Chrome executable path (otherwise discovered locally)
   PYTHON            Python 3 executable (otherwise python3 or python)
   SMOKE_TIMEOUT_MS  Time limit per smoke mode (default: 180000)
+  SCIDIGITIZER_XRD_IMAGE  Optional local path to the reported 1858x1477 XRD PNG
 
 Build the current file bundle first with npm run build:file.`);
   process.exit(0);

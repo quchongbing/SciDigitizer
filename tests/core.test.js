@@ -1638,6 +1638,125 @@ test("guided tracing does not switch between nearby red and orange curves", () =
   assert.ok(path.every((point) => Math.abs(point.y - Math.round(58 - point.x * 0.28)) <= 1));
 });
 
+test("same-color competition automatically strengthens only the ambiguous guided segment", () => {
+  const width = 240, height = 100;
+  const rgba = whiteImage(width, height);
+  const red = { r: 220, g: 30, b: 40 };
+  for (let x = 5; x <= 234; x += 1) {
+    if (x < 112 || x > 188) setPixel(rgba, width, x, 50, red);
+    if (x >= 60 && x <= 200 && x % 12 < 7) setPixel(rgba, width, x, 65, red);
+  }
+  for (const xs of [[50, 210], [10, 50, 210]]) {
+    const anchors = xs.map(x => ({ x, y: 50, anchorId: `guide-${x}` }));
+    const path = traceCurveThroughAnchors({
+      rgba, width, height, rect: { left: 5, top: 5, right: 234, bottom: 94 },
+      anchors, target: red, threshold: 5, maxJump: 14, maxGap: 24,
+      strictGuideCorridor: false, targetStyle: "line",
+    });
+    assert.ok(path.every(point => Math.abs(point.y - 50) < 0.1), "a dashed competitor must not replace the hidden solid line");
+    assert.ok(path.some(point => point.automaticGuidance), "report the locally enhanced guidance");
+    assert.ok(path.filter(point => point.x < 50 || point.x > 210).every(point => !point.automaticGuidance));
+    assert.equal(path.find(point => point.x === 150).observed, false, "hidden pixels remain inferred");
+    for (const anchor of anchors) assert.equal(path.find(point => point.anchorId === anchor.anchorId)?.y, anchor.y);
+  }
+});
+
+test("automatic competition guidance does not flatten a fully visible sharp bend", () => {
+  const width = 240, height = 100;
+  const red = { r: 220, g: 30, b: 40 };
+  const expected = x => x < 28 || x > 220 ? 50 : 50 - 32 * Math.sin((x - 28) / 192 * Math.PI);
+  for (const shortGap of [false, true]) {
+    const rgba = whiteImage(width, height);
+    for (let x = 5; x <= 234; x += 1) {
+      if (!shortGap || x < 130 || x > 133) setPixel(rgba, width, x, Math.round(expected(x)), red);
+      if (x >= 50 && x <= 150) setPixel(rgba, width, x, 62, red);
+    }
+    const path = traceCurveThroughAnchors({
+      rgba, width, height, rect: { left: 5, top: 5, right: 234, bottom: 94 },
+      anchors: [10, 28, 220].map(x => ({ x, y: 50 })),
+      target: red, threshold: 5, maxJump: 8, maxGap: 12, targetStyle: "line",
+    });
+    assert.ok(path.every(point => Math.abs(point.y - expected(point.x)) <= 1), "visible curvature must override a poor guide interpolation");
+    assert.ok(path.every(point => !point.automaticGuidance));
+  }
+});
+
+test("distant same-color labels do not activate automatic guidance", () => {
+  const width = 160, height = 110;
+  const rgba = whiteImage(width, height);
+  const red = { r: 220, g: 30, b: 40 };
+  for (let x = 5; x <= 154; x += 1) {
+    if (x < 70 || x > 76) setPixel(rgba, width, x, 90, red);
+    if (x >= 30 && x <= 115) setPixel(rgba, width, x, 10, red);
+  }
+  const path = traceCurveThroughAnchors({
+    rgba, width, height, rect: { left: 5, top: 4, right: 154, bottom: 104 },
+    anchors: [10, 60, 145].map(x => ({ x, y: 90 })), target: red,
+    threshold: 5, maxJump: 8, maxGap: 12, targetStyle: "line",
+  });
+  assert.ok(path.every(point => point.y === 90));
+  assert.ok(path.every(point => !point.automaticGuidance));
+  assert.equal(path.find(point => point.x === 73).observed, false);
+});
+
+test("confirmed competition continues across a guide inside a hidden interval, then clears", () => {
+  const width = 330, height = 110;
+  const rgba = whiteImage(width, height), red = { r: 220, g: 30, b: 40 };
+  const expected = x => x <= 210 ? 50 : 50 - 25 * Math.sin((x - 210) / 90 * Math.PI);
+  for (let x = 5; x <= 300; x += 1) {
+    if (x < 112 || x > 188) setPixel(rgba, width, x, Math.round(expected(x)), red);
+    if (x >= 60 && x <= 188 && x % 12 < 7) setPixel(rgba, width, x, 65, red);
+  }
+  const options = {
+    rgba, width, height, rect: { left: 5, top: 5, right: 300, bottom: 104 },
+    anchors: [10, 50, 120, 210, 300].map(x => ({ x, y: 50, anchorId: `guide-${x}` })),
+    target: red, threshold: 5, maxJump: 14, maxGap: 24, targetStyle: "line",
+  };
+  const path = traceCurveThroughAnchors(options);
+  assert.ok(path.every(point => Math.abs(point.y - expected(point.x)) <= 1));
+  assert.ok(path.some(point => point.x > 120 && point.x < 188 && point.automaticGuidance));
+  assert.ok(path.filter(point => point.x >= 210).every(point => !point.automaticGuidance),
+    "healthy neighboring bends must remain unconstrained");
+  assert.deepEqual(traceCurveThroughAnchors({ ...options, anchors: [...options.anchors].reverse() }), path,
+    "guide insertion order must not change ordinary-line geometry");
+});
+
+test("automatic competitive guidance leaves single-click and noisy tracing unchanged", () => {
+  const width = 240, height = 100;
+  const rgba = whiteImage(width, height), red = { r: 220, g: 30, b: 40 };
+  for (let x = 5; x <= 234; x += 1) {
+    if (x < 112 || x > 188) setPixel(rgba, width, x, 50, red);
+    if (x >= 60 && x <= 200 && x % 12 < 7) setPixel(rgba, width, x, 65, red);
+  }
+  const options = { rgba, width, height, rect: { left: 5, top: 5, right: 234, bottom: 94 },
+    target: red, threshold: 5, maxJump: 14, maxGap: 24, targetStyle: "line" };
+  const seed = { x: 50, y: 50 };
+  assert.deepEqual(traceCurveThroughAnchors({ ...options, anchors: [seed] }), traceCurve({ ...options, seed }));
+  const noisy = traceCurveThroughAnchors({ ...options, targetStyle: "noisy",
+    anchors: [10, 50, 210].map(x => ({ x, y: 50 })) });
+  assert.ok(noisy.every(point => !point.automaticGuidance));
+  const strict = traceCurveThroughAnchors({ ...options, strictGuideCorridor: true,
+    anchors: [10, 50, 210].map(x => ({ x, y: 50 })) });
+  assert.ok(strict.every(point => point.y === 50 && !point.automaticGuidance),
+    "manual strong guidance retains its own behavior and label");
+});
+
+test("two isolated same-color specks do not establish persistent competition", () => {
+  const width = 240, height = 100;
+  const rgba = whiteImage(width, height), red = { r: 220, g: 30, b: 40 };
+  for (let x = 5; x <= 234; x += 1) {
+    if (x < 112 || x > 188) setPixel(rgba, width, x, 50, red);
+    if (x === 80 || x === 81) setPixel(rgba, width, x, 65, red);
+  }
+  const path = traceCurveThroughAnchors({
+    rgba, width, height, rect: { left: 5, top: 5, right: 234, bottom: 94 },
+    anchors: [10, 50, 210].map(x => ({ x, y: 50, anchorId: `guide-${x}` })),
+    target: red, threshold: 5, maxJump: 14, maxGap: 24, targetStyle: "line",
+  });
+  assert.ok(path.every(point => !point.automaticGuidance));
+  assert.equal(path.filter(point => point.anchor).length, 3);
+});
+
 test("guided tracing keeps a dashed branch instead of switching to a same-color solid branch", () => {
   const width = 130;
   const height = 70;

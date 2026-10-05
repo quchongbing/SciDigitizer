@@ -8,7 +8,7 @@
       content="SciDigitizer — 面向科学论文曲线的本地半自动数值提取工具"
     />
     <title>SciDigitizer</title>
-    <link rel="stylesheet" href="styles.css?v=0.20.0-preview.3.22" />
+    <link rel="stylesheet" href="styles.css?v=0.20.0-preview.3.23" />
   </head>
   <body>
     <header class="topbar">
@@ -521,7 +521,7 @@
           <div>
             <strong id="trace-error-title">追踪未完成</strong>
             <p id="trace-error-message"></p>
-            <small id="trace-error-history">旧结果已保留，但暂不显示圆点或允许导出；可补涂、调整引导点或撤销后重试。</small>
+            <small id="trace-error-history">灰色虚线圆点为上次结果，仅供对照，暂不可编辑或导出；请调整引导点或撤销后重试。</small>
           </div>
           <button id="retry-trace" type="button" class="button button-secondary">重新追踪</button>
         </div>
@@ -611,10 +611,10 @@
       (() => {
         const appScript = document.createElement("script");
         if (window.location.protocol === "file:") {
-          appScript.src = "dist/app-file.js?v=0.20.0-preview.3.22";
+          appScript.src = "dist/app-file.js?v=0.20.0-preview.3.23";
         } else {
           appScript.type = "module";
-          appScript.src = "src/app.js?v=0.20.0-preview.3.22";
+          appScript.src = "src/app.js?v=0.20.0-preview.3.23";
         }
         document.body.appendChild(appScript);
       })();

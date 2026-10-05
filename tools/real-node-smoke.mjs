@@ -84,6 +84,24 @@ const cases = [
     maxJump: 14,
     maxGap: 24,
   },
+  {
+    image: "fig1.png",
+    name: "fig1 red solid with automatic local guidance",
+    anchors: [[100, 203], [250, 197], [370, 238], [500, 296], [540, 312]],
+    expected: [[430, 265], [540, 312]],
+    expectAutomaticGuidance: true,
+    targetStyle: "line", maxJump: 14, maxGap: 24,
+  },
+  {
+    image: "fig1.png",
+    name: "fig1 red solid with sparse legacy guides",
+    anchors: [[209, 199], [548, 313], [274, 204], [256, 199], [128, 203]],
+    // Visible-ink checks precede guide-based estimates in the hidden tail.
+    // These tail values test branch identity, not unrecoverable pixel truth.
+    expected: [[310, 222], [340, 239], [430, 274], [540, 310]],
+    expectAutomaticGuidance: true,
+    targetStyle: "line", maxJump: 14, maxGap: 24,
+  },
 ];
 
 // Match the reported blue-dashed/blue-solid confusion with two partial Pen
@@ -105,6 +123,10 @@ for (const penWidth of [8, 12, 24]) for (const guideCount of [1, 3]) {
     anchors: partialPenCase.anchors.slice(0, guideCount),
   });
 }
+cases.push({
+  ...cases[6], name: "fig1 red solid with partial local Pen and automatic guidance",
+  penStrokes: [[[280, 208], [310, 222], [340, 239]]], penWidth: 20,
+});
 function localPenMask(strokes, width, height, diameter = 20) {
   if (!strokes) return null;
   const data = new Uint8Array(width * height);
@@ -220,6 +242,10 @@ for (const config of cases) {
   const path = result.path;
   const rawMetrics = assertGeometry(path, config, "raw trace");
   assertGuides(path, anchors, `${config.name} / raw trace`);
+  if (config.expectAutomaticGuidance) {
+    assert.ok(path.some(point => point.automaticGuidance), `${config.name}: automatic guidance did not activate`);
+    assert.ok(path.some(point => point.automaticGuidance && !point.observed), `${config.name}: hidden tail was not labelled inferred`);
+  }
   const observed = path.filter((point) => point.observed).length;
   const observedFraction = observed / path.length;
   if (Number.isFinite(config.minimumObservedFraction)) {
@@ -235,6 +261,8 @@ for (const config of cases) {
   const displayed = prepareTraceOutput(path, { ...outputOptions, count: 100 }).path;
   assert.equal(displayed.length, 100, `${config.name}: output count was not retained`);
   assertGuides(displayed, anchors, `${config.name} / displayed`);
+  if (config.expectAutomaticGuidance) assert.ok(displayed.some(point => point.automaticGuidance),
+    `${config.name}: sampling lost the guidance metadata`);
   const displayedMetrics = assertGeometry(displayed, config, "displayed", { interpolate: true });
 
   // Explicit manual axis values, independent of plot-frame detection. A curve

@@ -1,4 +1,4 @@
-import { runComputeOperation } from "./compute-engine.js?v=0.20.0-preview.3.22";
+import { runComputeOperation } from "./compute-engine.js?v=0.20.0-preview.3.23";
 
 let image = null;
 let imageRevision = 0;

@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { traceCurveThroughAnchors, prepareInclusionMask, inclusionMaskAllows } from "../src/core.js";
-import { prepareTraceOutput } from "../src/trace-output.js";
+import { prepareRestoredTrace, prepareTraceOutput } from "../src/trace-output.js";
 import { createComputeClient } from "../src/compute-client.js";
 import { runComputeOperation } from "../src/compute-engine.js";
 import { traceParametricCurve } from "../src/parametric-trace.js";
@@ -108,6 +108,55 @@ test("background compute engine preserves the synchronous line-tracing result", 
   assert.ok(result.path.every((point, index) => (
     point.traceOrientation === "horizontal" && point.parametricOrder === index
   )));
+});
+
+test("steep ordinary peaks with nearby guides do not require a 2D Pen route", () => {
+  const image = whiteImage(240, 200);
+  const target = { r: 57, g: 79, b: 124 };
+  const curveY = x => 178 - 158 * Math.exp(-(((x - 94) / 8) ** 2))
+    - 50 * Math.exp(-(((x - 182) / 26) ** 2));
+  drawParametricStroke(image, t => ({ x: 12 + 214 * t, y: curveY(12 + 214 * t) }), target, 12000, 1);
+  // A separate same-colour legend must not make this ordinary y(x) peak
+  // require a mixed-direction model.
+  fillRect(image, { left: 30, right: 52, top: 30, bottom: 32 }, target);
+  const anchors = [30, 84, 87, 182, 220].map((x, index) => ({
+    x, y: curveY(x), anchorId: `peak-${index}`,
+  }));
+  const options = {
+    rect: { left: 10, top: 10, right: 230, bottom: 190, width: 221, height: 181 },
+    anchors, target, threshold: 5, maxJump: 20, maxGap: 12,
+    targetStyle: "line", refinementMode: "full", inclusionMask: null,
+  };
+  const expected = runComputeOperation("trace-line", { ...options, orientationMode: "horizontal" }, image);
+  for (const guides of [anchors, [...anchors].reverse()]) {
+    const result = runComputeOperation("trace-line", { ...options, anchors: guides, orientationMode: "auto" }, image);
+    assert.equal(result.orientation, "horizontal");
+    assert.deepEqual(result.path, expected.path);
+    for (const guide of guides) assert.ok(result.path.some(p => p.anchorId === guide.anchorId
+      && p.x === guide.x && p.y === guide.y));
+    const sampled = prepareTraceOutput(result.path, {
+      guides, count: 100, orientation: result.orientation, rect: options.rect,
+      width: image.width, height: image.height,
+    }).path;
+    assert.equal(sampled.length, 100);
+    assert.ok(sampled.some(p => p.x > 210), "the descending side and far tail remain available");
+  }
+});
+
+test("a genuinely disconnected unpainted 2D route does not ask users to repair a Pen", () => {
+  const image = whiteImage(180, 160);
+  const anchors = [{ x: 20, y: 45 }, { x: 120, y: 35 }, { x: 120, y: 130 }]
+    .map((point, index) => ({ ...point, anchorId: `disconnected-${index}` }));
+  assert.throws(() => runComputeOperation("trace-line", {
+    rect: { left: 5, top: 5, right: 174, bottom: 154, width: 170, height: 150 },
+    anchors, target: { r: 10, g: 10, b: 10 }, threshold: 5,
+    maxJump: 8, maxGap: 3, targetStyle: "line", orientationMode: "auto",
+    inclusionMask: null,
+  }, image), error => {
+    assert.match(error.message, /无法连续连接全部引导点/);
+    assert.doesNotMatch(error.message, /Pen|补涂/);
+    return true;
+  });
 });
 
 test("automatic line tracing switches to the vertical frame for a near-vertical curve", () => {
@@ -1158,6 +1207,74 @@ test("unreconnected enlarged dashed fragments fail closed instead of claiming a 
   assert.equal(result.topologyConfidence, 0);
   assert.equal(result.reason, "pattern-reconnection-failed");
   assert.ok(result.patternedComponentCount >= 3);
+});
+
+test("automatic same-color guidance survives both scan directions, Pen, sampling and restore", () => {
+  const target = { r: 220, g: 30, b: 40 };
+  for (const vertical of [false, true]) for (const scope of [null, "local", "strict"]) {
+    const image = whiteImage(vertical ? 100 : 240, vertical ? 240 : 100);
+    const point = (x, y) => vertical ? { x: y, y: x } : { x, y };
+    const paint = (x, y) => { const p = point(x, y); setPixel(image, p.x, p.y, target); };
+    for (let x = 5; x <= 234; x += 1) {
+      if (x < 112 || x > 188) paint(x, 50);
+      if (x >= 60 && x <= 200 && x % 12 < 7) paint(x, 65);
+      if (x >= 60 && x <= 200) paint(x, 5); // remote same-color annotation, excluded by Pen
+    }
+    const data = new Uint8Array(image.width * image.height);
+    if (scope) for (let x = scope === "local" ? 80 : 5; x <= (scope === "local" ? 104 : 234); x += 1) {
+      for (let y = scope === "local" ? 47 : 45; y <= (scope === "local" ? 53 : 70); y += 1) {
+        const p = point(x, y); data[p.y * image.width + p.x] = 1;
+      }
+    }
+    const inclusionMask = scope ? prepareInclusionMask(data, image.width, image.height, scope) : null;
+    const rect = { left: 5, top: 5, right: image.width - 6, bottom: image.height - 6,
+      width: image.width - 10, height: image.height - 10 };
+    const anchors = [10.25, 50.25, 210.25].map((x, index) => ({ ...point(x, 50.125), anchorId: `guide-${index}`, userGuided: true }));
+    const orientation = vertical ? "vertical" : "horizontal";
+    const options = { rect, anchors, target, threshold: 5, maxJump: 14, maxGap: 24,
+      targetStyle: "line", strictGuideCorridor: false, refinementMode: "full", orientationMode: orientation, inclusionMask };
+    const before = JSON.stringify(anchors);
+    const result = runComputeOperation("trace-line", options, image);
+    assert.equal(result.orientation, orientation);
+    assert.ok(result.path.some(p => p.automaticGuidance), `${orientation}/${scope}: expected a local correction`);
+    const hidden = result.path.filter(p => (vertical ? p.y : p.x) > 112 && (vertical ? p.y : p.x) < 188);
+    assert.ok(hidden.length > 60 && hidden.every(p => !p.observed && p.confidence <= 0.55));
+    const corridor = { rect, inclusionMask, width: image.width, height: image.height, guides: anchors, orientation };
+    for (const count of [20, 100, 200]) for (const samplingMode of ["uniform", "geometry"]) {
+      const output = prepareTraceOutput(result.path, { ...corridor, count, parameters: { samplingMode } });
+      assert.equal(output.path.length, count);
+      assert.ok(output.path.some(p => p.automaticGuidance), "sampled project metadata must retain the automatic correction");
+      for (const p of output.path) {
+        assert.ok(Math.abs((vertical ? p.x : p.y) - 50) < 0.35, "output switched to the dashed competitor");
+        if (!p.anchor) assert.ok(inclusionMaskAllows(inclusionMask, image.width, p.x, p.y));
+      }
+      for (const guide of anchors) assert.ok(output.path.some(p => p.anchorId === guide.anchorId && p.x === guide.x && p.y === guide.y));
+      const restored = prepareRestoredTrace(JSON.parse(JSON.stringify({ ...output, anchors })), corridor);
+      assert.equal(restored.traceStale, false);
+      assert.deepEqual(restored.path, output.path, "restoration must preserve coordinates and guidance flags");
+    }
+    assert.equal(JSON.stringify(anchors), before, "automatic enhancement must not rewrite user guides");
+    assert.equal(options.strictGuideCorridor, false, "automatic enhancement must not change the manual setting");
+  }
+});
+
+test("automatic guidance cannot bridge an explicitly erased Pen band", () => {
+  const image = whiteImage(240, 100), target = { r: 220, g: 30, b: 40 };
+  const data = new Uint8Array(image.width * image.height), erased = new Uint8Array(data.length);
+  for (let x = 5; x <= 234; x += 1) {
+    if (x < 112 || x > 188) setPixel(image, x, 50, target);
+    if (x >= 60 && x <= 200 && x % 12 < 7) setPixel(image, x, 65, target);
+    for (let y = 45; y <= 70; y += 1) {
+      if (x === 150) erased[y * image.width + x] = 1;
+      else data[y * image.width + x] = 1;
+    }
+  }
+  assert.throws(() => runComputeOperation("trace-line", {
+    rect: { left: 5, top: 5, right: 234, bottom: 94, width: 230, height: 90 },
+    anchors: [10, 50, 210].map(x => ({ x, y: 50 })), target, threshold: 5, maxJump: 14, maxGap: 24,
+    targetStyle: "line", strictGuideCorridor: false, orientationMode: "horizontal",
+    inclusionMask: prepareInclusionMask(data, image.width, image.height, "strict", { erased }),
+  }, image), error => error.code === "PEN_OUTSIDE" || error.code === "PEN_NO_VALID_PATH");
 });
 
 test("compute client uses an explicit synchronous fallback without Worker support", async () => {

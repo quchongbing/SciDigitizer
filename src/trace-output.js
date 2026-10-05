@@ -8,7 +8,7 @@ import {
   resamplePixelPathAdaptive,
   resamplePixelPathGeometry,
   resamplePixelPathRoughness,
-} from "./core.js?v=0.20.0-preview.3.22";
+} from "./core.js?v=0.20.0-preview.3.23";
 
 function outputError(code, message) {
   const error = new Error(message);

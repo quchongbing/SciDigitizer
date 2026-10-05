@@ -7,10 +7,10 @@ import {
   preferOrdinaryTraceFallback,
   refinePathCenterline,
   traceCurveThroughAnchors,
-} from "./core.js?v=0.20.0-preview.3.22";
+} from "./core.js?v=0.20.0-preview.3.23";
 
-import { traceParametricCurve } from "./parametric-trace.js?v=0.20.0-preview.3.22";
-import { prepareTraceOutput } from "./trace-output.js?v=0.20.0-preview.3.22";
+import { traceParametricCurve } from "./parametric-trace.js?v=0.20.0-preview.3.23";
+import { prepareTraceOutput } from "./trace-output.js?v=0.20.0-preview.3.23";
 
 function requireImage(image) {
   if (
@@ -238,7 +238,7 @@ function guideMinimumTreeLength(anchors) {
   return length;
 }
 
-function guidesRequireMixedDirectionPath(anchors, rect) {
+function guidesSuggestMixedDirectionPath(anchors, rect) {
   if ((anchors?.length ?? 0) < 3 || !rect) return false;
   const xValues = anchors.map((anchor) => anchor.x);
   const horizontalSpan = Math.max(...xValues) - Math.min(...xValues);
@@ -249,6 +249,17 @@ function guidesRequireMixedDirectionPath(anchors, rect) {
     && Math.abs(right.y - left.y) >= Math.max(20, rect.height * 0.12)
   )));
   return nearVerticalPair;
+}
+
+function scanLineConnectsGuides(result, anchors, maxJump) {
+  if (!result.path?.length || !retainsEveryGuide(result.path, anchors)) return false;
+  // Guide geometry is only a hint. A steep y(x) peak can have close X guides
+  // far apart in Y and still have a continuous, well-supported scan-line path.
+  // Refinement can move both ends of a step; allow twice the scan jump budget,
+  // but reject giant jumps between unrelated branches and dropped guide IDs.
+  if (maximumPathStep(result.path) > Math.max(8, Number(maxJump ?? 8) * 2)) return false;
+  return result.path.filter(point => point.observed && !point.anchor).length
+    >= result.path.length * 0.5;
 }
 
 function ambiguityFraction(path) {
@@ -355,9 +366,9 @@ function traceLine(image, payload) {
     ? horizontalResult.path.filter((point) => point.observed).length / horizontalResult.path.length
     : 0;
   const horizontalAmbiguity = ambiguityFraction(horizontalResult.path);
-  const requireGuided2d = guidesRequireMixedDirectionPath(tracePayload.anchors, tracePayload.rect);
-  const guideAssisted2d = requireGuided2d || (Boolean(tracePayload.inclusionMask?.data)
-    && (tracePayload.anchors?.length ?? 0) >= 3);
+  const mixedDirectionHint = guidesSuggestMixedDirectionPath(tracePayload.anchors, tracePayload.rect);
+  const horizontalConnectsGuides = mixedDirectionHint
+    && scanLineConnectsGuides(horizontalResult, tracePayload.anchors, tracePayload.maxJump);
   const hasPen = Boolean(tracePayload.inclusionMask?.data);
   // A healthy ordinary curve returns immediately. The transposed fallback is
   // only evaluated when the x-column model fails or the user supplies a Pen,
@@ -366,7 +377,7 @@ function traceLine(image, payload) {
     horizontalCoverage >= 0.78
     && horizontalObserved >= 0.68
     && horizontalAmbiguity < 0.42
-    && !guideAssisted2d
+    && (!mixedDirectionHint || horizontalConnectsGuides)
     && !hasPen
     && retainsEveryGuide(horizontalResult.path, tracePayload.anchors)
   ) return horizontalResult;
@@ -391,14 +402,21 @@ function traceLine(image, payload) {
       && verticalPen.span >= horizontalPen.span * 0.85;
     const betterPenTrace = hasPen && verticalPen.score > horizontalPen.score + 0.035
       && verticalPen.support >= horizontalPen.support * 0.9;
+    const verticalConnectsGuides = mixedDirectionHint
+      && scanLineConnectsGuides(verticalResult, tracePayload.anchors, tracePayload.maxJump);
     const chooseVertical = retainsEveryGuide(verticalResult.path, tracePayload.anchors)
       && (!retainsEveryGuide(horizontalResult.path, tracePayload.anchors)
         || strongerVerticalPenSupport
         || betterPenTrace
-        || (!hasPen && verticalCoverage >= horizontalCoverage + 0.12 && verticalScore >= horizontalScore + 0.07));
+        || (!hasPen && mixedDirectionHint && verticalConnectsGuides && !horizontalConnectsGuides)
+        || (!hasPen && !mixedDirectionHint
+          && verticalCoverage >= horizontalCoverage + 0.12 && verticalScore >= horizontalScore + 0.07));
     if (chooseVertical) selected = verticalResult;
   }
 
+  const requireGuided2d = mixedDirectionHint
+    && !scanLineConnectsGuides(selected, tracePayload.anchors, tracePayload.maxJump);
+  const guideAssisted2d = requireGuided2d || (hasPen && (tracePayload.anchors?.length ?? 0) >= 3);
   const selectedAmbiguity = ambiguityFraction(selected.path);
   const shouldInspectParametric = horizontalAmbiguity >= 0.42
     || !retainsEveryGuide(selected.path, tracePayload.anchors)
@@ -446,12 +464,13 @@ function traceLine(image, payload) {
     && parametricLength >= guideLength * 0.9
     && parametricLength <= guideLength * 4;
   if (chooseSimpleParametric || chooseGuidedParametric) return parametric;
-  // When the guides themselves clearly show both a broad horizontal span and
-  // a near-vertical section, returning a scan-line fallback is demonstrably
-  // wrong. Fail closed so the UI never leaves plausible-looking points on an
-  // unrelated same-colour line outside an incomplete Pen stroke.
+  // Fail closed only when neither scan-line frame can continuously represent
+  // the guides and the 2D graph also failed. A high slope alone is not failure.
+  // Do not claim the user painted a Pen when none is active.
   if (requireGuided2d) {
-    throw new Error("二维 Pen 路径不连续；请沿目标曲线补涂完整走廊，并在转弯或交叉两侧保留引导点");
+    throw new Error(hasPen
+      ? "二维 Pen 路径不连续；请沿目标曲线补涂完整走廊，并在转弯或交叉两侧保留引导点"
+      : "无法连续连接全部引导点；请检查引导点位置，并在转弯或交叉两侧补充引导点");
   }
   return requireCandidate(selected);
 }

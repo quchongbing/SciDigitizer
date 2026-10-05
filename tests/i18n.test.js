@@ -31,6 +31,12 @@ test("static interface labels translate to concise English", () => {
     "A repeated marker series was recognized from one click. Review the centers; add guides only if another same-color marker series is nearby.",
   );
   assert.equal(translateMessage("智能消歧", "en"), "Smart disambiguation");
+  assert.equal(translateMessage("同色竞争已自动局部增强", "en"), "same-color guidance strengthened locally");
+  const noPenFailure = translateMessage("无法连续连接全部引导点；请检查引导点位置，并在转弯或交叉两侧补充引导点", "en");
+  assert.match(noPenFailure, /Cannot connect all guide points/);
+  assert.doesNotMatch(noPenFailure, /Pen|\p{Script=Han}/u);
+  assert.match(translateMessage("灰色虚线圆点为上次结果，仅供对照，暂不可编辑或导出；请调整引导点或撤销后重试。", "en"),
+    /Grey dashed circles show the previous result/);
   assert.equal(translateMessage("定位并确认分支", "en"), "Locate and confirm branch");
   assert.equal(translateMessage("选择图像", "zh"), "选择图像");
 });

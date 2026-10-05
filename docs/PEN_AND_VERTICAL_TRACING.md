@@ -9,6 +9,29 @@ or starting the next curve clears the previous curve's Pen.
 也可先展开可选辅助、画 Pen，再首次选择曲线，笔迹不会被清空。
 重新选择另一目标或开始下一条曲线时，仍会清除上一条曲线的 Pen。
 
+## Same-color branches / 同色分支
+
+For a solid line that switches to a same-color branch, place guides before and
+after the ambiguous section. The app strengthens guidance locally when nearby
+competition persists, and continues through the adjacent hidden section until
+reliable target ink returns. The manual constraint checkbox stays unchanged.
+Single-click tracing and the existing dashed-line fingerprint logic are retained.
+
+实线串到同色分支时，在歧义区段前后加引导点。程序检测到持续的邻近竞争后，
+会自动局部增强引导，并在相邻遮挡区延续，直到目标像素稳定恢复。不会自动
+勾选强约束开关；单点提取与已有虚线指纹逻辑保持不变。
+
+The target summary reports “same-color guidance strengthened locally”. Guides
+keep their coordinates. Hidden points remain inferred, not measured; add a guide
+near a hidden bend if needed. Pen limits still apply to tracing, sampling and export.
+This assistance does not reconstruct information missing from the image.
+
+结果摘要会显示“同色竞争已自动局部增强”。手工引导点不移动，遮挡补点仍为
+推断点；隐藏的弯曲处必要时再加引导点。追踪、采样和导出仍遵守 Pen 范围。
+此辅助不能恢复原图中已丢失的信息。
+
+## Pen interaction / Pen 配合
+
 Erased pixels stay excluded even when a cut splits a local stroke into separate
 parts; they are not treated as an unpainted extension gap. Repaint to restore
 those pixels. Clearing or completely erasing the Pen restores unrestricted
@@ -75,17 +98,25 @@ The UI identifies settings that do not apply to 2D tracing.
 ## Failed tracing / 追踪失败
 
 An incompatible Pen or guide configuration retains the previous coordinates,
-but hides obsolete circles and blocks editing/export. A persistent warning above
-the canvas identifies the failure; strict-Pen conflicts name guides outside the
+shown as grey dashed circles for reference only, and blocks editing/export. A
+persistent warning above the canvas identifies the failure; strict-Pen conflicts name guides outside the
 painted area. Extend the painted route, adjust a guide,
 or undo the change, then retry. Small raster-edge corrections are marked as
 inferred, not observed. Changing point count or export density retains guides
 and validates the resulting points against that curve's Pen.
 
-Pen 或引导点约束冲突时，会保留上一次坐标，但隐藏失效的圆点并暂停编辑和导出。
+Pen 或引导点约束冲突时，会保留上一次坐标，并以灰色虚线圆点显示供对照，暂停编辑和导出。
 画布上方会持续显示失败原因；严格 Pen 模式会指出未被涂画覆盖的引导点编号。
 请补涂路径、调整引导点，或撤销修改后重试。少量像素边缘修正会标为推断点，
 不会冒充直接观测。修改点数及导出密度时，也会保留引导点并检查该曲线的 Pen。
+
+A steep section alone does not require 2D tracing. In Auto mode, a continuous
+scan-line path that retains the guides is still accepted; a 2D route is required
+only when neither scan direction connects them with sufficient image support. Pen-specific
+failure instructions appear only when a painted Pen is active.
+
+陡峭段本身不意味着必须使用二维追踪。自动模式仍接受能连续连接引导点的扫描线结果；
+两个扫描方向都无法连续表示时，才要求二维路径。只有实际使用 Pen 时，才显示补涂提示。
 
 Continuous paths are checked cell by cell, independently of output point count;
 even a one-pixel eraser cut cannot be skipped by sparse sampling. Sparse output

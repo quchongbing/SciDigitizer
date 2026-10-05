@@ -1,4 +1,4 @@
-import { skeletonizeMask, buildMaskGraph } from "./mask-geometry.js?v=0.20.0-preview.3.22";
+import { skeletonizeMask, buildMaskGraph } from "./mask-geometry.js?v=0.20.0-preview.3.23";
 
 export function clamp(value, minimum, maximum) {
   return Math.max(minimum, Math.min(maximum, value));
@@ -2244,6 +2244,112 @@ function hermiteGuideY(start, end, entrySlope, exitSlope, x) {
     + h11 * span * exitSlope;
 }
 
+function guidedColumnCandidates(options, x, ignoreInclusion = false) {
+  const key = ignoreInclusion ? `unmasked-${x}` : x;
+  if (options.guideCandidateCache?.has(key)) return options.guideCandidateCache.get(key);
+  const candidates = clusterColumnCandidates(
+    options.rgba, options.width, x, options.rect.top, options.rect.bottom,
+    options.target, options.threshold, options.exclusions, ignoreInclusion ? null : options.inclusionMask,
+  );
+  options.guideCandidateCache?.set(key, candidates);
+  return candidates;
+}
+
+/** Find persistent, nearby competition, not remote legends or isolated pixels.
+ * The profile is bounded by two user guides. Unsupported spans beside a
+ * confirmed split stay constrained until reliable target ink reappears.
+ */
+function guideCompetitionProfile(options, start, end, context) {
+  const span = end.x - start.x;
+  if (span < 12) return null;
+  const tolerance = clamp(span * 0.045, 4, 14);
+  const slope = (end.y - start.y) / span;
+  const guideY = x => hermiteGuideY(
+    start, end, context.entrySlope ?? slope, context.exitSlope ?? slope, x,
+  );
+  const step = Math.max(1, Math.floor(span / 96));
+  const searchRadius = Math.max(24, Math.min(56, options.maxJump * 3));
+  const samples = [];
+  const profileForColumns = columns => {
+    const blockedPrefix = new Uint32Array(columns.length + 1);
+    for (let x = 0; x < columns.length; x += 1) blockedPrefix[x + 1] = blockedPrefix[x] + (columns[x] ? 0 : 1);
+    return {
+      columns, tolerance, guideY, searchRadius,
+      allowsBridge: (fromX, toX) => blockedPrefix[toX] === blockedPrefix[fromX + 1],
+    };
+  };
+  for (let x = start.x + 1; x < end.x; x += step) {
+    const prediction = guideY(x);
+    const candidates = guidedColumnCandidates(options, x);
+    const nearest = candidates.reduce((best, candidate) => (
+      !best || Math.abs(candidate.y - prediction) < Math.abs(best.y - prediction) ? candidate : best
+    ), null);
+    const supported = Boolean(nearest && Math.abs(nearest.y - prediction) <= tolerance);
+    // Pen may have removed the competing branch already. Unmasked pixels are
+    // used only to recognize competition, never as tracing candidates.
+    const competitionCandidates = options.inclusionMask?.columns[x] && supported
+      ? guidedColumnCandidates(options, x, true) : candidates;
+    const competing = supported && competitionCandidates.some(candidate => (
+      Math.abs(candidate.y - nearest.y) >= Math.max(3, (candidate.thickness + nearest.thickness) / 2)
+      && Math.abs(candidate.y - prediction) <= searchRadius
+    ));
+    // A lone pixel cluster can still be the surviving wrong branch. Treat a
+    // return to the target as reliable only close to the guide trajectory;
+    // the boundary scan below also requires this evidence to persist.
+    const reliable = supported && !competing
+      && Math.abs(nearest.y - prediction) <= Math.max(2, tolerance * 0.5);
+    samples.push({ x, supported, competing, reliable, occupied: candidates.length > 0 });
+  }
+  const competingIndices = samples.flatMap((sample, index) => sample.competing ? [index] : []);
+  const persistentCompetition = competingIndices.length >= 3
+    && samples[competingIndices.at(-1)].x - samples[competingIndices[0]].x >= Math.max(6, step * 3)
+    && samples.filter(sample => sample.supported).length >= 3;
+  const reliableRun = Math.max(3, Math.ceil(12 / step));
+  const boundary = (index, direction) => {
+    let run = 0;
+    for (let cursor = index + direction; cursor >= 0 && cursor < samples.length; cursor += direction) {
+      run = samples[cursor].reliable ? run + 1 : 0;
+      if (run >= reliableRun) return cursor - direction * reliableRun;
+    }
+    return direction < 0 ? 0 : samples.length - 1;
+  };
+  // A confirmed split can hide the intended colour completely in the next
+  // interval. Do not reinterpret the surviving branch as the target merely
+  // because it is now the only candidate. Continuation is limited to adjacent
+  // guide-bounded intervals, and is cleared by reliable unambiguous ink.
+  const continuation = context.competitionContinuation
+    && samples.filter(sample => !sample.supported).length >= samples.length * 0.5
+    && samples.filter(sample => !sample.supported && sample.occupied).length
+      >= Math.max(3, samples.filter(sample => sample.occupied).length * 0.5);
+  if (!persistentCompetition && !continuation) return null;
+  if (!persistentCompetition) {
+    const right = boundary(-1, 1);
+    if (right < 0) return null;
+    const columns = new Uint8Array(options.width);
+    for (let x = start.x + 1; x <= Math.min(end.x - 1, samples[right].x + step); x += 1) columns[x] = 1;
+    return profileForColumns(columns);
+  }
+
+  const groups = [];
+  const maximumGap = Math.max(2, Math.ceil(Math.min(24, options.maxGap + 1) / step));
+  for (const index of competingIndices) {
+    const previous = groups.at(-1);
+    if (previous && index - previous.at(-1) <= maximumGap) previous.push(index);
+    else groups.push([index]);
+  }
+  const columns = new Uint8Array(options.width);
+  let constrained = 0;
+  for (const group of groups) {
+    if (group.length < 3) continue;
+    const left = boundary(group[0], -1), right = boundary(group.at(-1), 1);
+    for (let x = Math.max(start.x + 1, samples[left].x - step); x <= Math.min(end.x - 1, samples[right].x + step); x += 1) {
+      if (!columns[x]) constrained += 1;
+      columns[x] = 1;
+    }
+  }
+  return constrained ? profileForColumns(columns) : null;
+}
+
 function globalGuidedSegment(options, start, end, {
   entrySlope = null,
   exitSlope = null,
@@ -2274,18 +2380,24 @@ function globalGuidedSegment(options, start, end, {
     const isEnd = x === rightX;
     const candidates = isEnd
       ? [{ y: rightAnchor.y, thickness: 1, distance: 0, anchor: true }]
-      : clusterColumnCandidates(
-        options.rgba,
-        options.width,
-        x,
-        options.rect.top,
-        options.rect.bottom,
-        options.target,
-        options.threshold,
-        options.exclusions,
-        options.inclusionMask,
-      );
+      : guidedColumnCandidates(options, x);
     if (!candidates.length) continue;
+
+    // A narrow Pen that isolates one visible branch is stronger evidence than
+    // sparse-guide interpolation. Do not reject that selected ink merely
+    // because a hidden guide describes an approximate trajectory. A lone
+    // surviving branch with no Pen-excluded competitor is not this case.
+    const penSelectsBranch = options.guideCompetition && options.inclusionMask?.columns[x]
+      && candidates.length === 1 && !isEnd
+      && guidedColumnCandidates(options, x, true).some(candidate => (
+        Math.abs(candidate.y - candidates[0].y) >= Math.max(3, (candidate.thickness + candidates[0].thickness) / 2)
+        && Math.abs(candidate.y - candidates[0].y) <= options.guideCompetition.searchRadius
+        && !inclusionMaskAllows(options.inclusionMask, options.width, x, candidate.y)
+      ));
+    const automaticGuidance = Boolean(options.guideCompetition?.columns[x] && !penSelectsBranch);
+    const guideY = options.strictGuideCorridor || preserveTrajectoryHistory || automaticGuidance
+      ? hermiteGuideY({ ...leftAnchor, x: leftX }, { ...rightAnchor, x: rightX }, safeEntrySlope, safeExitSlope, x)
+      : leftAnchor.y + (x - leftX) / horizontalSpan * (rightAnchor.y - leftAnchor.y);
 
     const nextStates = [];
     for (const candidate of candidates) {
@@ -2297,12 +2409,16 @@ function globalGuidedSegment(options, start, end, {
           previous,
           { x, y: candidate.y },
         );
+        const automaticBridge = Boolean(options.guideCompetition
+          && (automaticGuidance || (candidate.anchor && options.guideCompetition.columns[x - 1]))
+          && options.guideCompetition.allowsBridge(previous.x, x));
         // Strict mode lets an explicit anchor bridge a gap longer than the
         // ordinary pixel evidence allows. Flexible mode falls back to the
         // bidirectional guided segment, which still retains both anchors.
         if (
           dx > options.maxGap + 1
           && !(candidate.anchor && options.strictGuideCorridor)
+          && !automaticBridge
           && !occlusionBridge
         ) continue;
         if (!inclusionBridgeAllowed(options.inclusionMask, options.width, previous, { x, y: candidate.y })) continue;
@@ -2323,7 +2439,7 @@ function globalGuidedSegment(options, start, end, {
         ) continue;
         if (
           Math.abs(candidate.y - predictedY) > options.maxJump * (noisyMode ? 1.6 : 1) * Math.max(1, dx)
-          && !(candidate.anchor && options.strictGuideCorridor)
+          && !(candidate.anchor && (options.strictGuideCorridor || automaticBridge))
         ) continue;
         const curvature = Math.abs(slope - recentSlope);
         const trendDeparture = Math.abs(slope - trendSlope);
@@ -2331,22 +2447,12 @@ function globalGuidedSegment(options, start, end, {
         const thicknessCost = candidateThicknessPenalty(candidate, options.targetStyle, 0.75);
         const styleCost = candidate.anchor ? 0 : patternedLinePenalty(options, candidate, x, slope);
         if (!Number.isFinite(styleCost)) continue;
-        const guideFraction = (x - leftX) / horizontalSpan;
-        const guideY = options.strictGuideCorridor || preserveTrajectoryHistory
-          ? hermiteGuideY(
-              { ...leftAnchor, x: leftX },
-              { ...rightAnchor, x: rightX },
-              safeEntrySlope,
-              safeExitSlope,
-              x,
-            )
-          : leftAnchor.y + guideFraction * (rightAnchor.y - leftAnchor.y);
         const guideDeviation = Math.abs(candidate.y - guideY);
         // A same-color neighboring branch should be treated as "no target
         // pixels here", not as evidence that the requested curve jumped. The
         // missing section will be marked inferred and interpolated between the
         // two anchors. Add more anchors for strongly curved intervals.
-        if (options.strictGuideCorridor && !candidate.anchor && guideDeviation > guideTolerance) continue;
+        if ((options.strictGuideCorridor || automaticGuidance) && !candidate.anchor && guideDeviation > guideTolerance) continue;
         const cost = previous.cost
           + colorCost * 1.4
           + thicknessCost
@@ -2360,7 +2466,7 @@ function globalGuidedSegment(options, start, end, {
           // Strict mode rejects remote same-color branches and favors the
           // anchor corridor. Flexible mode still passes through every anchor,
           // but does not linearize naturally curved intervals between them.
-          + (options.strictGuideCorridor
+          + (options.strictGuideCorridor || automaticGuidance
             ? guideDeviation * 0.28
             : guideDeviation * (preserveTrajectoryHistory && candidates.length > 1 ? 0.045 : 0))
           + (candidate.anchor && preserveTrajectoryHistory ? Math.abs(slope - safeExitSlope) * 0.32 : 0);
@@ -2426,10 +2532,32 @@ function guidedSegment(options, start, end, context = {}) {
   const localOptions = start.occlusionGuide || end.occlusionGuide
     ? { ...options, strictGuideCorridor: true }
     : options;
-  return globalGuidedSegment(localOptions, start, end, context)
+  const ordinary = globalGuidedSegment(localOptions, start, end, context)
     ?? greedyGuidedSegment(localOptions, start, end);
+  if (localOptions.strictGuideCorridor || !options.automaticCompetitionGuidance) return ordinary;
+  // A continuously observed curve is stronger evidence than a sparse guide
+  // interpolant. In particular, never flatten a visible bend to a chord.
+  if (!isPatternedLineStyle(options.targetStyle)) {
+    let gap = 0, longestGap = 0;
+    for (const point of ordinary) {
+      gap = point.observed || point.anchor ? 0 : gap + 1;
+      longestGap = Math.max(longestGap, gap);
+    }
+    if (longestGap <= 2 && ordinary.filter(point => point.observed).length >= ordinary.length * 0.85) return ordinary;
+  }
+  const competition = guideCompetitionProfile(options, start, end, context);
+  if (!competition || !ordinary.some(point => !point.anchor && competition.columns[point.x]
+    && Math.abs(point.y - competition.guideY(point.x)) > competition.tolerance + 1)) return ordinary;
+  const enhanced = globalGuidedSegment({ ...options, guideCompetition: competition }, start, end, context);
+  // Insufficient or conflicting evidence must not turn into an invented route.
+  // Leave the existing uncertainty/review mechanism in charge in that case.
+  if (!enhanced) return ordinary;
+  return enhanced.map(point => competition.columns[point.x] && !point.anchor
+    ? { ...point, automaticGuidance: true } : point);
 }
 
+// Keep the established safeguard for patterned curves. Their repeated blank
+// columns and stroke fingerprints require different evidence from solid lines.
 function hasPersistentGuideCompetition({
   rgba,
   width,
@@ -2567,7 +2695,6 @@ export function traceCurveThroughAnchors({
       exclusions,
       inclusionMask,
     });
-
   const options = {
     rgba,
     width,
@@ -2578,10 +2705,9 @@ export function traceCurveThroughAnchors({
     maxGap,
     exclusions,
     targetStyle,
-    strictGuideCorridor: Boolean(
-      strictGuideCorridor
-      || automaticStrictGuidance
-    ),
+    strictGuideCorridor: Boolean(strictGuideCorridor || automaticStrictGuidance),
+    automaticCompetitionGuidance: targetStyle === "line" || targetStyle === "auto",
+    guideCandidateCache: new Map(),
     avoidanceByX: buildAvoidanceByX(avoidPaths, safeRect),
     avoidanceRadius,
     inclusionMask,
@@ -2632,7 +2758,10 @@ export function traceCurveThroughAnchors({
     const exitSlope = after
       ? (after.y - start.y) / Math.max(1, after.x - start.x)
       : chordSlope;
-    const segment = guidedSegment(options, start, end, { entrySlope, exitSlope });
+    const segment = guidedSegment(options, start, end, {
+      entrySlope, exitSlope,
+      competitionContinuation: result.slice(-4).some(point => point.automaticGuidance),
+    });
     if (result.length && segment.length && result.at(-1).x === segment[0].x) segment.shift();
     result.push(...segment);
   }
@@ -4816,6 +4945,7 @@ function interpolateOrderedPathPoint(left, right, fraction, parametricOrder) {
   delete point.anchorId;
   point.anchor = false;
   point.userGuided = false;
+  if (left.automaticGuidance || right.automaticGuidance) point.automaticGuidance = true;
   const occlusionInferred = Boolean(left.occlusionInferred || right.occlusionInferred);
   const patternInferred = Boolean(left.patternInferred || right.patternInferred);
   if (occlusionInferred || patternInferred) {
@@ -5066,6 +5196,7 @@ function interpolatePixelPath(sortedPath, sampleXs) {
       candidateCount: Math.max(left.candidateCount ?? 0, right.candidateCount ?? 0),
       thickness: (left.thickness ?? 0) + localFraction * ((right.thickness ?? 0) - (left.thickness ?? 0)),
     };
+    if (left.automaticGuidance || right.automaticGuidance) sampledPoint.automaticGuidance = true;
     const ambiguitySource = localFraction <= 0.5 ? left : right;
     if (Array.isArray(ambiguitySource.ambiguityAlternatives)) {
       sampledPoint.ambiguityAlternatives = [...ambiguitySource.ambiguityAlternatives];
