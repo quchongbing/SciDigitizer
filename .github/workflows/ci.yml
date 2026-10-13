@@ -39,6 +39,9 @@ jobs:
       - name: Run unit tests
         run: npm test
 
+      - name: Check scatter extraction regressions
+        run: npm run test:scatter
+
       - name: Stress-test Pen geometry and extraction
         run: npm run test:pen
 

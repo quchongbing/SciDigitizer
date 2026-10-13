@@ -3559,6 +3559,14 @@ function markerDiskFill(mask, width, height, centerX, centerY, radius) {
 function consolidateRegularMarkerGrid(knownMarkers, candidates, estimatedDiameter) {
   if (knownMarkers.length < 5) return null;
   const known = [...knownMarkers].sort((left, right) => left.x - right.x);
+  // A regular x grid is not evidence of a single-valued series: a scatter
+  // cloud can contain several independent observations at the same x. Never
+  // use the one-per-column heuristic when measured components disagree in y.
+  for (let index = 1; index < known.length; index += 1) {
+    const left = known[index - 1], right = known[index];
+    if (right.x - left.x < estimatedDiameter * 0.6
+      && Math.abs(right.y - left.y) > estimatedDiameter * 0.8) return null;
+  }
   const gaps = known.slice(1)
     .map((point, index) => point.x - known[index].x)
     .filter((gap) => gap >= Math.max(2, estimatedDiameter * 0.45) && gap <= estimatedDiameter * 2.2);
@@ -3639,7 +3647,11 @@ function consolidateRegularMarkerGrid(knownMarkers, candidates, estimatedDiamete
   for (const gridIndex of allIndices) {
     if (!selectedByIndex.has(gridIndex)) chooseCandidate(gridIndex, 1);
   }
-  return [...selectedByIndex.values()].sort((left, right) => left.x - right.x);
+  const selected = [...selectedByIndex.values()];
+  // Grid phase is only a heuristic for attached disks, never a reason to
+  // discard a separately measured component with irregular x spacing.
+  if (knownMarkers.some(point => !selected.includes(point))) return null;
+  return selected.sort((left, right) => left.x - right.x);
 }
 
 function attachedMarkerCenters({
@@ -3706,11 +3718,9 @@ function attachedMarkerCenters({
       const x = safeRect.left + refinedX;
       const refinedGlobalY = safeRect.top + refinedY;
 
-      if (anchors.length >= 2) {
+      if (strictGuideCorridor && anchors.length >= 2) {
         const guideY = guideYAtX(anchors, x);
-        const tolerance = strictGuideCorridor
-          ? clamp(safeRect.width * 0.018, 5, 16)
-          : clamp(safeRect.height * 0.12, 14, 42);
+        const tolerance = clamp(safeRect.width * 0.018, 5, 16);
         if (Math.abs(refinedGlobalY - guideY) > tolerance) continue;
       }
 
@@ -3748,10 +3758,8 @@ function attachedMarkerCenters({
   const columnRunOptions = [];
   for (let localX = 1; localX < width - 1; localX += 1) {
     const x = safeRect.left + localX;
-    const guideY = anchors.length >= 2 ? guideYAtX(anchors, x) : null;
-    const guideTolerance = strictGuideCorridor
-      ? clamp(safeRect.width * 0.018, 5, 16)
-      : clamp(safeRect.height * 0.12, 14, 42);
+    const guideY = strictGuideCorridor && anchors.length >= 2 ? guideYAtX(anchors, x) : null;
+    const guideTolerance = clamp(safeRect.width * 0.018, 5, 16);
     let runStart = null;
     let bestRun = null;
     const eligibleRuns = [];
@@ -3976,11 +3984,11 @@ function extractMarkerCenters({
 
     const x = safeRect.left + sumX / area;
     const y = safeRect.top + sumY / area;
-    if (anchors.length >= 2) {
+    // Guides label measured centres. Only the explicit same-colour constraint
+    // may turn them into a y(x) corridor; ordinary scatter is not a function.
+    if (strictGuideCorridor && anchors.length >= 2) {
       const guideY = guideYAtX(anchors, x);
-      const tolerance = strictGuideCorridor
-        ? clamp(safeRect.width * 0.018, 5, 16)
-        : clamp(safeRect.height * 0.12, 14, 42);
+      const tolerance = clamp(safeRect.width * 0.018, 5, 16);
       if (Math.abs(y - guideY) > tolerance) continue;
     }
     components.push({
@@ -4000,8 +4008,19 @@ function extractMarkerCenters({
     .map((point) => Math.min(point.componentWidth, point.componentHeight))
     .filter((diameter) => Number.isFinite(diameter) && diameter >= 3);
   const fallbackDiameter = clamp(Math.min(safeRect.width, safeRect.height) * 0.018, 5, 14);
+  const clickedComponent = components.filter(point => {
+    const small = Math.min(point.componentWidth, point.componentHeight);
+    const large = Math.max(point.componentWidth, point.componentHeight);
+    return small >= 6 && small / large >= 0.7
+      && point.componentArea / (point.componentWidth * point.componentHeight) >= 0.5
+      && anchors.some(anchor => Math.hypot(anchor.x - point.x, anchor.y - point.y) <= Math.max(3, small * 0.6));
+  }).sort((a, b) => (
+    Math.min(...anchors.map(anchor => Math.hypot(anchor.x - a.x, anchor.y - a.y)))
+    - Math.min(...anchors.map(anchor => Math.hypot(anchor.x - b.x, anchor.y - b.y)))
+  ))[0];
   const estimatedDiameter = clamp(
-    componentDiameters.length ? median(componentDiameters) : fallbackDiameter,
+    clickedComponent ? Math.min(clickedComponent.componentWidth, clickedComponent.componentHeight)
+      : componentDiameters.length ? median(componentDiameters) : fallbackDiameter,
     4,
     maximumDiameter,
   );
@@ -4086,9 +4105,37 @@ function inferMarkerSeries({
   threshold = 42,
   exclusions = [],
   inclusionMask = null,
+  strokeDiagnosis = null,
 } = {}) {
   if (!rgba || rgba.length !== width * height * 4 || !rect || !seed || !target) {
     return { detected: false, confidence: 0, markers: [], reason: "insufficient-input" };
+  }
+  strokeDiagnosis ??= inferLineStyle({ rgba, width, height, rect, seed, target, threshold, exclusions });
+  // Solid thin strokes are by far the commonest target. A filled marker core
+  // must occupy more than a narrow stripe in a 5px neighbourhood. Probe nearby
+  // centres as well, so an antialiased / slightly missed marker click is not
+  // rejected. This avoids full-panel components and distance transforms for
+  // clear thin-line picks; uncertain or patterned picks retain the full test.
+  if (strokeDiagnosis.style === "line") {
+    let maximumFill = 0;
+    for (let cy = Math.round(seed.y) - 2; cy <= Math.round(seed.y) + 2; cy++) {
+      for (let cx = Math.round(seed.x) - 2; cx <= Math.round(seed.x) + 2; cx++) {
+        let ink = 0;
+        for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
+          const x = cx + dx, y = cy + dy;
+          if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) continue;
+          if (!inclusionMaskAllows(inclusionMask, width, x, y)
+            || exclusions.some(area => x >= area.left && x <= area.right && y >= area.top && y <= area.bottom)) continue;
+          const index = (y * width + x) * 4;
+          if (rgba[index + 3] >= 32 && compositedColorDistance(rgba[index], rgba[index + 1], rgba[index + 2], target) <= threshold) ink++;
+        }
+        maximumFill = Math.max(maximumFill, ink / 25);
+      }
+    }
+    if (maximumFill <= 0.6) return {
+      detected: false, confidence: 0.15, markers: [], reason: "thin-continuous-stroke",
+      evidence: { coreFill: maximumFill, strokeFingerprint: strokeDiagnosis.style },
+    };
   }
   const rawMarkers = extractMarkerCenters({
     rgba,
@@ -4118,21 +4165,15 @@ function inferMarkerSeries({
   const seedDistance = seedCandidate
     ? Math.hypot(seedCandidate.x - seed.x, seedCandidate.y - seed.y)
     : Infinity;
-  const strokeDiagnosis = inferLineStyle({
-    rgba,
-    width,
-    height,
-    rect,
-    seed,
-    target,
-    threshold,
-    exclusions,
-  });
+  const compactDisk = point => Number.isFinite(point.componentArea)
+    && Math.min(point.componentWidth, point.componentHeight) / Math.max(point.componentWidth, point.componentHeight) >= 0.7
+    && point.componentArea / (point.componentWidth * point.componentHeight) >= 0.5;
+  const compactSeed = compactDisk(seedCandidate ?? {}) && seedDistance <= Math.max(3, seedThickness * 0.6);
   if (
     !Number.isFinite(seedThickness)
     || seedThickness < 7
     || seedDistance > Math.max(4, seedThickness * 1.05)
-    || strokeDiagnosis.style === "line"
+    || (strokeDiagnosis.style === "line" && !compactSeed)
   ) {
     return {
       detected: false,
@@ -4149,7 +4190,7 @@ function inferMarkerSeries({
   }
 
   const boundaryMargin = Math.max(3, seedThickness * 0.42);
-  const shapeFiltered = rawMarkers.filter((point) => (
+  let shapeFiltered = rawMarkers.filter((point) => (
     (point.confidence ?? 0) >= 0.76
     && (point.thickness ?? 0) >= Math.max(3, seedThickness * 0.72)
     && (point.thickness ?? Infinity) <= seedThickness * 2.05
@@ -4158,6 +4199,23 @@ function inferMarkerSeries({
     && point.y > rect.top + boundaryMargin
     && point.y < rect.bottom - boundaryMargin
   ));
+  if (compactSeed) {
+    // Isolated circles can have a locally continuous fingerprint (a single
+    // disk fills the entire short ruler). Follow the spatially connected,
+    // size-matched series through the clicked disk, not a remote legend dot.
+    // Do not apply this to attached markers / noise peaks or loosen line mode.
+    shapeFiltered = shapeFiltered.filter(compactDisk);
+    const connected = shapeFiltered.filter(point => Math.hypot(point.x - seed.x, point.y - seed.y) <= Math.max(3, seedThickness * 0.6));
+    const remaining = new Set(shapeFiltered.filter(point => !connected.includes(point)));
+    const maximumGap = clamp(seedThickness * 8, 24, 100);
+    for (let cursor = 0; cursor < connected.length; cursor++) {
+      for (const point of remaining) if (Math.hypot(point.x - connected[cursor].x, point.y - connected[cursor].y) <= maximumGap) {
+        connected.push(point);
+        remaining.delete(point);
+      }
+    }
+    shapeFiltered = connected;
+  }
   const markers = consolidateMarkerSeriesCandidates(shapeFiltered, seed, seedThickness);
   if (markers.length < 5) {
     return {
@@ -4177,7 +4235,9 @@ function inferMarkerSeries({
   const slopes = markers.slice(1).map((point, index) => (
     (point.y - markers[index].y) / Math.max(1, point.x - markers[index].x)
   ));
-  const slopeChanges = slopes.slice(1).map((slope, index) => Math.abs(slope - slopes[index]));
+  const slopeChanges = slopes.slice(1).map((slope, index) => compactSeed
+    ? Math.abs(Math.atan(slope) - Math.atan(slopes[index]))
+    : Math.abs(slope - slopes[index]));
   const medianSlopeChange = median(slopeChanges) ?? 0;
   const smoothness = 1 - clamp(medianSlopeChange / 1.35, 0, 1);
   const horizontalSpan = (markers.at(-1).x - markers[0].x) / Math.max(1, rect.width);
@@ -4191,11 +4251,14 @@ function inferMarkerSeries({
   const seedSupport = markers.some((point) => (
     Math.hypot(point.x - seed.x, point.y - seed.y) <= Math.max(4, seedThickness * 1.05)
   ));
+  const conflictingCompactBranch = compactSeed && markers.some((point, index) => index > 0
+    && point.x - markers[index - 1].x <= seedThickness * 0.4
+    && Math.abs(point.y - markers[index - 1].y) > seedThickness * 3);
   const confidence = clamp(
     0.12
       + countScore * 0.18
       + spanScore * 0.14
-      + regularGapFraction * 0.2
+      + (compactSeed ? 1 : regularGapFraction) * 0.2
       + smoothness * 0.15
       + shapeAgreement * 0.16
       + (seedSupport ? 0.08 : 0),
@@ -4205,7 +4268,10 @@ function inferMarkerSeries({
   const detected = confidence >= 0.78
     && seedSupport
     && horizontalSpan >= 0.22
-    && regularGapFraction >= 0.68
+    && (compactSeed || regularGapFraction >= 0.68)
+    // A median alone hides a remote, same-sized dot at the same X. Keep sharp
+    // real turns, but do not certify a second distant branch as a y(x) series.
+    && !conflictingCompactBranch
     && smoothness >= 0.7;
   return {
     detected,
@@ -4223,6 +4289,7 @@ function inferMarkerSeries({
       regularGapFraction,
       smoothness,
       shapeAgreement,
+      compactSeed,
     },
   };
 }
@@ -7775,6 +7842,7 @@ return Object.freeze({ traceParametricCurve });
 const SciComputeEngine = (() => {
 const {
 discoverColoredSeries,
+  compositedColorDistance,
   extractMarkerCenters,
   fitInferredPathGaps,
   inferLineStyle,
@@ -7802,10 +7870,67 @@ function requireImage(image) {
 function imageOptions(image, payload) {
   return {
     ...payload,
+    exclusions: [...(payload.exclusions ?? []), ...plotFrameExclusions(image, payload)],
     rgba: image.rgba,
     width: image.width,
     height: image.height,
   };
+}
+
+// Only suppress confirmed, thin frame ink, not a generic inset of the plot.
+// A curve ending near an axis must remain available. Explicit guides and Pen
+// painting on an edge override this automatic protection for that edge.
+function plotFrameExclusions(image, { rect, target, threshold = 42, seed, anchors = [], inclusionMask }) {
+  if (!rect || !target || Math.max(target.r, target.g, target.b) - Math.min(target.r, target.g, target.b) > 18
+    || rect.width < 40 || rect.height < 40) return [];
+  const { width, height, rgba } = image;
+  const left = Math.max(0, Math.ceil(rect.left)), right = Math.min(width - 1, Math.floor(rect.right));
+  const top = Math.max(0, Math.ceil(rect.top)), bottom = Math.min(height - 1, Math.floor(rect.bottom));
+  const edges = [
+    { horizontal: true, coordinate: top, direction: 1 },
+    { horizontal: true, coordinate: bottom, direction: -1 },
+    { horizontal: false, coordinate: left, direction: 1 },
+    { horizontal: false, coordinate: right, direction: -1 },
+  ];
+  for (const edge of edges) {
+    const from = edge.horizontal ? left : top, to = edge.horizontal ? right : bottom;
+    const matches = coordinate => {
+      let ink = 0, samples = 0;
+      for (let along = from; along <= to; along += Math.max(1, Math.floor((to - from) / 100))) {
+        const x = edge.horizontal ? along : coordinate, y = edge.horizontal ? coordinate : along;
+        const offset = (y * width + x) * 4;
+        samples++;
+        if (rgba[offset + 3] >= 32 && compositedColorDistance(rgba[offset], rgba[offset + 1], rgba[offset + 2], target) <= threshold) ink++;
+      }
+      return ink / samples >= 0.88;
+    };
+    // Plot detection includes the outer antialias fringe. It may not pass the
+    // user's tight colour threshold although the next row is solid frame ink.
+    let fringe = 0;
+    while (fringe < 2 && !matches(edge.coordinate + edge.direction * fringe)) fringe++;
+    edge.depth = 0;
+    while (edge.depth < 6 && matches(edge.coordinate + edge.direction * (fringe + edge.depth))) edge.depth++;
+    if (edge.depth) edge.depth += fringe;
+  }
+  // Two perpendicular strokes may themselves be a real L-shaped target.
+  // All four long edges must agree before treating any ink as a plot frame.
+  if (!edges.every(edge => edge.depth)) return [];
+  const guides = seed ? [...anchors, seed] : anchors;
+  return edges.flatMap(edge => {
+    if (!edge.depth || guides.some(point => Math.abs((edge.horizontal ? point.y : point.x) - edge.coordinate) <= edge.depth + 1)) return [];
+    // Include the adjacent antialias row. Its lighter pixels can still be
+    // picked by stroke refinement even when they fail the strict colour gate.
+    const inner = edge.coordinate + edge.direction * edge.depth;
+    const area = edge.horizontal
+      ? { left, right, top: Math.min(inner, edge.coordinate), bottom: Math.max(inner, edge.coordinate) }
+      : { top, bottom, left: Math.min(inner, edge.coordinate), right: Math.max(inner, edge.coordinate) };
+    if (inclusionMask?.data) {
+      for (let y = area.top; y <= area.bottom; y++) for (let x = area.left; x <= area.right; x++) {
+        if (inclusionMask.data[y * width + x]) return [];
+      }
+    }
+    return [area];
+  });
 }
 
 function horizontalSpan(path, rect) {
@@ -8271,8 +8396,9 @@ function runComputeOperation(type, payload = {}, suppliedImage = null) {
   }
   if (type === "classify-target") {
     const options = imageOptions(image, payload);
-    const markerInference = inferMarkerSeries(options);
-    const lineInference = markerInference.detected ? null : inferLineStyle(options);
+    const strokeDiagnosis = inferLineStyle(options);
+    const markerInference = inferMarkerSeries({ ...options, strokeDiagnosis });
+    const lineInference = markerInference.detected ? null : strokeDiagnosis;
     return { markerInference, lineInference };
   }
   if (type === "trace-marker") {
@@ -9345,6 +9471,11 @@ const englishByChinese = new Map(Object.entries({
   "同色竞争已自动局部增强": "same-color guidance strengthened locally",
   "尚未框选": "No plot area selected",
   "坐标标定": "Axis calibration",
+  "当前曲线坐标随标定即时更新，无需重新提取。": "Current curve coordinates update as you calibrate. No retracing needed.",
+  "更新已存曲线的标定": "Recalibrate saved curves",
+  "全部已存曲线": "All saved curves",
+  "替换所选曲线的 X/Y 标定，其他曲线不变。保留数据点位置，可撤销。": "Replace X/Y calibration for the selected curves only. Point positions are kept. You can undo this.",
+  "应用当前标定": "Apply current calibration",
   "人工输入刻度值，并点击图中对应刻度": "Enter known values and click their ticks in the image",
   "X 轴": "X axis",
   "Y 轴": "Y axis",
@@ -9421,6 +9552,7 @@ const englishByChinese = new Map(Object.entries({
   "点线（短点组成的曲线）": "Dotted line",
   "实验噪声线（保留局部波动）": "Noisy experimental line",
   "圆点 / marker 中心": "Marker centers",
+  "散点 / marker 中心": "Scatter / marker centers",
   "选择目标曲线": "Pick target curve",
   "请在图中点击曲线": "Click the curve in the image",
   "重新选择目标": "Pick a different target",
@@ -9436,6 +9568,9 @@ const englishByChinese = new Map(Object.entries({
   "同色曲线：在分叉前后分别加点。每个引导点都会锁定为追踪基准并进入数据采样；悬停后可直接拖动。遮挡处可按趋势放点。": "For same-color branches, add guides before and after the split. Every guide stays locked; add guides along the expected trend inside occlusions.",
   "普通曲线只需选择目标即可；分叉、重叠或遮挡时再添加引导点并打开可选辅助工具。": "For an ordinary curve, just pick the target. Add guides and open the optional assistance only for branches, overlaps, or occlusions.",
   "已从一次点击识别重复 marker；请直接复核中心。只有附近存在同色点列时才需要补引导点。": "A repeated marker series was recognized from one click. Review the centers; add guides only if another same-color marker series is nearby.",
+  "点击一个清晰散点即可提取同色标记。用 Pen 或屏蔽区排除图例和其他点列；引导点为可选辅助，不默认压缩点云。": "Click a clear scatter point to extract same-color markers. Use Pen or exclusion masks to remove legends and other series; optional guides do not narrow the cloud by default.",
+  "默认保留同色散点；添加至少 4 个引导点后可启用强约束": "Same-color scatter points are kept by default. Add at least four guides to enable a strict corridor.",
+  "已有至少 4 个引导点；仅当附近还有同色 marker 分支时开启": "At least four guides are available. Enable only to isolate a nearby same-color marker series.",
   "选择孤立圆点，再在点列的弯曲处和另一端各加 1 个引导点。保持柔性引导；程序会识别粘在线上的局部圆核和规则间距。右键菱形可删除。": "Select an isolated marker, then add one guide near a bend and another at the far end. Keep flexible guidance; the app detects local marker cores attached to lines and regular spacing. Right-click a guide diamond to delete it.",
   "重叠 / 遮挡辅助（可选）": "Overlap / occlusion assistance (optional)",
   "普通曲线无需设置；只有自动追踪出现串线、重叠或遮挡时再打开。": "No setup is needed for ordinary curves. Open this only when automatic tracing switches branches, overlaps, or encounters occlusion.",
@@ -9699,8 +9834,11 @@ const englishByChinese = new Map(Object.entries({
 }));
 
 const dynamicPatterns = [
+  [/已更新 (\d+) 条曲线的标定；无需重新提取，可撤销/g, "Updated calibration for $1 curves; no retracing needed. You can undo this"],
   [/候选 (\d+) · 可信度 (\d+)%/g, "Candidate $1 · confidence $2%"],
   [/选择可能的彩色曲线 (\d+)/g, "Select possible coloured curve $1"],
+  [/识别到 (\d+) 个散点 · 保留真实散点/g, "Detected $1 scatter points · measured centers retained"],
+  [/识别到 (\d+) 个散点 · 强约束/g, "Detected $1 scatter points · strict corridor"],
   [/识别到 (\d+) 个 marker 中心 · 柔性引导。已检测独立圆点及粘在线上的局部圆核/g, "Detected $1 marker centers with flexible guidance, including isolated markers and local marker cores attached to lines"],
   [/识别到 (\d+) 个 marker 中心 · 强约束。已检测独立圆点及粘在线上的局部圆核/g, "Detected $1 marker centers with strict guidance, including isolated markers and local marker cores attached to lines"],
   [/([：；])([^；：]+) 的 ([XY]) 轴需要点击 (\d+) 个已知刻度位置/g, "$1$2: $3 axis needs $4 known tick positions"],
@@ -11922,6 +12060,39 @@ function syncCalibrationRefinement() {
     : "方向键可上下左右移动紫色十字；每次 1 px，Shift+方向键为 0.1 px。";
 }
 
+function syncSavedCalibrationControls() {
+  const panel = $("#saved-calibration-panel");
+  panel.hidden = !state.series.length;
+  const select = $("#calibration-series-target");
+  const previousTarget = select.value;
+  const targets = state.series.map((series, index) => [
+    `series:${series.id}`, series.label || `Curve ${index + 1}`,
+  ]);
+  if (targets.length > 1) targets.push(["all", translateMessage("全部已存曲线")]);
+  // Use text nodes: curve names are user input, not markup or translated UI.
+  select.replaceChildren(...targets.map(([value, label]) => new Option(label, value)));
+  select.value = targets.some(([value]) => value === previousTarget)
+    ? previousTarget : `series:${state.editingSeriesId ?? state.series[0]?.id}`;
+  select.disabled = Boolean(state.computeBusy) || state.rotationPreviewActive;
+  $("#apply-saved-calibration").disabled = panel.hidden || select.disabled || !calibrationsValid();
+}
+
+function applyCurrentCalibrationToSavedCurves() {
+  if (state.computeBusy || state.rotationPreviewActive || !calibrationsValid()) return;
+  const target = $("#calibration-series-target").value;
+  const selected = state.series.filter((series) => target === "all" || target === `series:${series.id}`);
+  if (!selected.length) return;
+  // Preserve pixel geometry and independent calibrations unless explicitly selected.
+  // A separate snapshot per curve also keeps future edits isolated.
+  const calibration = currentCalibrationSnapshot();
+  for (const series of selected) series.calibration = cloneSerializable(calibration);
+  updateUi();
+  updateCursorReadout(state.cursor);
+  draw();
+  commitHistory("更新已存曲线的标定");
+  showToast(translateMessage(`已更新 ${selected.length} 条曲线的标定；无需重新提取，可撤销`));
+}
+
 function renderSeriesList() {
   const list = $("#series-list");
   if (!state.series.length) {
@@ -12137,8 +12308,9 @@ function automaticMarkerSeriesActive() {
 }
 
 function minimumTraceAnchorCount() {
-  if ($("#target-style").value !== "markers") return 1;
-  return automaticMarkerSeriesActive() ? 1 : 3;
+  // An explicit marker choice already supplies the user's intent. A point
+  // cloud need not have a bend or a far-end guide like a continuous curve.
+  return 1;
 }
 
 function syncPointCountInput() {
@@ -12517,6 +12689,7 @@ function updateUi() {
   syncCalibrationValidation();
   syncCalibrationRefinement();
   const coordinateAudit = syncCalibrationQuality();
+  syncSavedCalibrationControls();
 
   if (state.seedColor) {
     const { r, g, b } = state.seedColor;
@@ -12598,7 +12771,7 @@ function updateUi() {
   $("#strict-guide-help").textContent = markerMode
     ? (markerStrictReady
       ? "已有至少 4 个引导点；仅当附近还有同色 marker 分支时开启"
-      : "marker 默认使用柔性引导；添加到至少 4 个引导点后才可强约束")
+      : "默认保留同色散点；添加至少 4 个引导点后可启用强约束")
     : "拒绝偏离引导走廊的同色分支；普通曲线无需开启";
   const patternedLineMode = ["dashed", "dashdot", "dotted"].includes($("#target-style").value);
   $("#trace-point-count").disabled = Boolean(state.computeBusy) || state.traceStale;
@@ -12617,7 +12790,7 @@ function updateUi() {
   $("#target-style-hint").textContent = markerMode
     ? (automaticMarkerSeriesActive()
       ? "已从一次点击识别重复 marker；请直接复核中心。只有附近存在同色点列时才需要补引导点。"
-      : "选择孤立圆点，再在点列的弯曲处和另一端各加 1 个引导点。保持柔性引导；程序会识别粘在线上的局部圆核和规则间距。右键菱形可删除。")
+      : "点击一个清晰散点即可提取同色标记。用 Pen 或屏蔽区排除图例和其他点列；引导点为可选辅助，不默认压缩点云。")
     : patternedLineMode
       ? "在清晰、孤立且较平缓的目标划线上取色；程序会学习划线长度和间隔。交叉或陡峭处仍需添加引导点；右键菱形可删除。"
       : $("#target-style").value === "noisy"
@@ -13256,9 +13429,6 @@ async function traceCurrentCurve({ silent = false, refreshHistory = true } = {})
   try {
     const previouslySelectedAnchor = state.selectedAnchorIndex;
     let targetStyle = $("#target-style").value;
-    if (targetStyle === "markers" && state.anchors.length < minimumTraceAnchorCount()) {
-      throw new Error("marker 模式需要取色种子，并在点列弯曲处和另一端各添加 1 个引导点");
-    }
     const effectiveStrictGuidance = $("#strict-guide").checked
       && (targetStyle !== "markers" || state.anchors.length >= 4);
     const avoidPaths = targetStyle === "markers" ? [] : sameColorAvoidancePaths();
@@ -13366,8 +13536,8 @@ async function traceCurrentCurve({ silent = false, refreshHistory = true } = {})
     if (refreshHistory) editSession?.refreshCurrent();
     const observed = state.path.filter((point) => point.observed).length;
     if (targetStyle === "markers") {
-      const markerGuidance = effectiveStrictGuidance ? "强约束" : "柔性引导";
-      if (!silent) showToast(`识别到 ${state.path.length} 个 marker 中心 · ${markerGuidance}。已检测独立圆点及粘在线上的局部圆核`);
+      const markerGuidance = effectiveStrictGuidance ? "强约束" : "保留真实散点";
+      if (!silent) showToast(`识别到 ${state.path.length} 个散点 · ${markerGuidance}`);
     } else {
       const samplingLabel = nextOrientation === "parametric" ? "二维弧长采样" : $("#sampling-mode").value === "peak"
         ? "峰值自适应"
@@ -13878,7 +14048,7 @@ async function selectTraceTarget(point) {
   state.draggedAnchorIndex = null;
   setMode(null);
   try {
-    if ($("#target-style").value === "auto") {
+    if ($("#target-style").value === "auto" || $("#target-style").dataset.autoDetected) {
       state.computeBusy = "classify";
       updateUi();
       draw();
@@ -13911,12 +14081,8 @@ async function selectTraceTarget(point) {
     state.computeBusy = null;
     updateUi();
     draw();
-    if ($("#target-style").value === "markers" && !automaticMarkerSeriesActive()) {
-      showToast("marker 颜色已采样；请在点列弯曲处和另一端各添加 1 个引导点");
-    } else {
-      const traced = await traceCurrentCurve({ refreshHistory: false });
-      if (!traced) return false;
-    }
+    const traced = await traceCurrentCurve({ refreshHistory: false });
+    if (!traced) return false;
     if (selectionId !== targetSelectionSequence || state.seed?.anchorId !== selectedAnchorId) return false;
     commitHistory("选择目标并智能追踪");
     return true;
@@ -15038,8 +15204,15 @@ for (const selector of [
     updateCursorReadout(state.cursor);
     scheduleDraftSave();
   });
-  $(selector).addEventListener("change", () => commitHistory("修改标定或标签"));
+  $(selector).addEventListener("change", () => {
+    updateUi();
+    updateCursorReadout(state.cursor);
+    draw();
+    commitHistory("修改标定或标签");
+  });
 }
+
+$("#apply-saved-calibration").addEventListener("click", applyCurrentCalibrationToSavedCurves);
 
 $("#calibration-snap").addEventListener("change", () => {
   scheduleDraftSave();
@@ -15121,6 +15294,7 @@ $("#series-list").addEventListener("click", (event) => {
     }
     if (!state.editingSeriesId) state.calibrationBeforeSeriesEdit = currentCalibrationSnapshot();
     state.editingSeriesId = id;
+    $("#calibration-series-target").value = `series:${id}`;
     applyCalibrationSnapshot(curveCalibrationSnapshot(series));
     state.path = createDataPath(series.path);
     state.reviewRegionIndex = 0;

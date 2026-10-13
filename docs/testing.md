@@ -6,6 +6,7 @@ Run from the project root / 在项目根目录执行：
 npm run build:file
 npm run check
 npm test
+npm run test:scatter
 npm run test:pen
 npm run benchmark:check
 npm run smoke:real
@@ -19,6 +20,18 @@ npm run smoke:app
   覆盖邻近黑网格、低对比、抗锯齿和底色变化。
 - `benchmark:check`: deterministic accuracy regression gates; does not update
   the baseline. 合成精度回归检查，不修改基线。
+- `test:scatter`: 60 deterministic separated-marker cases: filled/hollow circles,
+  crosses, pluses and stars; irregular series, clouds with repeated x values,
+  vertical columns and dense clouds at two resolutions. Checks one-to-one centre
+  matching, missed/extra points, calibration and export without interpolation.
+  These cases also run in `npm test`. Touching symbols and hidden coincident
+  records are not certified; screenshots cannot reveal hidden multiplicity.
+  60 组可分离散点测试，覆盖实心/空心圆、叉号、十字、星形点，不规则序列、同 x
+  多点、竖直点列和密集点云；检查中心位置、漏点、误检、标定及不插值导出。
+  同时纳入 `npm test`；粘连符号和完全重叠点的原始数量不在保证范围内。
+  In the UI, choose Scatter / marker centers, then pick one clear symbol;
+  guides are optional. 在界面选择“散点 / marker 中心”，点击一个清晰标记即可，
+  无需先添加曲线引导点。
 - `test:pen`: 2,100 deterministic cases covering mirrored/rotated curves,
   narrow and wide brushes, local/strict scope, sparse/dense output, one-pixel
   eraser cuts, same-colour crossings and inclined/near-vertical dashed lines.
@@ -39,6 +52,14 @@ npm run smoke:app
   both legacy and newer drafts; old validity flags are not trusted.
   包括用鼠标涂画示例蓝色虚线的 12/24 px 局部 Pen、减少标记点时保留引导点，
   以及新旧草稿重新校验（不直接信任已保存的“有效”标记）。
+  Also checks a 32-point cloud with four y values at each x through manual
+  marker selection, optional guides, calibration and CSV/TXT export.
+  另检查 32 点散点云（每个 x 对应四个 y）的取色、可选引导、标定和 CSV/TXT 导出。
+  Recalibration checks cover live coordinates, log axes, moved reference ticks,
+  explicit updates to one/all saved curves, independent overlay calibrations,
+  invalid endpoints, undo/redo and project round-trips without moving data points.
+  重新标定检查覆盖实时坐标、对数轴、刻度位置修正、单条/全部已存曲线更新、
+  平移曲线的独立标定、非法端点、撤销/重做和项目恢复，并确认数据点位置不变。
 
 Browser checks require Node.js 22+, Python 3 and installed Chrome/Chromium.
 They use temporary browser storage and automatically allocated ports; the
@@ -65,4 +86,14 @@ competing black diagonal and plot frame.
 
 ```sh
 node tools/real-pen-smoke.mjs /path/to/regime-diagram.png
+```
+
+Three further scientific screenshots can be checked locally without adding
+them to the repository. Checks eight panels and seven selected extraction
+cases, not every scientific data point or dense merged symbol.
+另外三张科研截图可在本地检查，无需收录进仓库；验证八个面板及七组指定提取案例，
+不等于验证全部原始数据点或密集粘连符号：
+
+```sh
+node tools/research-image-smoke.mjs dispersion.png four-panels.png three-panels.png
 ```

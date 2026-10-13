@@ -775,6 +775,14 @@ button:disabled {
   font-size: 12px;
 }
 
+.saved-calibration-panel > button {
+  width: 100%;
+}
+
+.saved-calibration-panel .field-label {
+  margin-top: 0;
+}
+
 .compact-select {
   height: 27px;
   padding: 0 7px;

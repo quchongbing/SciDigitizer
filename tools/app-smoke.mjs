@@ -1218,6 +1218,11 @@ await evaluate(`(async () => {
   markerContext.strokeStyle = '#111';
   markerContext.lineWidth = 2;
   markerContext.strokeRect(20, 15, 220, 145);
+  markerContext.strokeStyle = '#309a45';
+  markerContext.beginPath();
+  markerContext.moveTo(30, 140);
+  markerContext.lineTo(230, 150);
+  markerContext.stroke();
   markerContext.fillStyle = '#080808';
   for (let index = 0; index < 11; index += 1) {
     const x = 35 + index * 18;
@@ -1262,6 +1267,29 @@ assert.equal(automaticMarkerState.points, 11, JSON.stringify(automaticMarkerStat
 assert.equal(await evaluate("document.querySelector('#target-style').dataset.autoDetected"), "markers");
 assert.equal(await evaluate("document.querySelector('#trace-curve').disabled"), false);
 assert.match(await evaluate("document.querySelector('#target-style-hint').textContent"), /一次点击识别重复 marker/);
+// Replacing an automatically classified target must classify the NEW target,
+// without asking the user to reset the dropdown to Auto between clicks.
+await clickAtNaturalPoint("#pick-seed", 90, 143);
+await waitForComputeIdle();
+assert.equal(await evaluate("document.querySelector('#target-style').value"), "line");
+assert.equal(await evaluate("document.querySelector('#target-style').dataset.autoDetected"), "line");
+await clickAtNaturalPoint("#pick-seed", 89, 110);
+await waitForComputeIdle();
+assert.equal(await evaluate("document.querySelector('#target-style').value"), "markers");
+assert.equal(await evaluate("document.querySelectorAll('.data-point-row').length"), 11);
+// An actual user choice remains authoritative on the next pick.
+await evaluate("document.querySelector('#target-style').value = 'line'; document.querySelector('#target-style').dispatchEvent(new Event('change'))");
+await waitForComputeIdle();
+await clickAtNaturalPoint("#pick-seed", 90, 143);
+await waitForComputeIdle();
+assert.equal(await evaluate("document.querySelector('#target-style').value"), "line");
+assert.equal(await evaluate("document.querySelector('#target-style').dataset.autoDetected ?? null"), null);
+await evaluate("document.querySelector('#target-style').value = 'auto'; document.querySelector('#target-style').dispatchEvent(new Event('change'))");
+await waitForComputeIdle();
+await clickAtNaturalPoint("#pick-seed", 89, 110);
+await waitForComputeIdle();
+assert.equal(await evaluate("document.querySelector('#target-style').value"), "markers");
+assert.equal(await evaluate("document.querySelectorAll('.data-point-row').length"), 11);
 const markerProject = JSON.parse(await evaluate(`(async () => {
   let exportedBlob = null;
   const originalCreateObjectURL = URL.createObjectURL;
@@ -1633,6 +1661,167 @@ assert.match(await evaluate("document.querySelector('#seed-status').textContent"
 assert.equal(await evaluate("document.querySelector('#strict-guide').checked"),false);
 assert.deepEqual(consoleErrors, []);
 
+// Actual point-cloud workflow: guides on the top row must not silently remove
+// the other three measured y values at every x. Exercise Worker/file fallback,
+// calibration and the real CSV/TXT handlers, not only the core extractor.
+await evaluate(`(async () => {
+  const c=document.createElement('canvas'); c.width=260; c.height=230;
+  const ctx=c.getContext('2d'); ctx.fillStyle='#fff'; ctx.fillRect(0,0,260,230);
+  ctx.strokeStyle='#111'; ctx.lineWidth=2; ctx.strokeRect(20,15,220,200);
+  ctx.fillStyle='#1f77b4';
+  for(let row=0;row<4;row++) for(let col=0;col<8;col++) {
+    ctx.beginPath(); ctx.arc(35+col*26,45+row*46,3,0,Math.PI*2); ctx.fill();
+  }
+  const blob=await new Promise(resolve=>c.toBlob(resolve,'image/png'));
+  const transfer=new DataTransfer();transfer.items.add(new File([blob],'scatter-cloud-smoke.png',{type:'image/png'}));
+  const drop=new Event('drop',{bubbles:true,cancelable:true});Object.defineProperty(drop,'dataTransfer',{value:transfer});
+  document.dispatchEvent(drop);
+})()`);
+await waitFor("document.querySelector('#workspace-title').textContent==='scatter-cloud-smoke.png'");
+await waitForComputeIdle();
+await evaluate(`(() => {
+  document.querySelector('#target-style').value='markers';
+  document.querySelector('#target-style').dispatchEvent(new Event('change'));
+  document.querySelector('#x-scale').value='linear';document.querySelector('#y-scale').value='linear';
+  document.querySelector('#x-value-1').value='0';document.querySelector('#x-value-2').value='1';
+  document.querySelector('#y-value-1').value='0';document.querySelector('#y-value-2').value='1';
+  document.querySelector('#calibration-snap').checked=false;
+})()`);
+for(const [selector,x,y] of [['#pick-x-1',20,215],['#pick-x-2',240,215],['#pick-y-1',20,215],['#pick-y-2',20,15]]) {
+  await clickAtNaturalPoint(selector,x,y);
+}
+await clickAtNaturalPoint('#pick-seed',35,45);
+await waitForComputeIdle();
+assert.equal(JSON.parse(await downloadText('#export-project')).activeCurve.path.length,32,
+  "an explicit scatter choice needs one colour pick, not mandatory curve guides");
+await clickAtNaturalPoint('#add-guide',217,45);
+await waitForComputeIdle();
+assert.equal(await evaluate("document.querySelector('#trace-error').hidden"),true);
+const scatterProject=JSON.parse(await downloadText('#export-project'));
+const scatterCurve=scatterProject.activeCurve;
+assert.equal(scatterCurve.path.length,32,"scatter guides must not become an implicit narrow curve corridor");
+assert.equal(scatterCurve.traceCorridorOperations.length,0);
+assert.equal(scatterCurve.parameters.strictGuidance,false);
+assert.ok(scatterCurve.path.every(point=>point.observed && point.marker));
+await evaluate("document.querySelector('#trace-point-count').value=1000;document.querySelector('#trace-point-count').dispatchEvent(new Event('change'))");
+assert.equal(JSON.parse(await downloadText('#export-project')).activeCurve.path.length,32,"do not invent 1000 scatter measurements");
+for(const selector of ['#export-csv','#export-txt']) {
+  const content=await downloadText(selector);
+  assert.equal(content.trim().split('\n').length,34,`${selector}: preserve all measured rows`);
+}
+const scatterRows=(await downloadText('#export-csv')).trim().split('\n').slice(2).map(line=>line.split(',').map(Number));
+assert.ok(scatterRows.every(row=>row.length===2 && row.every(Number.isFinite)));
+const scatterColumns=new Map();
+for(const [x,y] of scatterRows) {
+  if(!scatterColumns.has(x))scatterColumns.set(x,new Set());
+  scatterColumns.get(x).add(y);
+}
+assert.equal(scatterColumns.size,8);
+assert.ok([...scatterColumns.values()].every(values=>values.size===4),"CSV must retain multiple y observations at the same x");
+assert.deepEqual(consoleErrors, []);
+
+// Recalibration must operate on the original pixel points, not on previously
+// converted data. Saved curves remain independent until explicitly selected.
+async function setCalibrationFields(fields, eventType = 'change') {
+  await evaluate(`(() => {
+    const fields=${JSON.stringify(fields)};
+    for(const [selector,value] of Object.entries(fields)) document.querySelector(selector).value=value;
+    document.querySelector(Object.keys(fields).at(-1)).dispatchEvent(new Event(${JSON.stringify(eventType)},{bubbles:true}));
+  })()`);
+}
+async function calibrationCsvRows() {
+  return (await downloadText('#export-csv')).trim().split('\n').slice(2).map(line=>line.split(',').map(Number));
+}
+function assertCoordinates(rows, expected, label) {
+  assert.equal(rows.length, expected.length, label);
+  rows.forEach((row,i)=>{
+    assert.equal(row.length,expected[i].length,label);
+    row.forEach((value,j)=>assert.ok(Math.abs(value-expected[i][j])<1e-8,
+      `${label}: row ${i}, col ${j}: ${value} != ${expected[i][j]}`));
+  });
+}
+const calibrationProject = async () => JSON.parse(await downloadText('#export-project'));
+const calibrationPixelPath = (await calibrationProject()).activeCurve.path;
+const shiftedRows = (offset) => scatterRows.map(([x,y])=>[10**(2*x), y+offset]);
+await setCalibrationFields({'#y-value-1':10,'#y-value-2':11}, 'input');
+assertCoordinates(await calibrationCsvRows(),scatterRows.map(([x,y])=>[x,y+10]),'live Y correction');
+await setCalibrationFields({'#x-value-1':1,'#x-value-2':100,'#x-scale':'log'});
+assertCoordinates(await calibrationCsvRows(),shiftedRows(10),'live log X correction');
+assertCoordinates(await evaluate(`[...document.querySelectorAll('.data-point-row')].map(row=>[
+  Number(row.querySelector('[data-coordinate="x"]').value),Number(row.querySelector('[data-coordinate="y"]').value)])`),
+  shiftedRows(10),'coordinate table follows the corrected axes');
+await clickAtNaturalPoint('#pick-y-2',20,25);
+assertCoordinates(await calibrationCsvRows(),scatterRows.map(([x,y])=>[10**(2*x),10+y*200/190]),'reference pixel correction');
+assert.deepEqual((await calibrationProject()).activeCurve.path,calibrationPixelPath,'recalibration never moves measured pixels');
+await evaluate("document.querySelector('#undo-action').click()");
+assertCoordinates(await calibrationCsvRows(),shiftedRows(10),'undo reference pixel correction');
+
+await evaluate("document.querySelector('#save-series').click()");
+const firstCalibratedSeries = (await calibrationProject()).series[0];
+assert.equal(await evaluate("document.querySelector('#saved-calibration-panel').hidden"),false);
+await setCalibrationFields({'#y-value-1':20,'#y-value-2':21});
+assertCoordinates(await calibrationCsvRows(),shiftedRows(10),'new workspace calibration leaves saved data alone');
+await evaluate("document.querySelector('#target-style').value='markers';document.querySelector('#target-style').dispatchEvent(new Event('change'))");
+await clickAtNaturalPoint('#pick-seed',35,45);
+await waitForComputeIdle();
+await evaluate("document.querySelector('#save-series').click()");
+const beforeCorrection = await calibrationProject();
+assert.equal(beforeCorrection.series.length,2);
+assert.equal(beforeCorrection.series[1].path.length,32);
+await setCalibrationFields({'#y-value-1':30,'#y-value-2':31});
+const combineRows = (firstOffset,secondOffset) => shiftedRows(firstOffset).map((row,i)=>[...row,...shiftedRows(secondOffset)[i]]);
+assertCoordinates(await calibrationCsvRows(),combineRows(10,20),'saved overlay curves retain independent calibration');
+await evaluate(`document.querySelector('#calibration-series-target').value=${JSON.stringify(`series:${firstCalibratedSeries.id}`)};
+  document.querySelector('#apply-saved-calibration').click()`);
+assertCoordinates(await calibrationCsvRows(),combineRows(30,20),'apply only to selected saved curve');
+const afterCorrection = await calibrationProject();
+assert.deepEqual(afterCorrection.series[1],beforeCorrection.series[1],'unselected series must be untouched');
+const withoutCalibration = ({calibration,...rest}) => rest;
+assert.deepEqual(withoutCalibration(afterCorrection.series[0]),withoutCalibration(beforeCorrection.series[0]),
+  'only calibration changes: preserve points, guides, Pen, labels and tracing parameters');
+await evaluate("document.querySelector('#undo-action').click()");
+assertCoordinates(await calibrationCsvRows(),combineRows(10,20),'undo saved correction');
+await evaluate("document.querySelector('#redo-action').click()");
+assertCoordinates(await calibrationCsvRows(),combineRows(30,20),'redo saved correction');
+
+// Editing and then correcting a saved curve must also use the live axes in
+// exports before Save. Applying calibration is explicit and survives Cancel.
+await evaluate("document.querySelector('[data-action=\"edit\"]').click()");
+assert.equal(await evaluate("document.querySelector('#calibration-series-target').value"),`series:${firstCalibratedSeries.id}`);
+await setCalibrationFields({'#y-value-1':40,'#y-value-2':41});
+assertCoordinates(await calibrationCsvRows(),combineRows(40,20),'live saved-curve edit correction');
+await evaluate("document.querySelector('#apply-saved-calibration').click();document.querySelector('[data-action=\"edit\"]').click()");
+assertCoordinates(await calibrationCsvRows(),combineRows(40,20),'explicit saved correction survives leaving edit mode');
+assert.equal(await evaluate("document.querySelector('#y-value-1').value"),'30','restore the independent workspace calibration');
+
+await setCalibrationFields({'#y-value-2':30});
+assert.equal(await evaluate("document.querySelector('#apply-saved-calibration').disabled"),true,'reject equal calibration endpoints');
+await evaluate("document.querySelector('#apply-saved-calibration').click()");
+assertCoordinates(await calibrationCsvRows(),combineRows(40,20),'invalid correction cannot corrupt saved coordinates');
+await setCalibrationFields({'#y-value-2':31});
+await evaluate("document.querySelector('#calibration-series-target').value='all';document.querySelector('#apply-saved-calibration').click()");
+assertCoordinates(await calibrationCsvRows(),combineRows(30,30),'explicit apply to all saved curves');
+await evaluate("document.querySelector('#undo-action').click()");
+assertCoordinates(await calibrationCsvRows(),combineRows(40,20),'undo all preserves the previous independent axes');
+await evaluate("document.querySelector('#redo-action').click()");
+assertCoordinates(await calibrationCsvRows(),combineRows(30,30),'redo all');
+const correctedProject = await calibrationProject();
+await setCalibrationFields({'#y-value-1':0,'#y-value-2':1});
+await evaluate(`(() => {
+  const transfer=new DataTransfer();
+  transfer.items.add(new File([${JSON.stringify(JSON.stringify(correctedProject))}],'recalibrated.json',{type:'application/json'}));
+  const input=document.querySelector('#project-upload');input.files=transfer.files;input.dispatchEvent(new Event('change',{bubbles:true}));
+})()`);
+await waitFor("document.querySelector('#y-value-1').value==='30'");
+assertCoordinates(await calibrationCsvRows(),combineRows(30,30),'project round-trip retains recalibrated exports');
+assert.deepEqual((await calibrationProject()).series.map(series=>series.calibration),correctedProject.series.map(series=>series.calibration));
+await evaluate("document.querySelector('[data-language=\"en\"]').click()");
+assert.equal(await evaluate("document.querySelector('#calibration-series-target option[value=\"all\"]').textContent"),'All saved curves');
+assert.equal(await evaluate("document.querySelector('#apply-saved-calibration').textContent"),'Apply current calibration');
+await evaluate("document.querySelector('[data-language=\"zh\"]').click()");
+assert.equal(await evaluate("document.querySelector('#calibration-series-target option[value=\"all\"]').textContent"),'全部已存曲线');
+assert.deepEqual(consoleErrors, []);
+
 // Optional reproduction against the reported XRD screenshot. The image stays
 // local and is not a repository asset. Default CI covers the geometry in the
 // deterministic compute tests; local runs can also exercise real UI guides.
@@ -1679,5 +1868,7 @@ process.stdout.write(`${JSON.stringify({ beforeSave, afterSave, localPenResults,
   points: automaticCurve.path.length, guides: automaticCurve.anchors.length,
   enhancedRawPoints: automaticCurve.rawPath.filter(p=>p.automaticGuidance).length,
   manualConstraint: automaticCurve.parameters.strictGuidance,
-}, xrdResult, consoleErrors }, null, 2)}\n`);
+}, scatter: { points: scatterCurve.path.length, columns: scatterColumns.size, perColumn: 4 },
+recalibration: { savedCurves: correctedProject.series.length, pointsPerCurve: 32,
+  active: true, selected: true, all: true, undoRedo: true, projectRoundTrip: true }, xrdResult, consoleErrors }, null, 2)}\n`);
 socket.close();

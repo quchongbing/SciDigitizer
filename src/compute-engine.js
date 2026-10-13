@@ -1,5 +1,6 @@
 import {
   discoverColoredSeries,
+  compositedColorDistance,
   extractMarkerCenters,
   fitInferredPathGaps,
   inferLineStyle,
@@ -23,10 +24,67 @@ function requireImage(image) {
 function imageOptions(image, payload) {
   return {
     ...payload,
+    exclusions: [...(payload.exclusions ?? []), ...plotFrameExclusions(image, payload)],
     rgba: image.rgba,
     width: image.width,
     height: image.height,
   };
+}
+
+// Only suppress confirmed, thin frame ink, not a generic inset of the plot.
+// A curve ending near an axis must remain available. Explicit guides and Pen
+// painting on an edge override this automatic protection for that edge.
+function plotFrameExclusions(image, { rect, target, threshold = 42, seed, anchors = [], inclusionMask }) {
+  if (!rect || !target || Math.max(target.r, target.g, target.b) - Math.min(target.r, target.g, target.b) > 18
+    || rect.width < 40 || rect.height < 40) return [];
+  const { width, height, rgba } = image;
+  const left = Math.max(0, Math.ceil(rect.left)), right = Math.min(width - 1, Math.floor(rect.right));
+  const top = Math.max(0, Math.ceil(rect.top)), bottom = Math.min(height - 1, Math.floor(rect.bottom));
+  const edges = [
+    { horizontal: true, coordinate: top, direction: 1 },
+    { horizontal: true, coordinate: bottom, direction: -1 },
+    { horizontal: false, coordinate: left, direction: 1 },
+    { horizontal: false, coordinate: right, direction: -1 },
+  ];
+  for (const edge of edges) {
+    const from = edge.horizontal ? left : top, to = edge.horizontal ? right : bottom;
+    const matches = coordinate => {
+      let ink = 0, samples = 0;
+      for (let along = from; along <= to; along += Math.max(1, Math.floor((to - from) / 100))) {
+        const x = edge.horizontal ? along : coordinate, y = edge.horizontal ? coordinate : along;
+        const offset = (y * width + x) * 4;
+        samples++;
+        if (rgba[offset + 3] >= 32 && compositedColorDistance(rgba[offset], rgba[offset + 1], rgba[offset + 2], target) <= threshold) ink++;
+      }
+      return ink / samples >= 0.88;
+    };
+    // Plot detection includes the outer antialias fringe. It may not pass the
+    // user's tight colour threshold although the next row is solid frame ink.
+    let fringe = 0;
+    while (fringe < 2 && !matches(edge.coordinate + edge.direction * fringe)) fringe++;
+    edge.depth = 0;
+    while (edge.depth < 6 && matches(edge.coordinate + edge.direction * (fringe + edge.depth))) edge.depth++;
+    if (edge.depth) edge.depth += fringe;
+  }
+  // Two perpendicular strokes may themselves be a real L-shaped target.
+  // All four long edges must agree before treating any ink as a plot frame.
+  if (!edges.every(edge => edge.depth)) return [];
+  const guides = seed ? [...anchors, seed] : anchors;
+  return edges.flatMap(edge => {
+    if (!edge.depth || guides.some(point => Math.abs((edge.horizontal ? point.y : point.x) - edge.coordinate) <= edge.depth + 1)) return [];
+    // Include the adjacent antialias row. Its lighter pixels can still be
+    // picked by stroke refinement even when they fail the strict colour gate.
+    const inner = edge.coordinate + edge.direction * edge.depth;
+    const area = edge.horizontal
+      ? { left, right, top: Math.min(inner, edge.coordinate), bottom: Math.max(inner, edge.coordinate) }
+      : { top, bottom, left: Math.min(inner, edge.coordinate), right: Math.max(inner, edge.coordinate) };
+    if (inclusionMask?.data) {
+      for (let y = area.top; y <= area.bottom; y++) for (let x = area.left; x <= area.right; x++) {
+        if (inclusionMask.data[y * width + x]) return [];
+      }
+    }
+    return [area];
+  });
 }
 
 function horizontalSpan(path, rect) {
@@ -492,8 +550,9 @@ export function runComputeOperation(type, payload = {}, suppliedImage = null) {
   }
   if (type === "classify-target") {
     const options = imageOptions(image, payload);
-    const markerInference = inferMarkerSeries(options);
-    const lineInference = markerInference.detected ? null : inferLineStyle(options);
+    const strokeDiagnosis = inferLineStyle(options);
+    const markerInference = inferMarkerSeries({ ...options, strokeDiagnosis });
+    const lineInference = markerInference.detected ? null : strokeDiagnosis;
     return { markerInference, lineInference };
   }
   if (type === "trace-marker") {

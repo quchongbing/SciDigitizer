@@ -3448,6 +3448,14 @@ function markerDiskFill(mask, width, height, centerX, centerY, radius) {
 function consolidateRegularMarkerGrid(knownMarkers, candidates, estimatedDiameter) {
   if (knownMarkers.length < 5) return null;
   const known = [...knownMarkers].sort((left, right) => left.x - right.x);
+  // A regular x grid is not evidence of a single-valued series: a scatter
+  // cloud can contain several independent observations at the same x. Never
+  // use the one-per-column heuristic when measured components disagree in y.
+  for (let index = 1; index < known.length; index += 1) {
+    const left = known[index - 1], right = known[index];
+    if (right.x - left.x < estimatedDiameter * 0.6
+      && Math.abs(right.y - left.y) > estimatedDiameter * 0.8) return null;
+  }
   const gaps = known.slice(1)
     .map((point, index) => point.x - known[index].x)
     .filter((gap) => gap >= Math.max(2, estimatedDiameter * 0.45) && gap <= estimatedDiameter * 2.2);
@@ -3528,7 +3536,11 @@ function consolidateRegularMarkerGrid(knownMarkers, candidates, estimatedDiamete
   for (const gridIndex of allIndices) {
     if (!selectedByIndex.has(gridIndex)) chooseCandidate(gridIndex, 1);
   }
-  return [...selectedByIndex.values()].sort((left, right) => left.x - right.x);
+  const selected = [...selectedByIndex.values()];
+  // Grid phase is only a heuristic for attached disks, never a reason to
+  // discard a separately measured component with irregular x spacing.
+  if (knownMarkers.some(point => !selected.includes(point))) return null;
+  return selected.sort((left, right) => left.x - right.x);
 }
 
 function attachedMarkerCenters({
@@ -3595,11 +3607,9 @@ function attachedMarkerCenters({
       const x = safeRect.left + refinedX;
       const refinedGlobalY = safeRect.top + refinedY;
 
-      if (anchors.length >= 2) {
+      if (strictGuideCorridor && anchors.length >= 2) {
         const guideY = guideYAtX(anchors, x);
-        const tolerance = strictGuideCorridor
-          ? clamp(safeRect.width * 0.018, 5, 16)
-          : clamp(safeRect.height * 0.12, 14, 42);
+        const tolerance = clamp(safeRect.width * 0.018, 5, 16);
         if (Math.abs(refinedGlobalY - guideY) > tolerance) continue;
       }
 
@@ -3637,10 +3647,8 @@ function attachedMarkerCenters({
   const columnRunOptions = [];
   for (let localX = 1; localX < width - 1; localX += 1) {
     const x = safeRect.left + localX;
-    const guideY = anchors.length >= 2 ? guideYAtX(anchors, x) : null;
-    const guideTolerance = strictGuideCorridor
-      ? clamp(safeRect.width * 0.018, 5, 16)
-      : clamp(safeRect.height * 0.12, 14, 42);
+    const guideY = strictGuideCorridor && anchors.length >= 2 ? guideYAtX(anchors, x) : null;
+    const guideTolerance = clamp(safeRect.width * 0.018, 5, 16);
     let runStart = null;
     let bestRun = null;
     const eligibleRuns = [];
@@ -3865,11 +3873,11 @@ export function extractMarkerCenters({
 
     const x = safeRect.left + sumX / area;
     const y = safeRect.top + sumY / area;
-    if (anchors.length >= 2) {
+    // Guides label measured centres. Only the explicit same-colour constraint
+    // may turn them into a y(x) corridor; ordinary scatter is not a function.
+    if (strictGuideCorridor && anchors.length >= 2) {
       const guideY = guideYAtX(anchors, x);
-      const tolerance = strictGuideCorridor
-        ? clamp(safeRect.width * 0.018, 5, 16)
-        : clamp(safeRect.height * 0.12, 14, 42);
+      const tolerance = clamp(safeRect.width * 0.018, 5, 16);
       if (Math.abs(y - guideY) > tolerance) continue;
     }
     components.push({
@@ -3889,8 +3897,19 @@ export function extractMarkerCenters({
     .map((point) => Math.min(point.componentWidth, point.componentHeight))
     .filter((diameter) => Number.isFinite(diameter) && diameter >= 3);
   const fallbackDiameter = clamp(Math.min(safeRect.width, safeRect.height) * 0.018, 5, 14);
+  const clickedComponent = components.filter(point => {
+    const small = Math.min(point.componentWidth, point.componentHeight);
+    const large = Math.max(point.componentWidth, point.componentHeight);
+    return small >= 6 && small / large >= 0.7
+      && point.componentArea / (point.componentWidth * point.componentHeight) >= 0.5
+      && anchors.some(anchor => Math.hypot(anchor.x - point.x, anchor.y - point.y) <= Math.max(3, small * 0.6));
+  }).sort((a, b) => (
+    Math.min(...anchors.map(anchor => Math.hypot(anchor.x - a.x, anchor.y - a.y)))
+    - Math.min(...anchors.map(anchor => Math.hypot(anchor.x - b.x, anchor.y - b.y)))
+  ))[0];
   const estimatedDiameter = clamp(
-    componentDiameters.length ? median(componentDiameters) : fallbackDiameter,
+    clickedComponent ? Math.min(clickedComponent.componentWidth, clickedComponent.componentHeight)
+      : componentDiameters.length ? median(componentDiameters) : fallbackDiameter,
     4,
     maximumDiameter,
   );
@@ -3975,9 +3994,37 @@ export function inferMarkerSeries({
   threshold = 42,
   exclusions = [],
   inclusionMask = null,
+  strokeDiagnosis = null,
 } = {}) {
   if (!rgba || rgba.length !== width * height * 4 || !rect || !seed || !target) {
     return { detected: false, confidence: 0, markers: [], reason: "insufficient-input" };
+  }
+  strokeDiagnosis ??= inferLineStyle({ rgba, width, height, rect, seed, target, threshold, exclusions });
+  // Solid thin strokes are by far the commonest target. A filled marker core
+  // must occupy more than a narrow stripe in a 5px neighbourhood. Probe nearby
+  // centres as well, so an antialiased / slightly missed marker click is not
+  // rejected. This avoids full-panel components and distance transforms for
+  // clear thin-line picks; uncertain or patterned picks retain the full test.
+  if (strokeDiagnosis.style === "line") {
+    let maximumFill = 0;
+    for (let cy = Math.round(seed.y) - 2; cy <= Math.round(seed.y) + 2; cy++) {
+      for (let cx = Math.round(seed.x) - 2; cx <= Math.round(seed.x) + 2; cx++) {
+        let ink = 0;
+        for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
+          const x = cx + dx, y = cy + dy;
+          if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) continue;
+          if (!inclusionMaskAllows(inclusionMask, width, x, y)
+            || exclusions.some(area => x >= area.left && x <= area.right && y >= area.top && y <= area.bottom)) continue;
+          const index = (y * width + x) * 4;
+          if (rgba[index + 3] >= 32 && compositedColorDistance(rgba[index], rgba[index + 1], rgba[index + 2], target) <= threshold) ink++;
+        }
+        maximumFill = Math.max(maximumFill, ink / 25);
+      }
+    }
+    if (maximumFill <= 0.6) return {
+      detected: false, confidence: 0.15, markers: [], reason: "thin-continuous-stroke",
+      evidence: { coreFill: maximumFill, strokeFingerprint: strokeDiagnosis.style },
+    };
   }
   const rawMarkers = extractMarkerCenters({
     rgba,
@@ -4007,21 +4054,15 @@ export function inferMarkerSeries({
   const seedDistance = seedCandidate
     ? Math.hypot(seedCandidate.x - seed.x, seedCandidate.y - seed.y)
     : Infinity;
-  const strokeDiagnosis = inferLineStyle({
-    rgba,
-    width,
-    height,
-    rect,
-    seed,
-    target,
-    threshold,
-    exclusions,
-  });
+  const compactDisk = point => Number.isFinite(point.componentArea)
+    && Math.min(point.componentWidth, point.componentHeight) / Math.max(point.componentWidth, point.componentHeight) >= 0.7
+    && point.componentArea / (point.componentWidth * point.componentHeight) >= 0.5;
+  const compactSeed = compactDisk(seedCandidate ?? {}) && seedDistance <= Math.max(3, seedThickness * 0.6);
   if (
     !Number.isFinite(seedThickness)
     || seedThickness < 7
     || seedDistance > Math.max(4, seedThickness * 1.05)
-    || strokeDiagnosis.style === "line"
+    || (strokeDiagnosis.style === "line" && !compactSeed)
   ) {
     return {
       detected: false,
@@ -4038,7 +4079,7 @@ export function inferMarkerSeries({
   }
 
   const boundaryMargin = Math.max(3, seedThickness * 0.42);
-  const shapeFiltered = rawMarkers.filter((point) => (
+  let shapeFiltered = rawMarkers.filter((point) => (
     (point.confidence ?? 0) >= 0.76
     && (point.thickness ?? 0) >= Math.max(3, seedThickness * 0.72)
     && (point.thickness ?? Infinity) <= seedThickness * 2.05
@@ -4047,6 +4088,23 @@ export function inferMarkerSeries({
     && point.y > rect.top + boundaryMargin
     && point.y < rect.bottom - boundaryMargin
   ));
+  if (compactSeed) {
+    // Isolated circles can have a locally continuous fingerprint (a single
+    // disk fills the entire short ruler). Follow the spatially connected,
+    // size-matched series through the clicked disk, not a remote legend dot.
+    // Do not apply this to attached markers / noise peaks or loosen line mode.
+    shapeFiltered = shapeFiltered.filter(compactDisk);
+    const connected = shapeFiltered.filter(point => Math.hypot(point.x - seed.x, point.y - seed.y) <= Math.max(3, seedThickness * 0.6));
+    const remaining = new Set(shapeFiltered.filter(point => !connected.includes(point)));
+    const maximumGap = clamp(seedThickness * 8, 24, 100);
+    for (let cursor = 0; cursor < connected.length; cursor++) {
+      for (const point of remaining) if (Math.hypot(point.x - connected[cursor].x, point.y - connected[cursor].y) <= maximumGap) {
+        connected.push(point);
+        remaining.delete(point);
+      }
+    }
+    shapeFiltered = connected;
+  }
   const markers = consolidateMarkerSeriesCandidates(shapeFiltered, seed, seedThickness);
   if (markers.length < 5) {
     return {
@@ -4066,7 +4124,9 @@ export function inferMarkerSeries({
   const slopes = markers.slice(1).map((point, index) => (
     (point.y - markers[index].y) / Math.max(1, point.x - markers[index].x)
   ));
-  const slopeChanges = slopes.slice(1).map((slope, index) => Math.abs(slope - slopes[index]));
+  const slopeChanges = slopes.slice(1).map((slope, index) => compactSeed
+    ? Math.abs(Math.atan(slope) - Math.atan(slopes[index]))
+    : Math.abs(slope - slopes[index]));
   const medianSlopeChange = median(slopeChanges) ?? 0;
   const smoothness = 1 - clamp(medianSlopeChange / 1.35, 0, 1);
   const horizontalSpan = (markers.at(-1).x - markers[0].x) / Math.max(1, rect.width);
@@ -4080,11 +4140,14 @@ export function inferMarkerSeries({
   const seedSupport = markers.some((point) => (
     Math.hypot(point.x - seed.x, point.y - seed.y) <= Math.max(4, seedThickness * 1.05)
   ));
+  const conflictingCompactBranch = compactSeed && markers.some((point, index) => index > 0
+    && point.x - markers[index - 1].x <= seedThickness * 0.4
+    && Math.abs(point.y - markers[index - 1].y) > seedThickness * 3);
   const confidence = clamp(
     0.12
       + countScore * 0.18
       + spanScore * 0.14
-      + regularGapFraction * 0.2
+      + (compactSeed ? 1 : regularGapFraction) * 0.2
       + smoothness * 0.15
       + shapeAgreement * 0.16
       + (seedSupport ? 0.08 : 0),
@@ -4094,7 +4157,10 @@ export function inferMarkerSeries({
   const detected = confidence >= 0.78
     && seedSupport
     && horizontalSpan >= 0.22
-    && regularGapFraction >= 0.68
+    && (compactSeed || regularGapFraction >= 0.68)
+    // A median alone hides a remote, same-sized dot at the same X. Keep sharp
+    // real turns, but do not certify a second distant branch as a y(x) series.
+    && !conflictingCompactBranch
     && smoothness >= 0.7;
   return {
     detected,
@@ -4112,6 +4178,7 @@ export function inferMarkerSeries({
       regularGapFraction,
       smoothness,
       shapeAgreement,
+      compactSeed,
     },
   };
 }

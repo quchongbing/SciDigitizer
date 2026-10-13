@@ -8,7 +8,7 @@
       content="SciDigitizer — 面向科学论文曲线的本地半自动数值提取工具"
     />
     <title>SciDigitizer</title>
-    <link rel="stylesheet" href="styles.css?v=0.20.0-preview.3.23" />
+    <link rel="stylesheet" href="styles.css?v=0.20.0-preview.3.24" />
   </head>
   <body>
     <header class="topbar">
@@ -246,6 +246,13 @@
             <div id="x-calibration-quality">X：等待人工标定</div>
             <div id="y-calibration-quality">Y：等待人工标定</div>
           </div>
+          <p class="status-line">当前曲线坐标随标定即时更新，无需重新提取。</p>
+          <div id="saved-calibration-panel" class="axis-card saved-calibration-panel" hidden>
+            <label class="field-label" for="calibration-series-target">更新已存曲线的标定</label>
+            <select id="calibration-series-target" class="select-control" aria-describedby="saved-calibration-help" data-i18n-skip></select>
+            <p id="saved-calibration-help" class="status-line">替换所选曲线的 X/Y 标定，其他曲线不变。保留数据点位置，可撤销。</p>
+            <button id="apply-saved-calibration" type="button" class="button-secondary">应用当前标定</button>
+          </div>
         </section>
 
         <section class="panel-section panel-collapsible is-collapsed" data-panel-step="trace">
@@ -273,7 +280,7 @@
               <option value="dashdot">点划线（长划线 + 短点）</option>
               <option value="dotted">点线（短点组成的曲线）</option>
               <option value="noisy">实验噪声线（保留局部波动）</option>
-              <option value="markers">圆点 / marker 中心</option>
+              <option value="markers">散点 / marker 中心</option>
             </select>
           </details>
 
@@ -611,10 +618,10 @@
       (() => {
         const appScript = document.createElement("script");
         if (window.location.protocol === "file:") {
-          appScript.src = "dist/app-file.js?v=0.20.0-preview.3.23";
+          appScript.src = "dist/app-file.js?v=0.20.0-preview.3.24";
         } else {
           appScript.type = "module";
-          appScript.src = "src/app.js?v=0.20.0-preview.3.23";
+          appScript.src = "src/app.js?v=0.20.0-preview.3.24";
         }
         document.body.appendChild(appScript);
       })();

@@ -1968,6 +1968,39 @@ function syncCalibrationRefinement() {
     : "方向键可上下左右移动紫色十字；每次 1 px，Shift+方向键为 0.1 px。";
 }
 
+function syncSavedCalibrationControls() {
+  const panel = $("#saved-calibration-panel");
+  panel.hidden = !state.series.length;
+  const select = $("#calibration-series-target");
+  const previousTarget = select.value;
+  const targets = state.series.map((series, index) => [
+    `series:${series.id}`, series.label || `Curve ${index + 1}`,
+  ]);
+  if (targets.length > 1) targets.push(["all", translateMessage("全部已存曲线")]);
+  // Use text nodes: curve names are user input, not markup or translated UI.
+  select.replaceChildren(...targets.map(([value, label]) => new Option(label, value)));
+  select.value = targets.some(([value]) => value === previousTarget)
+    ? previousTarget : `series:${state.editingSeriesId ?? state.series[0]?.id}`;
+  select.disabled = Boolean(state.computeBusy) || state.rotationPreviewActive;
+  $("#apply-saved-calibration").disabled = panel.hidden || select.disabled || !calibrationsValid();
+}
+
+function applyCurrentCalibrationToSavedCurves() {
+  if (state.computeBusy || state.rotationPreviewActive || !calibrationsValid()) return;
+  const target = $("#calibration-series-target").value;
+  const selected = state.series.filter((series) => target === "all" || target === `series:${series.id}`);
+  if (!selected.length) return;
+  // Preserve pixel geometry and independent calibrations unless explicitly selected.
+  // A separate snapshot per curve also keeps future edits isolated.
+  const calibration = currentCalibrationSnapshot();
+  for (const series of selected) series.calibration = cloneSerializable(calibration);
+  updateUi();
+  updateCursorReadout(state.cursor);
+  draw();
+  commitHistory("更新已存曲线的标定");
+  showToast(translateMessage(`已更新 ${selected.length} 条曲线的标定；无需重新提取，可撤销`));
+}
+
 function renderSeriesList() {
   const list = $("#series-list");
   if (!state.series.length) {
@@ -2183,8 +2216,9 @@ function automaticMarkerSeriesActive() {
 }
 
 function minimumTraceAnchorCount() {
-  if ($("#target-style").value !== "markers") return 1;
-  return automaticMarkerSeriesActive() ? 1 : 3;
+  // An explicit marker choice already supplies the user's intent. A point
+  // cloud need not have a bend or a far-end guide like a continuous curve.
+  return 1;
 }
 
 function syncPointCountInput() {
@@ -2563,6 +2597,7 @@ function updateUi() {
   syncCalibrationValidation();
   syncCalibrationRefinement();
   const coordinateAudit = syncCalibrationQuality();
+  syncSavedCalibrationControls();
 
   if (state.seedColor) {
     const { r, g, b } = state.seedColor;
@@ -2644,7 +2679,7 @@ function updateUi() {
   $("#strict-guide-help").textContent = markerMode
     ? (markerStrictReady
       ? "已有至少 4 个引导点；仅当附近还有同色 marker 分支时开启"
-      : "marker 默认使用柔性引导；添加到至少 4 个引导点后才可强约束")
+      : "默认保留同色散点；添加至少 4 个引导点后可启用强约束")
     : "拒绝偏离引导走廊的同色分支；普通曲线无需开启";
   const patternedLineMode = ["dashed", "dashdot", "dotted"].includes($("#target-style").value);
   $("#trace-point-count").disabled = Boolean(state.computeBusy) || state.traceStale;
@@ -2663,7 +2698,7 @@ function updateUi() {
   $("#target-style-hint").textContent = markerMode
     ? (automaticMarkerSeriesActive()
       ? "已从一次点击识别重复 marker；请直接复核中心。只有附近存在同色点列时才需要补引导点。"
-      : "选择孤立圆点，再在点列的弯曲处和另一端各加 1 个引导点。保持柔性引导；程序会识别粘在线上的局部圆核和规则间距。右键菱形可删除。")
+      : "点击一个清晰散点即可提取同色标记。用 Pen 或屏蔽区排除图例和其他点列；引导点为可选辅助，不默认压缩点云。")
     : patternedLineMode
       ? "在清晰、孤立且较平缓的目标划线上取色；程序会学习划线长度和间隔。交叉或陡峭处仍需添加引导点；右键菱形可删除。"
       : $("#target-style").value === "noisy"
@@ -3302,9 +3337,6 @@ async function traceCurrentCurve({ silent = false, refreshHistory = true } = {})
   try {
     const previouslySelectedAnchor = state.selectedAnchorIndex;
     let targetStyle = $("#target-style").value;
-    if (targetStyle === "markers" && state.anchors.length < minimumTraceAnchorCount()) {
-      throw new Error("marker 模式需要取色种子，并在点列弯曲处和另一端各添加 1 个引导点");
-    }
     const effectiveStrictGuidance = $("#strict-guide").checked
       && (targetStyle !== "markers" || state.anchors.length >= 4);
     const avoidPaths = targetStyle === "markers" ? [] : sameColorAvoidancePaths();
@@ -3412,8 +3444,8 @@ async function traceCurrentCurve({ silent = false, refreshHistory = true } = {})
     if (refreshHistory) editSession?.refreshCurrent();
     const observed = state.path.filter((point) => point.observed).length;
     if (targetStyle === "markers") {
-      const markerGuidance = effectiveStrictGuidance ? "强约束" : "柔性引导";
-      if (!silent) showToast(`识别到 ${state.path.length} 个 marker 中心 · ${markerGuidance}。已检测独立圆点及粘在线上的局部圆核`);
+      const markerGuidance = effectiveStrictGuidance ? "强约束" : "保留真实散点";
+      if (!silent) showToast(`识别到 ${state.path.length} 个散点 · ${markerGuidance}`);
     } else {
       const samplingLabel = nextOrientation === "parametric" ? "二维弧长采样" : $("#sampling-mode").value === "peak"
         ? "峰值自适应"
@@ -3924,7 +3956,7 @@ async function selectTraceTarget(point) {
   state.draggedAnchorIndex = null;
   setMode(null);
   try {
-    if ($("#target-style").value === "auto") {
+    if ($("#target-style").value === "auto" || $("#target-style").dataset.autoDetected) {
       state.computeBusy = "classify";
       updateUi();
       draw();
@@ -3957,12 +3989,8 @@ async function selectTraceTarget(point) {
     state.computeBusy = null;
     updateUi();
     draw();
-    if ($("#target-style").value === "markers" && !automaticMarkerSeriesActive()) {
-      showToast("marker 颜色已采样；请在点列弯曲处和另一端各添加 1 个引导点");
-    } else {
-      const traced = await traceCurrentCurve({ refreshHistory: false });
-      if (!traced) return false;
-    }
+    const traced = await traceCurrentCurve({ refreshHistory: false });
+    if (!traced) return false;
     if (selectionId !== targetSelectionSequence || state.seed?.anchorId !== selectedAnchorId) return false;
     commitHistory("选择目标并智能追踪");
     return true;
@@ -5084,8 +5112,15 @@ for (const selector of [
     updateCursorReadout(state.cursor);
     scheduleDraftSave();
   });
-  $(selector).addEventListener("change", () => commitHistory("修改标定或标签"));
+  $(selector).addEventListener("change", () => {
+    updateUi();
+    updateCursorReadout(state.cursor);
+    draw();
+    commitHistory("修改标定或标签");
+  });
 }
+
+$("#apply-saved-calibration").addEventListener("click", applyCurrentCalibrationToSavedCurves);
 
 $("#calibration-snap").addEventListener("change", () => {
   scheduleDraftSave();
@@ -5167,6 +5202,7 @@ $("#series-list").addEventListener("click", (event) => {
     }
     if (!state.editingSeriesId) state.calibrationBeforeSeriesEdit = currentCalibrationSnapshot();
     state.editingSeriesId = id;
+    $("#calibration-series-target").value = `series:${id}`;
     applyCalibrationSnapshot(curveCalibrationSnapshot(series));
     state.path = createDataPath(series.path);
     state.reviewRegionIndex = 0;

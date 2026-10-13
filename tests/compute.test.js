@@ -75,6 +75,65 @@ function drawPatternedParametricStroke(
   }
 }
 
+test("automatic black tracing protects a confirmed frame without cropping near-axis data", () => {
+  const image = whiteImage(240, 160), target = { r: 8, g: 8, b: 8 };
+  const rect = { left: 10, top: 10, right: 229, bottom: 149, width: 220, height: 140 };
+  fillRect(image, { left: 10, top: 10, right: 229, bottom: 11 }, target);
+  fillRect(image, { left: 10, top: 148, right: 229, bottom: 149 }, target);
+  fillRect(image, { left: 10, top: 10, right: 11, bottom: 149 }, target);
+  fillRect(image, { left: 228, top: 10, right: 229, bottom: 149 }, target);
+  for (let x = 35; x <= 205; x++) setPixel(image, x, Math.round(142 - (x - 35) * 0.63), target);
+  const anchors = [{ x: 110, y: Math.round(142 - 75 * 0.63), anchorId: "a", userGuided: true }];
+  const result = runComputeOperation("trace-line", { rect, target, anchors, threshold: 5,
+    targetStyle: "line", maxJump: 8, maxGap: 12, orientationMode: "auto" }, image);
+  assert.equal(result.orientation, "horizontal");
+  assert.ok(result.path.length >= 170);
+  assert.ok(result.path.every(point => Math.abs(point.y - (142 - (point.x - 35) * 0.63)) <= 0.6));
+  assert.ok(result.path.some(point => point.x === 35 && point.y === 142), "valid point close to lower axis was cropped");
+});
+
+test("frame protection respects explicit edge guides and does not treat L-shaped ink as a frame", () => {
+  const image = whiteImage(150, 100), target = { r: 8, g: 8, b: 8 };
+  const rect = { left: 5, top: 5, right: 144, bottom: 94, width: 140, height: 90 };
+  fillRect(image, { left: 5, top: 5, right: 144, bottom: 5 }, target);
+  fillRect(image, { left: 5, top: 5, right: 5, bottom: 94 }, target);
+  const seed = { x: 50, y: 5, anchorId: "edge", userGuided: true };
+  let result = runComputeOperation("trace-line", { rect, target, anchors: [seed], threshold: 5,
+    targetStyle: "line", maxJump: 8, maxGap: 12, orientationMode: "horizontal" }, image);
+  assert.ok(result.path.length >= 130);
+  assert.ok(result.path.some(point => point.anchorId === "edge" && point.y === 5));
+  fillRect(image, { left: 144, top: 5, right: 144, bottom: 94 }, target);
+  fillRect(image, { left: 5, top: 94, right: 144, bottom: 94 }, target);
+  result = runComputeOperation("trace-line", { rect, target, anchors: [seed], threshold: 5,
+    targetStyle: "line", maxJump: 8, maxGap: 12, orientationMode: "horizontal" }, image);
+  assert.ok(result.path.length >= 130, "explicit edge guide must override automatic frame protection");
+  const data = new Uint8Array(image.width * image.height);
+  for (let x = 5; x <= 144; x++) data[5 * image.width + x] = 1;
+  result = runComputeOperation("trace-line", { rect, target, anchors: [{ ...seed, y: 6 }], threshold: 5,
+    inclusionMask: prepareInclusionMask(data, image.width, image.height, "strict"),
+    targetStyle: "line", maxJump: 8, maxGap: 12, orientationMode: "horizontal" }, image);
+  assert.ok(result.path.length >= 130, "painted edge must remain available");
+});
+
+test("confirmed black frame protection tolerates a one- or two-pixel outer fringe", () => {
+  for (const fringe of [1, 2]) {
+    const image = whiteImage(240, 160), target = { r: 8, g: 8, b: 8 };
+    const rect = { left: 10, top: 10, right: 229, bottom: 149, width: 220, height: 140 };
+    const left = rect.left + fringe, right = rect.right - fringe;
+    const top = rect.top + fringe, bottom = rect.bottom - fringe;
+    fillRect(image, { left, right, top, bottom: top + 1 }, target);
+    fillRect(image, { left, right, top: bottom - 1, bottom }, target);
+    fillRect(image, { left, right: left + 1, top, bottom }, target);
+    fillRect(image, { left: right - 1, right, top, bottom }, target);
+    for (let x = 35; x <= 205; x++) setPixel(image, x, Math.round(142 - (x - 35) * 0.63), target);
+    const result = runComputeOperation("trace-line", { rect, target, threshold: 5,
+      anchors: [{ x: 110, y: Math.round(142 - 75 * 0.63), anchorId: "a" }],
+      targetStyle: "line", maxJump: 8, maxGap: 12, orientationMode: "auto" }, image);
+    assert.ok(result.path.length >= 170);
+    assert.ok(result.path.every(point => Math.abs(point.y - (142 - (point.x - 35) * 0.63)) <= 0.6));
+  }
+});
+
 test("background compute engine preserves the synchronous line-tracing result", () => {
   const image = whiteImage(70, 44);
   const target = { r: 25, g: 135, b: 210 };

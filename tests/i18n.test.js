@@ -31,6 +31,12 @@ test("static interface labels translate to concise English", () => {
     "A repeated marker series was recognized from one click. Review the centers; add guides only if another same-color marker series is nearby.",
   );
   assert.equal(translateMessage("智能消歧", "en"), "Smart disambiguation");
+  assert.equal(translateMessage("应用当前标定", "en"), "Apply current calibration");
+  assert.equal(translateMessage("全部已存曲线", "en"), "All saved curves");
+  assert.equal(translateMessage("已更新 2 条曲线的标定；无需重新提取，可撤销", "en"),
+    "Updated calibration for 2 curves; no retracing needed. You can undo this");
+  assert.equal(translateMessage("散点 / marker 中心", "en"), "Scatter / marker centers");
+  assert.doesNotMatch(translateMessage("点击一个清晰散点即可提取同色标记。用 Pen 或屏蔽区排除图例和其他点列；引导点为可选辅助，不默认压缩点云。", "en"), /\p{Script=Han}/u);
   assert.equal(translateMessage("同色竞争已自动局部增强", "en"), "same-color guidance strengthened locally");
   const noPenFailure = translateMessage("无法连续连接全部引导点；请检查引导点位置，并在转弯或交叉两侧补充引导点", "en");
   assert.match(noPenFailure, /Cannot connect all guide points/);
@@ -42,6 +48,8 @@ test("static interface labels translate to concise English", () => {
 });
 
 test("dynamic trace summaries retain their numeric values in English", () => {
+  assert.equal(translateMessage("识别到 32 个散点 · 保留真实散点", "en"),
+    "Detected 32 scatter points · measured centers retained");
   assert.equal(
     translateMessage("RGB(0, 139, 0) · 连续细线 · 2 个引导基准点 · 100 个数据点", "en"),
     "RGB(0, 139, 0) · Continuous line · 2 guide points · 100 data points",

@@ -2211,6 +2211,67 @@ test("one-click marker inference leaves an ordinary thick curve in line mode", (
   assert.deepEqual(inference.markers, []);
 });
 
+test("isolated circle inference accepts irregular sampling without joining a remote legend", () => {
+  const width = 280, height = 180, rgba = whiteImage(width, height);
+  const target = { r: 255, g: 165, b: 0 };
+  const truth = [20, 30, 45, 65, 90, 120, 150, 185, 220, 255].map(x => ({ x, y: 160 - x * 0.38 }));
+  for (const p of [...truth, { x: 150, y: 18 }]) {
+    for (let dy = -4; dy <= 4; dy++) for (let dx = -4; dx <= 4; dx++) {
+      if (dx * dx + dy * dy <= 16) setPixel(rgba, width, Math.round(p.x + dx), Math.round(p.y + dy), target);
+    }
+  }
+  // Small same-colour fragments must not shrink the clicked marker's size.
+  for (let x = 35; x < 235; x += 12) for (let dy = 0; dy < 3; dy++) for (let dx = 0; dx < 3; dx++) {
+    setPixel(rgba, width, x + dx, 24 + dy, target);
+  }
+  for (const seed of [truth[5], truth[8]]) {
+    const inferred = inferMarkerSeries({ rgba, width, height, target, threshold: 5,
+      rect: { left: 5, top: 5, right: 274, bottom: 174, width: 270, height: 170 }, seed });
+    assert.equal(inferred.detected, true, JSON.stringify(inferred));
+    assert.equal(inferred.markers.length, truth.length);
+    assert.ok(inferred.markers.every((point, index) => Math.hypot(point.x - truth[index].x, point.y - truth[index].y) < 0.6));
+  }
+});
+
+test("circle inference does not auto-select a broad scattered cloud", () => {
+  const width = 260, height = 180, rgba = whiteImage(width, height);
+  const target = { r: 30, g: 100, b: 210 };
+  const truth = [130, 35, 125, 45, 135, 40, 120, 30, 140, 50, 125].map((y, index) => ({ x: 20 + index * 21, y }));
+  for (const p of truth) for (let dy = -4; dy <= 4; dy++) for (let dx = -4; dx <= 4; dx++) {
+    if (dx * dx + dy * dy <= 16) setPixel(rgba, width, p.x + dx, p.y + dy, target);
+  }
+  const inferred = inferMarkerSeries({ rgba, width, height, target, threshold: 5,
+    rect: { left: 5, top: 5, right: 254, bottom: 174, width: 250, height: 170 }, seed: truth[4] });
+  assert.equal(inferred.detected, false, JSON.stringify(inferred));
+});
+
+test("compact marker inference rejects a nearby same-sized dot on a second branch", () => {
+  const width = 280, height = 180, rgba = whiteImage(width, height), target = { r: 255, g: 165, b: 0 };
+  const truth = [20, 30, 45, 65, 90, 120, 150, 185, 220, 255].map(x => ({ x, y: 145 - x * 0.38 }));
+  for (const p of [...truth, { x: 150, y: 18 }]) for (let dy = -4; dy <= 4; dy++) for (let dx = -4; dx <= 4; dx++) {
+    if (dx * dx + dy * dy <= 16) setPixel(rgba, width, Math.round(p.x + dx), Math.round(p.y + dy), target);
+  }
+  const inferred = inferMarkerSeries({ rgba, width, height, target, threshold: 5,
+    rect: { left: 5, top: 5, right: 274, bottom: 174, width: 270, height: 170 }, seed: truth[5] });
+  assert.equal(inferred.detected, false, JSON.stringify(inferred));
+  assert.deepEqual(inferred.markers, []);
+});
+
+test("clear thin-line classification uses the local core gate, including steep slopes", () => {
+  const width = 150, height = 120;
+  for (const steep of [false, true]) {
+    const rgba = whiteImage(width, height), target = { r: 20, g: 90, b: 210 };
+    const seed = { x: 70, y: 55 };
+    drawLine(rgba, width, height, steep ? { x: 60, y: 10 } : { x: 10, y: 45 },
+      steep ? { x: 80, y: 100 } : { x: 130, y: 65 }, target, 1);
+    const inferred = inferMarkerSeries({ rgba, width, height, target, seed, threshold: 5,
+      rect: { left: 4, top: 4, right: 145, bottom: 115, width: 142, height: 112 } });
+    assert.equal(inferred.detected, false);
+    assert.equal(inferred.reason, "thin-continuous-stroke");
+    assert.ok(inferred.evidence.coreFill <= 0.6);
+  }
+});
+
 test("colour discovery finds persistent curves but ignores short legend swatches", () => {
   const width = 240;
   const height = 150;
