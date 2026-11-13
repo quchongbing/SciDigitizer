@@ -9,12 +9,41 @@ const width = 120;
 const height = 100;
 const rect = { left: 0, top: 0, right: width - 1, bottom: height - 1, width, height };
 
+test("a lone or duplicated seed is not an extracted line; a single measured marker remains valid", () => {
+  const seed = { x: 10, y: 20, anchor: true, userGuided: true, anchorId: "a" };
+  for (const path of [[seed], [seed, { ...seed }]]) {
+    assert.throws(() => prepareTraceOutput(path, { count: 100, requireCurveSegment: true }), { code: "NO_CURVE_SEGMENT" });
+    assert.throws(() => prepareTraceOutput(path, {
+      count: 100, requireCurveSegment: true, inclusionMask: bentMask("strict"), width, height, rect,
+    }), { code: "PEN_SEED_OUTSIDE" });
+  }
+  assert.equal(prepareTraceOutput([{ ...seed, marker: true }], {
+    markerData: true, count: 100, requireCurveSegment: true,
+  }).path.length, 1);
+  // Editing, restoring, and exporting deliberately reduced single-point data
+  // must not be confused with the result of a fresh failed automatic trace.
+  assert.equal(prepareTraceOutput([seed]).path.length, 1);
+});
+
 function bentMask(mode) {
   const data = new Uint8Array(width * height);
   for (let x = 20; x <= 50; x += 1) data[20 * width + x] = 1;
   for (let y = 20; y <= 50; y += 1) data[y * width + 50] = 1;
   return prepareInclusionMask(data, width, height, mode);
 }
+
+test("a fresh local Pen trace cannot claim success without reaching the paint", () => {
+  const inclusionMask = bentMask("local");
+  const path = [{ x: 5, y: 20, anchor: true, userGuided: true }, { x: 10, y: 20, observed: true }];
+  const options = { inclusionMask, width, height, rect, requireCurveSegment: true };
+  assert.throws(() => prepareTraceOutput(path, options), { code: "PEN_NOT_REACHED" });
+  // Validation of previously stored/editor-reduced data has no fresh-repair
+  // requirement. Marker selection keeps its own discrete identity contract.
+  assert.equal(prepareTraceOutput(path, { ...options, requireCurveSegment: false }).path.length, 2);
+  assert.equal(prepareTraceOutput(path, { ...options, markerData: true }).path.length, 2);
+  assert.equal(prepareTraceOutput([...path, { x: 25, y: 20, observed: true }], options).path.length, 3);
+  assert.doesNotMatch(translateMessage("未能接入 Pen 涂画区段；请将笔迹起点与可见曲线稍有重叠，必要时在遮挡两侧添加引导点", "en"), /\p{Script=Han}/u);
+});
 
 test("Pen local and strict scopes are explicit and invariant across trace orientations", () => {
   const local = bentMask("local");

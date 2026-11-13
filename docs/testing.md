@@ -52,6 +52,31 @@ npm run smoke:app
   both legacy and newer drafts; old validity flags are not trusted.
   包括用鼠标涂画示例蓝色虚线的 12/24 px 局部 Pen、减少标记点时保留引导点，
   以及新旧草稿重新校验（不直接信任已保存的“有效”标记）。
+  Also picks the red solid line once, then paints its full route at 12/24/40 px
+  in both Pen scopes. Checks full coverage, branch identity, estimate labels
+  and export availability without adding endpoint guides.
+  另检查红色实线单点选择后，以 12/24/40 px 笔宽涂完整路径，两种 Pen 范围均
+  验证覆盖、分支身份、估计标记和导出可用性，不补端点引导点。
+  Blue solid/dashed checks use automatic line-type selection, one target click,
+  both scopes, and 12/24 px brushes painted before/after the click. A partial
+  strict stroke excluding the click must retain the previous 100 points and
+  density, report the scope mismatch, and recover when the route is completed.
+  蓝色实线/虚线检查使用自动线型、一个目标点、两种范围及 12/24 px 笔宽，
+  覆盖先涂画或先选点的操作。完整约束下笔迹不含目标点时，应保留上次 100 点
+  及采样数量、提示范围不匹配，并在补涂完整路径后恢复。
+  Late blue-solid repair tests paint only the hidden right tail at 12/24/40 px
+  using the new local default, leaving the original left click outside the
+  paint. They check full coverage, unchanged visible left pixels and guides,
+  estimate metadata, and export. The strict warning's local-retry button is
+  tested separately; saved strict scopes still remain strict on restore.
+  右侧局部修补测试使用默认局部辅助，以 12/24/40 px 笔宽只涂蓝色实线遮挡尾段，
+  不覆盖左侧原选点；验证完整覆盖、左侧观测与引导点不变、估计标记及导出。
+  另检查完整约束失败后的局部重试按钮；恢复旧项目时仍保留已存的完整约束。
+  Unit checks also reject distant/side entries and explicit entrance erasures,
+  in both horizontal and vertical frames. Hidden-point checks validate the
+  painted trajectory and labels, not the unknowable location of hidden ink.
+  单元测试还检查横向/纵向的远距离、侧向和擦除入口均不可伪造连接。
+  遮挡点检查验证的是涂画路径与标记，不等同于验证原图不可见的真实曲线位置。
   Also checks a 32-point cloud with four y values at each x through manual
   marker selection, optional guides, calibration and CSV/TXT export.
   另检查 32 点散点云（每个 x 对应四个 y）的取色、可选引导、标定和 CSV/TXT 导出。

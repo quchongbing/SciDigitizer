@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { traceCurveThroughAnchors, prepareInclusionMask, inclusionMaskAllows } from "../src/core.js";
+import { traceCurveThroughAnchors, prepareInclusionMask, inclusionMaskAllows, inclusionPathViolation,
+  completePaintedTraceTails } from "../src/core.js";
 import { prepareRestoredTrace, prepareTraceOutput } from "../src/trace-output.js";
 import { createComputeClient } from "../src/compute-client.js";
 import { runComputeOperation } from "../src/compute-engine.js";
@@ -74,6 +75,30 @@ function drawPatternedParametricStroke(
     previous = point;
   }
 }
+
+test("a strict Pen excluding the only seed fails instead of returning a false one-point curve", () => {
+  const image = whiteImage(160, 100), target = { r: 0, g: 0, b: 255 };
+  const rect = { left: 0, top: 0, right: 159, bottom: 99, width: 160, height: 100 };
+  for (let x = 10; x <= 140; x++) setPixel(image, x, 40, target);
+  const anchors = [{ x: 20, y: 40, userGuided: true, anchorId: "seed" }];
+  const data = new Uint8Array(image.width * image.height);
+  for (let x = 80; x <= 140; x++) for (let y = 34; y <= 46; y++) data[y * image.width + x] = 1;
+  const payload = { rect, target, anchors, threshold: 5, targetStyle: "line", maxJump: 8, maxGap: 12 };
+  for (const orientationMode of ["auto", "horizontal", "vertical"]) {
+    assert.throws(() => runComputeOperation("trace-line", {
+      ...payload, orientationMode, inclusionMask: prepareInclusionMask(data, image.width, image.height, "strict"),
+    }, image), { code: "PEN_SEED_OUTSIDE" });
+  }
+  const local = runComputeOperation("trace-line", {
+    ...payload, inclusionMask: prepareInclusionMask(data, image.width, image.height, "local"),
+  }, image);
+  assert.ok(local.path.length >= 130, "partial local assistance must still allow continuation");
+  for (let x = 10; x < 80; x++) for (let y = 34; y <= 46; y++) data[y * image.width + x] = 1;
+  const recovered = runComputeOperation("trace-line", {
+    ...payload, inclusionMask: prepareInclusionMask(data, image.width, image.height, "strict"),
+  }, image);
+  assert.equal(prepareTraceOutput(recovered.path, { count: 100, guides: anchors }).path.length, 100);
+});
 
 test("automatic black tracing protects a confirmed frame without cropping near-axis data", () => {
   const image = whiteImage(240, 160), target = { r: 8, g: 8, b: 8 };
@@ -1334,6 +1359,173 @@ test("automatic guidance cannot bridge an explicitly erased Pen band", () => {
     targetStyle: "line", strictGuideCorridor: false, orientationMode: "horizontal",
     inclusionMask: prepareInclusionMask(data, image.width, image.height, "strict", { erased }),
   }, image), error => error.code === "PEN_OUTSIDE" || error.code === "PEN_NO_VALID_PATH");
+});
+
+function paintedTailFixture({ vertical = false, reverse = false, roundCaps = false, scope = "strict", penWidth = 12, cut = null, paintStart = 15, paintEnd = 225, resumeInk = true, competitor = true } = {}) {
+  const image = whiteImage(vertical ? 120 : 240, vertical ? 240 : 120);
+  const point = (x, y) => {
+    const along = reverse ? 239 - x : x;
+    return vertical ? { x: y, y: along } : { x: along, y };
+  };
+  const target = { r: 220, g: 30, b: 40 };
+  const yAt = x => x <= 100 ? 40 : 40 + (x - 100) * 0.25;
+  const data = new Uint8Array(image.width * image.height), erased = new Uint8Array(data.length);
+  for (let x = 15; x <= 225; x++) {
+    const y = yAt(x);
+    if (x <= 100 || (resumeInk && x >= 195)) {
+      const p = point(x, Math.round(y)); setPixel(image, p.x, p.y, target);
+    }
+    // A dashed same-colour competitor inside the broadest painted tube.
+    if (competitor && x >= 70 && x < 145 && x % 12 < 7) {
+      const p = point(x, Math.round(y + 12)); setPixel(image, p.x, p.y, target);
+    }
+    if (roundCaps || x < paintStart || x > paintEnd) continue;
+    for (let row = Math.ceil(y - penWidth / 2); row <= Math.floor(y + penWidth / 2); row++) {
+      const p = point(x, row), index = p.y * image.width + p.x;
+      if (cut && x >= cut[0] && x <= cut[1]) erased[index] = 1;
+      else data[index] = 1;
+    }
+  }
+  if (roundCaps) {
+    // Match the actual Canvas brush, including round caps. Square masks can
+    // leave thinning spurs at the end and do not model this pointer workflow.
+    const radius = penWidth / 2;
+    for (let x = paintStart; x <= paintEnd; x++) {
+      const centerY = yAt(x);
+      for (let yy = Math.floor(centerY - radius); yy <= Math.ceil(centerY + radius); yy++) {
+        for (let xx = x - radius; xx <= x + radius; xx++) {
+          if (xx < 0 || xx >= 240 || yy < 0 || yy >= 120 || Math.hypot(xx - x, yy - centerY) > radius) continue;
+          const p = point(xx, yy); data[p.y * image.width + p.x] = 1;
+        }
+      }
+    }
+  }
+  const rect = { left: 5, top: 5, right: image.width - 6, bottom: image.height - 6,
+    width: image.width - 10, height: image.height - 10 };
+  const anchors = [{ ...point(50.125, 40), anchorId: "only-seed", userGuided: true }];
+  return { image, yAt, vertical, payload: { rect, anchors, target, threshold: 5,
+    inclusionMask: prepareInclusionMask(data, image.width, image.height, scope, { erased }),
+    maxJump: 14, maxGap: 24, targetStyle: "line", refinementMode: "full",
+    orientationMode: vertical ? "vertical" : "horizontal" } };
+}
+
+test("one guide and connected Pen complete a long hidden tail in both scan directions", () => {
+  for (const scope of ["strict", "local"]) for (const vertical of [false, true]) for (const penWidth of [12, 24, 40]) {
+    const { image, payload, yAt } = paintedTailFixture({ scope, vertical, penWidth });
+    const guideBefore = JSON.stringify(payload.anchors);
+    const result = runComputeOperation("trace-line", payload, image);
+    const along = p => vertical ? p.y : p.x, across = p => vertical ? p.x : p.y;
+    assert.ok(Math.max(...result.path.map(along)) >= 224, `${scope}/${vertical}/${penWidth}: premature end`);
+    const estimated = result.path.filter(p => along(p) > 145 && along(p) < 190);
+    assert.ok(estimated.length > 40 && estimated.every(p => p.penInferred && !p.observed && p.confidence <= 0.45));
+    assert.ok(result.path.filter(p => along(p) > 205).every(p => p.observed), "matching ink must be observed again after the gap");
+    assert.ok(result.path.every(p => Math.abs(across(p) - yAt(along(p))) <= 2),
+      `${scope}/${vertical}/${penWidth}: ${JSON.stringify(result.path.filter(p=>Math.abs(across(p)-yAt(along(p)))>2).slice(0,5))}`);
+    assert.equal(JSON.stringify(payload.anchors), guideBefore);
+    const contract = { ...payload, width: image.width, height: image.height, guides: payload.anchors, orientation: result.orientation };
+    assert.equal(inclusionPathViolation(result.path, contract), null);
+    for (const samplingMode of ["geometry", "uniform"]) for (const count of [30, 100, 200]) {
+      const output = prepareTraceOutput(result.path, { ...contract, count, parameters: { samplingMode } });
+      assert.equal(output.path.length, count);
+      assert.equal(output.path.filter(p => p.anchor || p.userGuided).length, 1, "brush estimates cannot become guides");
+      assert.ok(output.path.some(p => p.penInferred && p.origin === "pen-estimate" && !p.observed));
+      const restored = prepareRestoredTrace(JSON.parse(JSON.stringify({ ...output, anchors: payload.anchors })), contract);
+      assert.equal(restored.traceStale, false);
+      assert.deepEqual(restored.path, output.path);
+    }
+  }
+});
+
+test("Pen tail estimates stop at an eraser, separated stroke, or unpainted local exit", () => {
+  for (const scope of ["strict", "local"]) for (const vertical of [false, true]) {
+    for (const cut of [null, [130, 131], [130, 160]]) {
+      const { image, payload } = paintedTailFixture({ scope, vertical, cut, paintEnd: 175, resumeInk: false });
+      if (cut?.[1] === 160) payload.inclusionMask.erased = null; // separate strokes, not an eraser operation
+      const result = runComputeOperation("trace-line", payload, image);
+      const along = p => vertical ? p.y : p.x;
+      assert.ok(Math.max(...result.path.map(along)) <= (cut ? 129 : 175));
+      assert.ok(result.path.every(p => p.anchor || payload.inclusionMask.data[Math.round(p.y) * image.width + Math.round(p.x)]));
+      assert.equal(inclusionPathViolation(result.path, { ...payload, width: image.width, height: image.height }), null);
+    }
+  }
+});
+
+test("a local repair connects a short tangent entrance without repainting the remote seed", () => {
+  for (const vertical of [false, true]) for (const reverse of [false, true]) for (const penWidth of [12, 24, 40]) {
+    const { image, payload } = paintedTailFixture({ scope: "local", vertical, reverse, roundCaps: true,
+      penWidth, paintStart: 108 + penWidth / 2, paintEnd: 205, resumeInk: false, competitor: false });
+    const before = JSON.stringify(payload.anchors);
+    let result;
+    assert.doesNotThrow(() => { result = runComputeOperation("trace-line", payload, image); },
+      `local repair: vertical=${vertical}, reverse=${reverse}, width=${penWidth}`);
+    const along = p => reverse ? 239 - (vertical ? p.y : p.x) : (vertical ? p.y : p.x);
+    assert.ok(Math.max(...result.path.map(along)) >= 205, `local entrance stopped: ${vertical}/${reverse}/${penWidth}: ${JSON.stringify(result.path.at(-1))}`);
+    assert.ok(result.path.some(p => p.inferenceModel === "local-entry" && !p.observed && p.penInferred));
+    assert.equal(JSON.stringify(payload.anchors), before);
+    assert.equal(inclusionPathViolation(result.path, { ...payload, width: image.width, height: image.height }), null);
+    const output = prepareTraceOutput(result.path, { ...payload, width: image.width, height: image.height,
+      guides: payload.anchors, orientation: result.orientation, count: 100 });
+    assert.equal(output.path.length, 100);
+    assert.ok(output.path.some(p => p.penInferred && !p.observed));
+  }
+});
+
+test("local repair does not bridge a distant stroke, side entrance, or explicit entrance erasure", () => {
+  for (const vertical of [false, true]) for (const kind of ["distant", "side", "erased"]) {
+    const { image, payload } = paintedTailFixture({ scope: "local", vertical, paintStart: kind === "distant" ? 118 : 108, resumeInk: false, competitor: false });
+    // Remove the same-colour competitor to isolate an unsupported entrance.
+    for (let x = 101; x <= 225; x++) for (let y = 0; y < 120; y++) {
+      const p = vertical ? { x: y, y: x } : { x, y }; setPixel(image, p.x, p.y, { r: 255, g: 255, b: 255 });
+    }
+    if (kind === "side") {
+      const moved = new Uint8Array(payload.inclusionMask.data.length);
+      for (let y = 0; y < image.height; y++) for (let x = 0; x < image.width; x++) {
+        const tx = vertical ? x + 30 : x, ty = vertical ? y : y + 30;
+        if (tx < image.width && ty < image.height) moved[ty * image.width + tx] = payload.inclusionMask.data[y * image.width + x];
+      }
+      payload.inclusionMask = prepareInclusionMask(moved, image.width, image.height, "local");
+    }
+    if (kind === "erased") {
+      const erased = new Uint8Array(image.width * image.height);
+      for (let across = 0; across < 120; across++) {
+        const p = vertical ? { x: across, y: 103 } : { x: 103, y: across };
+        erased[p.y * image.width + p.x] = 1;
+      }
+      payload.inclusionMask = prepareInclusionMask(payload.inclusionMask.data, image.width, image.height, "local", { erased });
+    }
+    let result;
+    try { result = runComputeOperation("trace-line", payload, image); }
+    catch (error) {
+      assert.ok(["NO_CURVE_SEGMENT", "PEN_NO_VALID_PATH", "PEN_OUTSIDE", "PEN_NOT_REACHED"].includes(error.code), `${kind}/${vertical}: ${error.message}`);
+      continue;
+    }
+    assert.ok(result.path.every(p => !p.penInferred), `${kind}/${vertical}: invented a connection`);
+    assert.ok(Math.max(...result.path.map(p => vertical ? p.y : p.x)) <= 100);
+  }
+});
+
+test("no Pen and patterned targets keep their ordinary gap and endpoint rules", () => {
+  const { image, payload } = paintedTailFixture({ resumeInk: false });
+  for (const options of [{ ...payload, inclusionMask: null }, { ...payload, targetStyle: "dashed" }]) {
+    const result = runComputeOperation("trace-line", options, image);
+    assert.ok(result.path.every(p => !p.penInferred));
+    assert.ok(Math.max(...result.path.map(p => p.x)) < 180);
+  }
+});
+
+test("a seed without observed support or a broad painted blob cannot manufacture a curve", () => {
+  const { image, payload } = paintedTailFixture({ resumeInk: false });
+  const sparse = [{ ...payload.anchors[0], anchor: true }, { x: 51, y: 40, observed: true }];
+  assert.equal(completePaintedTraceTails({ ...image, ...payload, path: sparse }), sparse);
+  const data = new Uint8Array(image.width * image.height);
+  for (let x = 15; x <= 225; x++) for (let y = 10; y <= 110; y++) data[y * image.width + x] = 1;
+  const path = Array.from({ length: 81 }, (_, i) => ({ x: 20 + i, y: 40, observed: true }));
+  path[30] = { ...payload.anchors[0], anchor: true };
+  assert.equal(completePaintedTraceTails({ ...image, ...payload, path,
+    inclusionMask: prepareInclusionMask(data, image.width, image.height, "strict") }), path);
+  for (const targetStyle of ["markers", "dashed", "dotted", "dashdot"]) {
+    assert.equal(completePaintedTraceTails({ ...image, ...payload, path, targetStyle }), path);
+  }
 });
 
 test("compute client uses an explicit synchronous fallback without Worker support", async () => {

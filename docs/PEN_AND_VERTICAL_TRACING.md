@@ -32,12 +32,48 @@ This assistance does not reconstruct information missing from the image.
 
 ## Pen interaction / Pen 配合
 
+For a solid curve that stops at an occlusion, keep the target click and paint
+continuously along the missing section. A connected narrow corridor can extend
+a horizontal or vertical trace beyond the ordinary gap limit. Matching target
+pixels remain observations; missing pixels are marked **Pen path estimate**
+with low confidence and brush-width uncertainty. In local mode, a short
+tangent join (at most 12 px) can connect visible ink to a nearby painted end.
+It must pass the same Pen boundary check; a few cap-edge points may be replaced
+by estimates, but manual guides never move. No estimates continue past the
+painted tail, across an eraser cut, or into discrete markers. Ambiguous 2D branches
+still require guides. Optional gap smoothing is discarded if it leaves Pen.
+
+实线在遮挡处停止时，保留目标点，沿缺失段连续涂画。连通的窄走廊可帮助横向
+或纵向追踪越过普通断口限制。匹配目标色的像素仍为观测；缺失处标为“Pen 路径估计”，
+置信度较低，不确定度与笔宽有关。局部模式可通过不超过 12 px 的切向连接
+接入附近笔迹端部，仍须通过 Pen 边界检查。入口处少量边缘点可改标为估计，
+手工引导点不会移动。不会越过尾部涂画范围、擦除缺口或向散点添加估计。
+有歧义的二维分支仍需引导点；可选的平滑拟合若越出 Pen，会保留拟合前的合法路径。
+
 Erased pixels stay excluded even when a cut splits a local stroke into separate
 parts; they are not treated as an unpainted extension gap. Repaint to restore
 those pixels. Clearing or completely erasing the Pen restores unrestricted
 plot-area search. A failed retrace blocks export rather than inventing a bridge.
 局部笔迹即使被擦断，擦掉的像素也不能成为自动延伸通道；补涂后才能恢复。
 清除或完全擦掉 Pen 后恢复全绘图区搜索。重追踪失败时会暂停导出，不会伪造连接。
+
+In **Painted area only** mode, include the original target click in the paint.
+For a short correction away from that click, use **Local assistance** (the
+default for new curves), and overlap the paint slightly with visible ink.
+Existing curves keep their saved scope. If a strict trace fails because the
+click is outside the paint, **Use local assistance** in the warning retries
+without moving the click. A retrace
+that finds only the clicked point is rejected; the previous data and requested
+point count are retained. Finish painting or change the scope, then retry.
+If a local trace never reaches the paint, it is also rejected with an entrance
+hint; an unpainted prefix is not reported as a successful repair.
+
+“仅在涂画区域”模式下，请同时覆盖原来的目标点。新曲线默认“局部辅助”，
+只涂需修正的区段，并与可见曲线稍有重叠。已有曲线保留保存时的范围；
+完整约束因原选点未被覆盖而失败时，可点提示栏的“改用局部辅助”直接重试。
+如果重追踪只找到目标点，程序会提示失败，并保留上次数据及设置的点数；
+补涂或调整范围后可直接重试，不必重新设置点数。
+局部追踪若完全未接入笔迹，也会提示失败及入口调整方法，不把未涂的前半段当作修补成功。
 
 With Pen active, automatic direction selection compares actual curve pixels
 inside the painted route, so an exposed same-colour axis cannot win merely by
@@ -52,7 +88,7 @@ underlying path is checked again before sampling, restoration, and export.
 
 ## Pen scope / 约束范围
 
-- **Local assistance (optional):** each painted section is constrained, including
+- **Local assistance (default for new curves):** each painted section is constrained, including
   unpainted pixels beside it. Tracing may continue beyond its two end boundaries,
   shown as dashed lines, but cannot bypass the section on a neighbouring curve.
   End directions come from the brush geometry, so vertical strokes and turns do
@@ -61,14 +97,14 @@ underlying path is checked again before sampling, restoration, and export.
   closing off the rounded brush cap. Farther away, ordinary search resumes.
   Follow the curve when painting
   a turn; a closed stroke has no exit. A single dab has no reliable direction.
-  **局部辅助（可选）：**已涂区段只能在 Pen 内搜索，不能从侧面绕到其它曲线；
+  **局部辅助（新曲线默认）：**已涂区段只能在 Pen 内搜索，不能从侧面绕到其它曲线；
   允许越过笔迹两端的虚线边界接续。端点方向由笔迹确定，横向、竖向和转弯
   遵守同一范围。端部附近通过逐渐变宽的切向通道接续，避免立即跳到远处的
   平行曲线，也不会把圆头笔迹的合法入口封死；更远处恢复普通搜索。
   转弯处请顺着曲线涂画；闭合笔迹没有出口，单个点涂无法确定方向。
-- **Painted area only (default for new curves):** all automatically generated points must stay inside
+- **Painted area only (full-route constraint):** all automatically generated points must stay inside
   the painted area. Paint the full target route, including turns and endpoints.
-  **仅在涂画区域提取（新曲线默认）：**所有自动生成的点必须位于涂画区域内。
+  **仅在涂画区域提取（完整路径约束）：**所有自动生成的点必须位于涂画区域内。
   请覆盖完整目标路径，包括转弯和端点。
 - The scope does not change when the algorithm switches between horizontal,
   vertical and 2D tracing. Manual guide coordinates remain authoritative,

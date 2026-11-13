@@ -2047,6 +2047,179 @@ function traceCurve({
   return [...left, safeSeed, ...right];
 }
 
+/** Continue a truncated solid-line tail through a connected painted tube.
+ * Pen is explicit spatial evidence, not target-colour evidence. Missing ink
+ * stays inferred; manual guides are never replaced. Do not continue
+ * beyond the painted tail, a disconnected stroke, a wide 2D blob, or
+ * patterned/scatter data whose endpoints cannot be inferred this way.
+ */
+function completePaintedTraceTails({
+  path, rgba, width, height, rect, target, threshold = 42, exclusions = [],
+  inclusionMask, targetStyle = "line", maxJump = 14, maxGap = 24,
+}) {
+  if (!path?.length || !inclusionMask?.data || !["auto", "line", "noisy"].includes(targetStyle)) return path;
+  const painted = { ...inclusionMask, allowed: inclusionMask.data };
+  const runsAt = (x) => inclusionRunsAt(painted, width, x, Math.ceil(rect.top), Math.floor(rect.bottom));
+  const guides = path.filter(point => point.anchor || point.userGuided);
+  const seed = guides[0];
+  const seedRun = seed ? runsAt(Math.round(seed.x)).find(run => seed.y >= run.start && seed.y <= run.end) : null;
+  const seedOffset = seedRun ? seed.y - seedRun.center : 0;
+  // A partial repair can start just beyond the final visible pixel. Connect
+  // only a nearby end aperture aligned with the observed tangent. The local
+  // mask remains authoritative: this cannot enter through a side or erasure.
+  const localEntry = (support, direction) => {
+    if (inclusionMask.mode !== "local") return null;
+    const endpoint = support.at(-1);
+    // An observed endpoint can sit at the very edge of a round cap. Starting
+    // the join a few pixels earlier avoids a sideways jump across its wall.
+    // Any replaced ink becomes estimated geometry, never a moved observation.
+    for (let trim = 0; trim < Math.min(13, support.length); trim++) {
+      if (trim && (support.at(-trim).anchor || support.at(-trim).userGuided)) break;
+      const end = support.at(-1 - trim);
+      if (Math.abs(end.x - endpoint.x) > 12) break;
+      const reference = [...support.slice(0, support.length - trim).slice(-32)].reverse().find(point => point.observed
+        && Math.abs(point.x - end.x) >= 6);
+      if (!reference) continue;
+      const dx = end.x - reference.x, dy = end.y - reference.y;
+      const length = Math.hypot(dx, dy);
+      const gates = (inclusionMask.gates ?? []).filter(gate => (
+        -(dx * gate.nx + dy * gate.ny) / length >= 0.85
+        && gate.nx * (end.x - gate.x) + gate.ny * (end.y - gate.y) >= -gate.halfWidth
+        && Math.hypot(end.x - gate.x, end.y - gate.y) <= gate.halfWidth * 2 + 12
+      ));
+      if (!gates.length) continue;
+      const slope = dy / dx;
+      for (let distance = 1; distance <= Math.min(12, maxGap); distance++) {
+        const x = Math.round(end.x) + direction * distance;
+        if (x < rect.left || x > rect.right) break;
+        const runs = runsAt(x);
+        if (runs.length !== 1 || runs[0].end - runs[0].start > 80) continue;
+        const run = runs[0], prediction = end.y + (x - end.x) * slope;
+        const y = clamp(prediction, run.start, run.end);
+        if (Math.hypot(x - end.x, y - end.y) > 12) continue;
+        const entry = { x, y };
+        if (inclusionPathViolation([end, entry], {
+          inclusionMask, width, height, rect, maximumCorrection: 0,
+        })) continue;
+        return { run, entry, trim, start: end };
+      }
+    }
+    return null;
+  };
+  const complete = (support, direction) => {
+    const tail = [];
+    let trim = 0;
+    let previous = support.at(-1);
+    let run = runsAt(Math.round(previous.x)).find(candidate => previous.y >= candidate.start - 0.5 && previous.y <= candidate.end + 0.5);
+    // Require some real curve support, not just a lone clicked pixel or guide.
+    if (support.slice(-32).filter(point => point.observed && !point.anchor).length < 6) return { tail, trim };
+    if (!run) {
+      const connection = localEntry(support, direction);
+      if (!connection) return { tail, trim };
+      const start = connection.start, span = Math.abs(connection.entry.x - Math.round(start.x));
+      trim = connection.trim;
+      for (let step = 1; step <= span; step++) {
+        tail.push({
+          x: Math.round(start.x) + direction * step,
+          y: start.y + (connection.entry.y - start.y) * step / span,
+          observed: false, confidence: 0.2, candidateCount: 0, thickness: 0,
+          penInferred: true, occlusionInferred: true, origin: "pen-estimate",
+          inferenceMethod: "painted-corridor", inferenceModel: "local-entry",
+          inferenceUncertainty: Math.max(1, (connection.run.end - connection.run.start) / 2),
+        });
+      }
+      previous = tail.at(-1);
+      run = connection.run;
+    }
+    const endpointOffset = previous.y - run.center;
+    const initialOffset = guides.length === 1 && Math.abs(endpointOffset - seedOffset) > Math.max(4, (run.end - run.start) * 0.225)
+      ? seedOffset : endpointOffset;
+    const limit = direction > 0 ? Math.floor(rect.right) : Math.ceil(rect.left);
+    for (let x = Math.round(previous.x) + direction; direction > 0 ? x <= limit : x >= limit; x += direction) {
+      // One connected narrow run is a tube. At a split or a near-vertical
+      // section the scan-line model has no unambiguous continuation; defer to
+      // the existing guided 2D tracer rather than invent a branch.
+      const connected = runsAt(x).filter(candidate => candidate.start <= run.end + 1 && candidate.end >= run.start - 1);
+      if (connected.length !== 1) break;
+      const nextRun = connected[0];
+      if (nextRun.end - nextRun.start > 80) break;
+      const halfWidth = (nextRun.end - nextRun.start) / 2;
+      // Fade the observed stroke's offset from the brush centre over a short
+      // distance, instead of extrapolating a raster tangent out of the tube.
+      const offset = initialOffset * Math.max(0, 1 - (tail.length + 1) / 12);
+      const predictedY = clamp(nextRun.center + offset, nextRun.start, nextRun.end);
+      const candidates = clusterColumnCandidates(rgba, width, x, rect.top, rect.bottom,
+        target, threshold, exclusions, inclusionMask)
+        .filter(candidate => candidate.y >= nextRun.start && candidate.y <= nextRun.end
+          && candidate.thickness <= 9
+          && Math.abs(candidate.y - predictedY) <= Math.max(2, halfWidth * 0.65)
+          && Math.abs(candidate.y - previous.y) <= maxJump)
+        .sort((a, b) => Math.abs(a.y - predictedY) - Math.abs(b.y - predictedY) || a.distance - b.distance);
+      let point;
+      if (candidates.length) {
+        point = { ...candidateToPoint(candidates[0], x, threshold, candidates.length, targetStyle), penContinuation: true };
+        attachCandidateAmbiguity(point, candidates, candidates[0], Math.max(8, maxJump * 2.5));
+      } else {
+        point = {
+          x, y: predictedY, observed: false, confidence: 0.2,
+          candidateCount: 0, thickness: 0, penInferred: true,
+          occlusionInferred: true, origin: "pen-estimate",
+          inferenceMethod: "painted-corridor", inferenceModel: "brush-centre",
+          // Brush width limits the spatial estimate, but cannot establish the
+          // true subpixel location of a completely hidden curve.
+          inferenceUncertainty: Math.max(1, halfWidth),
+          unsupportedDistance: (previous.unsupportedDistance ?? 0) + 1,
+        };
+      }
+      // Check actual painted cells, not the local-mode entrance/exit allowance.
+      // This also forbids crossing an eraser cut or an unpainted diagonal gap.
+      if (inclusionPathViolation([previous, point], {
+        inclusionMask: painted, width, height, rect, maximumCorrection: 0,
+      })) break;
+      tail.push(point);
+      previous = point;
+      run = nextRun;
+    }
+    // Round caps commonly extend a few pixels beyond a healthy observed
+    // endpoint. Those are not a long occlusion and must not create estimates
+    // on an otherwise completely observed curve.
+    return tail.filter(point => !point.observed).length >= Math.max(8, maxGap + 1)
+      ? { tail, trim } : { tail: [], trim: 0 };
+  };
+  const left = complete([...path].reverse(), -1);
+  const right = complete(path, 1);
+  if (!left.tail.length && !right.tail.length) return path;
+  const retained = path.slice(left.trim, path.length - right.trim);
+  // A surviving same-colour branch can occupy a wide brush's edge while the
+  // intended curve is hidden near its centre. Only in this long-gap assisted
+  // case reconsider remote non-guide points. Preserve matching central ink;
+  // otherwise explicitly estimate the painted trajectory, not that other ink.
+  // Multiple user guides already define the hidden route and its bends; do
+  // not substitute a global brush-centre model for that stronger evidence.
+  if (guides.length !== 1) return [...left.tail.reverse(), ...retained, ...right.tail];
+  const corrected = retained.map(point => {
+    if (point.anchor || point.userGuided) return point;
+    const x = Math.round(point.x), runs = runsAt(x);
+    if (runs.length !== 1 || runs[0].end - runs[0].start > 80) return point;
+    const run = runs[0], halfWidth = (run.end - run.start) / 2;
+    const prediction = clamp(run.center + seedOffset, run.start, run.end);
+    const tolerance = Math.max(4, halfWidth * 0.45);
+    if (Math.abs(point.y - prediction) <= tolerance) return point;
+    const candidates = clusterColumnCandidates(rgba, width, x, rect.top, rect.bottom,
+      target, threshold, exclusions, inclusionMask)
+      .filter(candidate => candidate.thickness <= 9 && Math.abs(candidate.y - prediction) <= tolerance)
+      .sort((a, b) => Math.abs(a.y - prediction) - Math.abs(b.y - prediction));
+    if (candidates.length) return { ...candidateToPoint(candidates[0], x, threshold, candidates.length, targetStyle), penContinuation: true };
+    return {
+      x: point.x, y: prediction, observed: false, confidence: 0.2,
+      candidateCount: 0, thickness: 0, penInferred: true, occlusionInferred: true,
+      origin: "pen-estimate", inferenceMethod: "painted-corridor", inferenceModel: "brush-centre",
+      inferenceUncertainty: Math.max(1, halfWidth),
+    };
+  });
+  return [...left.tail.reverse(), ...corrected, ...right.tail];
+}
+
 function fillPathGaps(points) {
   if (points.length < 2) return points;
   const sorted = [...points].sort((a, b) => a.x - b.x);
@@ -3308,6 +3481,9 @@ function scoreGapModel(model, support, {
 function fitInferredPathGaps(path, {
   rect = null,
   minimumSupport = 4,
+  inclusionMask = null,
+  width = null,
+  height = null,
 } = {}) {
   if (!Array.isArray(path) || path.length < 3) return (path ?? []).map((point) => ({ ...point }));
   const refined = path.map((point) => ({ ...point }));
@@ -3426,6 +3602,17 @@ function fitInferredPathGaps(path, {
       blend *= allowedDeviation / (maximumCurveDeviation * blend);
     }
     if (blend < 0.12) continue;
+
+    // A fit is optional; a painted/erased boundary is not. If smoothing would
+    // leave the valid underlying route, retain that route instead of making
+    // the final Pen validator reject the entire extraction.
+    if (inclusionMask?.data && Number.isFinite(width) && rect) {
+      const proposed = [leftBoundary, ...predictions.map(prediction => ({
+        ...refined[prediction.cursor],
+        y: clamp(prediction.linearY + (prediction.ensembleY - prediction.linearY) * blend, rect.top, rect.bottom),
+      })), rightBoundary];
+      if (inclusionPathViolation(proposed, { inclusionMask, width, height, rect })) continue;
+    }
 
     for (const prediction of predictions) {
       const point = refined[prediction.cursor];
@@ -5071,11 +5258,15 @@ function suggestInterferenceMasks({
 function pathToData(path, xCalibration, yCalibration) {
   if (!validateCalibration(xCalibration) || !validateCalibration(yCalibration)) return [];
   return path.map((point) => {
-    const xUncertainty = calibrationUncertaintyAtPixel(point.x, xCalibration);
+    // A brush-centre estimate in a transposed scan is uncertain in X, not Y.
+    // Keep the established uncertainty convention for every other point.
+    const verticalPenEstimate = point.penInferred && point.traceOrientation === "vertical";
+    const xUncertainty = calibrationUncertaintyAtPixel(point.x, xCalibration,
+      verticalPenEstimate ? point.inferenceUncertainty ?? 0 : 0);
     const yUncertainty = calibrationUncertaintyAtPixel(
       point.y,
       yCalibration,
-      point.inferenceUncertainty ?? 0,
+      verticalPenEstimate ? 0 : point.inferenceUncertainty ?? 0,
     );
     return {
       ...point,
@@ -5124,6 +5315,10 @@ function interpolateOrderedPathPoint(left, right, fraction, parametricOrder) {
   point.anchor = false;
   point.userGuided = false;
   if (left.automaticGuidance || right.automaticGuidance) point.automaticGuidance = true;
+  if (left.penInferred || right.penInferred) {
+    point.penInferred = true;
+    point.origin = "pen-estimate";
+  }
   const occlusionInferred = Boolean(left.occlusionInferred || right.occlusionInferred);
   const patternInferred = Boolean(left.patternInferred || right.patternInferred);
   if (occlusionInferred || patternInferred) {
@@ -5375,6 +5570,10 @@ function interpolatePixelPath(sortedPath, sampleXs) {
       thickness: (left.thickness ?? 0) + localFraction * ((right.thickness ?? 0) - (left.thickness ?? 0)),
     };
     if (left.automaticGuidance || right.automaticGuidance) sampledPoint.automaticGuidance = true;
+    if (left.penInferred || right.penInferred) {
+      sampledPoint.penInferred = true;
+      sampledPoint.origin = "pen-estimate";
+    }
     const ambiguitySource = localFraction <= 0.5 ? left : right;
     if (Array.isArray(ambiguitySource.ambiguityAlternatives)) {
       sampledPoint.ambiguityAlternatives = [...ambiguitySource.ambiguityAlternatives];
@@ -6034,7 +6233,7 @@ function csvEscape(value) {
   const text = String(value);
   return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
 }
-return Object.freeze({ clamp, normalizeRect, fitCalibrationModel, calibrationError, validateCalibration, assessCalibrationQuality, pixelToValue, valueToPixel, calibrationUncertaintyAtPixel, snapCalibrationPoint, valueStepForPixelNudge, rgbDistanceSquared, compositedColorDistance, pixelAt, sampleRepresentativeColor, estimateColorThreshold, snapTargetPoint, prepareInclusionMask, inclusionMaskAllows, inclusionPathViolation, constrainPathToInclusionMask, clusterColumnCandidates, inferLineStyle, traceCurve, traceCurveThroughAnchors, refinePathCenterline, fitInferredPathGaps, extractMarkerCenters, inferMarkerSeries, discoverColoredSeries, detectPlotRects, detectPlotRect, suggestInterferenceMasks, pathToData, resamplePixelPath, resamplePixelPathArcLength, includeMandatoryParametricPoints, includeMandatoryPoints, resamplePixelPathGeometry, resamplePixelPathAdaptive, resamplePixelPathRoughness, resamplePath, findMostInformativeAmbiguity, findPathReviewRegions, assessPathQuality, preferOrdinaryTraceFallback, formatNumber, buildPairedCurveRows, csvEscape });
+return Object.freeze({ clamp, normalizeRect, fitCalibrationModel, calibrationError, validateCalibration, assessCalibrationQuality, pixelToValue, valueToPixel, calibrationUncertaintyAtPixel, snapCalibrationPoint, valueStepForPixelNudge, rgbDistanceSquared, compositedColorDistance, pixelAt, sampleRepresentativeColor, estimateColorThreshold, snapTargetPoint, prepareInclusionMask, inclusionMaskAllows, inclusionPathViolation, constrainPathToInclusionMask, clusterColumnCandidates, inferLineStyle, traceCurve, completePaintedTraceTails, traceCurveThroughAnchors, refinePathCenterline, fitInferredPathGaps, extractMarkerCenters, inferMarkerSeries, discoverColoredSeries, detectPlotRects, detectPlotRect, suggestInterferenceMasks, pathToData, resamplePixelPath, resamplePixelPathArcLength, includeMandatoryParametricPoints, includeMandatoryPoints, resamplePixelPathGeometry, resamplePixelPathAdaptive, resamplePixelPathRoughness, resamplePath, findMostInformativeAmbiguity, findPathReviewRegions, assessPathQuality, preferOrdinaryTraceFallback, formatNumber, buildPairedCurveRows, csvEscape });
 })();
 const SciTraceOutput = (() => {
 const {
@@ -6042,6 +6241,7 @@ constrainPathToInclusionMask,
   inclusionPathViolation,
   includeMandatoryParametricPoints,
   includeMandatoryPoints,
+  inclusionMaskAllows,
   resamplePixelPath,
   resamplePixelPathArcLength,
   resamplePixelPathAdaptive,
@@ -6116,12 +6316,32 @@ function prepareTraceOutput(path, {
   orientation = "horizontal",
   guides = [],
   markerData = false,
+  requireCurveSegment = false,
   geometryPath = null,
   ...corridor
 } = {}) {
   if (!path?.length) throw outputError("EMPTY_PATH", "未找到可用路径；请补充引导点或调整 Pen 后重新追踪");
   if ([...path, ...(geometryPath ?? [])].some((point) => !Number.isFinite(point?.x) || !Number.isFinite(point?.y))) {
     throw outputError("INVALID_PATH", "路径包含无效坐标；未替换上一次结果");
+  }
+  const geometry = geometryPath?.length ? geometryPath : path;
+  if (requireCurveSegment && !markerData && !geometry.some(point => Math.hypot(
+    point.x - geometry[0].x, point.y - geometry[0].y,
+  ) > 1e-7)) {
+    // An authoritative guide may be outside Pen, but the guide by itself is
+    // not an extracted curve. Accepting it also overwrites the user's output
+    // density with one point, so later successful retries appear empty.
+    if (corridor.inclusionMask?.mode === "strict"
+      && !inclusionMaskAllows(corridor.inclusionMask, corridor.width, geometry[0].x, geometry[0].y)) {
+      throw outputError("PEN_SEED_OUTSIDE", "目标点不在 Pen 涂画区域内；请补涂目标点，或切换为局部辅助后重试");
+    }
+    throw outputError("NO_CURVE_SEGMENT", "只找到目标点，未提取到曲线区段；请在清晰曲线处重选目标或调整 Pen");
+  }
+  if (requireCurveSegment && !markerData && corridor.inclusionMask?.mode === "local"
+    && !geometry.some(point => corridor.inclusionMask.data[Math.round(point.y) * corridor.width + Math.round(point.x)])) {
+    // A valid but truncated unpainted prefix is not a successful Pen repair.
+    // Keep the previous result rather than quietly ignoring the entire stroke.
+    throw outputError("PEN_NOT_REACHED", "未能接入 Pen 涂画区段；请将笔迹起点与可见曲线稍有重叠，必要时在遮挡两侧添加引导点");
   }
   // Marker guides identify a measured centre by ID; the click need not equal
   // that centre. Continuous-line guides instead require exact coordinates.
@@ -7843,6 +8063,7 @@ const SciComputeEngine = (() => {
 const {
 discoverColoredSeries,
   compositedColorDistance,
+  completePaintedTraceTails,
   extractMarkerCenters,
   fitInferredPathGaps,
   inferLineStyle,
@@ -7966,7 +8187,13 @@ function traceLineInFrame(image, payload) {
   if (refinementMode !== "off") {
     path = refinePathCenterline({ ...options, path, iterations: 2 });
   }
-  if (refinementMode === "full") path = fitInferredPathGaps(path, { rect: options.rect });
+  if (refinementMode === "full") path = fitInferredPathGaps(path, {
+    rect: options.rect, inclusionMask: options.inclusionMask, width: image.width, height: image.height,
+  });
+  // A painted solid-line tube may continue far beyond the last visible target
+  // pixel. Continue through that tube or its short permitted local entrance,
+  // labelling missing ink as estimated. No endpoint inference without a Pen.
+  path = completePaintedTraceTails({ ...options, path, height: image.height, targetStyle });
   // Scan columns remain integral, but user guide coordinates do not. Restore
   // only an actually retained anchor, never manufacture a missing branch.
   path = path.map((point) => {
@@ -8032,7 +8259,8 @@ function transposeInclusionMask(mask, width, height) {
     }
     columns[y] = rowPainted ? 1 : 0;
   }
-  return { data, columns, allowed, erased, mode: mask.mode };
+  return { data, columns, allowed, erased, mode: mask.mode,
+    gates: (mask.gates ?? []).map(gate => ({ ...gate, x: gate.y, y: gate.x, nx: gate.ny, ny: gate.nx })) };
 }
 
 function transposeTracePayload(payload, width, height) {
@@ -8231,12 +8459,14 @@ function traceLine(image, payload) {
   delete tracePayload.orientationMode;
   let penFailure = null;
   const validateCandidate = (result) => {
-    if (!tracePayload.inclusionMask?.data || !result.path?.length) return result;
+    if (!result.path?.length) return result;
+    if (!tracePayload.inclusionMask?.data && result.path.length > 1) return result;
     try {
       const prepared = prepareTraceOutput(result.path, {
         inclusionMask: tracePayload.inclusionMask, width: image.width, height: image.height,
         rect: tracePayload.rect, orientation: result.orientation ?? "horizontal",
         guides: tracePayload.anchors,
+        requireCurveSegment: true,
       });
       return { ...result, path: prepared.rawPath };
     } catch (error) {
@@ -9604,9 +9834,14 @@ const englishByChinese = new Map(Object.entries({
   "Pen 范围": "Pen scope",
   "仅在涂画区域提取（默认）": "Painted area only (default)",
   "局部辅助（沿两端延伸）": "Local assistance (extend from stroke ends)",
+  "局部辅助（默认，沿两端延伸）": "Local assistance (default, extend from stroke ends)",
+  "仅在涂画区域提取（完整路径）": "Painted area only (full route)",
+  "改用局部辅助": "Use local assistance",
+  "未能接入 Pen 涂画区段；请将笔迹起点与可见曲线稍有重叠，必要时在遮挡两侧添加引导点": "The trace could not reach the painted section. Overlap the start of the stroke with visible ink; add guides on both sides of the occlusion if needed.",
   "仅搜索涂画区域": "Painted area only",
   "涂画区段内约束 · 两端允许延伸": "Painted sections constrained · extension at stroke ends",
-  "默认只提取涂画区域。局部辅助会锁定已涂区段，只允许沿笔迹两端接续，不会从侧面绕到其它曲线。虚线表示入口和出口边界；转弯处请顺着曲线涂画。引导点保持固定。": "By default, only painted pixels are extracted. Local assistance locks each painted section and allows continuation only beyond its ends, not sideways onto another curve. Dashed lines mark entry and exit boundaries; follow the curve when painting turns. Guides stay fixed.",
+  "默认只提取涂画区域。局部辅助会锁定已涂区段，只允许沿笔迹两端接续，不会从侧面绕到其它曲线。虚线表示入口和出口边界；转弯处请顺着曲线涂画。引导点保持固定。连续涂抹可辅助估计被完全遮挡的实线段；橙色点是估计，不是观测。": "By default, extraction stays inside the paint. Local assistance locks painted sections and allows continuation beyond their ends, not sideways onto another curve. Dashed lines mark entry and exit boundaries; follow the curve when painting turns. Guides stay fixed. Continuous painting can help estimate hidden solid-line sections; orange points are estimates, not observations.",
+  "默认局部辅助：只涂需要修正的区段，并与可见曲线稍有重叠。已涂区段只在 Pen 内搜索，其余部分沿两端接续。若选“仅在涂画区域提取”，请涂完整路径并覆盖原选点。引导点保持固定；完全遮挡处的橙色点是估计，不是观测。": "Local assistance is the default: paint only the section to repair, slightly overlapping visible ink. Painted sections are searched only inside the Pen; the rest continues through the stroke ends. For Painted area only, cover the full route and the original click. Guides stay fixed; orange points in hidden sections are estimates, not observations.",
   "二维模式使用弧长采样和引导路径；扫描跳跃、扫描间隔、严格扫描走廊及已存同色避让不适用。中心校正开关有效，遮挡由二维路径重连处理。": "2D mode uses arc-length sampling and guided paths. Scan jumps, scan gaps, strict scan guidance and saved-color avoidance do not apply. Center refinement can be switched off; gaps are handled by 2D reconnection.",
   "当前结果尚未按新设置更新；请重新追踪，或撤销本次调整": "The result has not been updated for these settings. Retry tracing or undo the adjustment.",
   "请编辑并重新追踪此已存曲线": "Edit and retrace this saved curve",
@@ -9615,6 +9850,8 @@ const englishByChinese = new Map(Object.entries({
   "路径未经过全部引导点；请调整走廊或切换二维追踪": "The path does not pass through every guide. Adjust the corridor or select 2D tracing.",
   "路径包含无效坐标；未替换上一次结果": "The path contains invalid coordinates; the previous result was not replaced.",
   "未找到可用路径；请补充引导点或调整 Pen 后重新追踪": "No usable path was found. Add guides or adjust the Pen, then retry.",
+  "目标点不在 Pen 涂画区域内；请补涂目标点，或切换为局部辅助后重试": "The target click is outside the painted Pen area. Paint over it or switch to Local assistance, then retry.",
+  "只找到目标点，未提取到曲线区段；请在清晰曲线处重选目标或调整 Pen": "Only the target point was found, not a curve segment. Pick a clear part of the curve or adjust the Pen.",
   "二维弧长采样": "2D arc-length sampling",
   "二维引导路径": "2D guided path",
   "更改 Pen 范围": "Change Pen scope",
@@ -9773,6 +10010,8 @@ const englishByChinese = new Map(Object.entries({
   "已定位最有信息量的分叉；请在高亮候选中点击正确曲线，随后将自动全局重追踪": "Located the most informative split. Click the correct highlighted candidate and the curve will be retraced globally.",
   "已定位需要复核的位置；请点击曲线应经过的位置，随后将自动重新追踪": "Located the review region. Click where the curve should pass and it will be retraced automatically.",
   "遮挡推断": "Occlusion inference",
+  "Pen 路径估计": "Pen path estimate",
+  "已涂路径，非原图观测": "painted route, not observed image data",
   "低置信度": "Low confidence",
   "同色候选歧义": "Ambiguous same-color candidates",
   "拟合不确定度较高": "High fitting uncertainty",
@@ -10267,7 +10506,7 @@ let targetSelectionSequence = 0;
 let traceTaskSequence = 0;
 
 const computeClient = createComputeClient({
-  workerUrl: new URL("src/trace-worker.js?v=0.20.0-preview.3.23", document.baseURI).href,
+  workerUrl: new URL("src/trace-worker.js?v=0.20.0-preview.3.25", document.baseURI).href,
 });
 
 function currentComputeImage() {
@@ -10878,7 +11117,7 @@ function resetExtraction({ keepCalibrationValues = true } = {}) {
   plotDetectionSequence += 1;
   state.traceStale = false;
   state.traceError = null;
-  $("#trace-corridor-mode").value = "strict";
+  $("#trace-corridor-mode").value = "local";
   interferenceScanSequence += 1;
   colorDiscoverySequence += 1;
   targetSelectionSequence += 1;
@@ -12378,11 +12617,12 @@ function updatePointListRow(point) {
   yInput.step = pointCoordinateInputStep(point, "y");
   const originLabel = point.anchor
     ? "引导基准点"
-    : point.origin === "manual" ? "用户新增" : point.observed === false ? "遮挡推断" : "自动追踪";
+    : point.origin === "manual" ? "用户新增" : point.penInferred ? "Pen 路径估计" : point.observed === false ? "遮挡推断" : "自动追踪";
   const uncertainty = Number.isFinite(point.inferenceUncertainty)
     ? ` · 估计不确定度 ±${formatNumber(point.inferenceUncertainty, 3)} px`
     : "";
-  const inferenceModel = point.inferenceModel ? ` · 遮挡恢复 ${point.inferenceModel}` : "";
+  const inferenceModel = point.penInferred ? " · 已涂路径，非原图观测"
+    : point.inferenceModel ? ` · 遮挡恢复 ${point.inferenceModel}` : "";
   const corridorLabel = point.corridorConstrained ? " · Pen 边界修正" : "";
   const coordinateUncertainty = pointCoordinateUncertaintyText(point);
   row.title = `pixel (${formatNumber(point.x, 8)}, ${formatNumber(point.y, 8)}) · ${originLabel}${inferenceModel}${uncertainty}${coordinateUncertainty}${corridorLabel}`;
@@ -12422,11 +12662,11 @@ function renderPointList() {
     const yStep = pointCoordinateInputStep(point, "y");
     const originLabel = point.anchor
       ? "引导基准点"
-      : point.origin === "manual" ? "用户新增" : point.observed === false ? "遮挡推断" : "自动追踪";
+      : point.origin === "manual" ? "用户新增" : point.penInferred ? "Pen 路径估计" : point.observed === false ? "遮挡推断" : "自动追踪";
     const uncertainty = Number.isFinite(point.inferenceUncertainty)
       ? ` · 估计不确定度 ±${formatNumber(point.inferenceUncertainty, 3)} px`
       : "";
-    const inferenceModel = point.inferenceModel
+    const inferenceModel = point.penInferred ? " · 已涂路径，非原图观测" : point.inferenceModel
       ? ` · 遮挡恢复 ${point.inferenceModel}`
       : "";
     const reviewLabel = reviewPointIndices.has(index) ? " · 当前智能复核区" : "";
@@ -12750,6 +12990,8 @@ function updateUi() {
   $("#trace-curve").disabled = Boolean(state.computeBusy)
     || !(state.imageData && state.plotRect && state.seedColor && state.anchors.length >= minimumAnchors);
   $("#retry-trace").disabled = $("#trace-curve").disabled;
+  $("#use-local-pen").hidden = true;
+  $("#use-local-pen").disabled = $("#trace-curve").disabled;
   $("#trace-error").hidden = !state.traceStale;
   $("#trace-error-title").textContent = state.computeBusy ? "正在重新追踪…" : "追踪未完成";
   $("#trace-error-history").hidden = !state.path.length;
@@ -12760,7 +13002,10 @@ function updateUi() {
     const mask = traceCorridorMask();
     if (mask?.mode === "strict") {
       const outside = state.anchors.flatMap((point, index) => inclusionMaskAllows(mask, canvas.width, point.x, point.y) ? [] : [`A${index + 1}`]);
-      if (outside.length) $("#trace-error-message").textContent = `${outside.join(", ")} · ${translateMessage("引导点在 Pen 外；请补涂完整路径，或选择局部辅助。引导点不会被移动或删除。")}`;
+      if (outside.length) {
+        $("#trace-error-message").textContent = `${outside.join(", ")} · ${translateMessage("引导点在 Pen 外；请补涂完整路径，或选择局部辅助。引导点不会被移动或删除。")}`;
+        $("#use-local-pen").hidden = false;
+      }
     }
   }
   $("#add-guide").disabled = Boolean(state.computeBusy) || !(state.plotRect && state.seedColor);
@@ -13447,6 +13692,7 @@ async function traceCurrentCurve({ silent = false, refreshHistory = true } = {})
     const outputOptions = {
       inclusionMask, width: canvas.width, height: canvas.height, rect: state.plotRect,
       parameters: activeSamplingParameters(), count: activeTracePointCount(),
+      requireCurveSegment: true,
     };
     const inputGuides = state.anchors.map((point) => ({ ...point }));
     const requestedParameters = { ...activeTraceParameters() };
@@ -13632,7 +13878,7 @@ function updateCursorReadout(point) {
 function clearActiveCurve({ keepLabel = false, keepTargetStyle = false } = {}) {
   state.traceStale = false;
   state.traceError = null;
-  $("#trace-corridor-mode").value = "strict";
+  $("#trace-corridor-mode").value = "local";
   targetSelectionSequence += 1;
   traceTaskSequence += 1;
   state.computeBusy = null;
@@ -15223,6 +15469,10 @@ $("#trace-curve").addEventListener("click", async () => {
   if (await traceCurrentCurve({ refreshHistory: false })) commitHistory("重新自动追踪");
 });
 $("#retry-trace").addEventListener("click", () => $("#trace-curve").click());
+$("#use-local-pen").addEventListener("click", () => {
+  $("#trace-corridor-mode").value = "local";
+  $("#trace-corridor-mode").dispatchEvent(new Event("change"));
+});
 $("#clear-curve").addEventListener("click", () => {
   clearActiveCurve({ keepTargetStyle: true });
   commitHistory("重置当前曲线");
@@ -15579,7 +15829,7 @@ $("#export-project").addEventListener("click", async () => {
       calibration: currentCalibrationSnapshot(),
       calibrationBeforeSeriesEdit: state.calibrationBeforeSeriesEdit,
     },
-    extractor: { name: "SciDigitizer", version: "0.20.0-preview.3.23", engine: "parametric-orientation-adaptive-bilingual-occlusion-pattern-gap-ensemble-risk-ranked-review-low-friction-import-responsive-worker-guided-color-centerline-multicurve-core" },
+    extractor: { name: "SciDigitizer", version: "0.20.0-preview.3.25", engine: "parametric-orientation-adaptive-bilingual-occlusion-pattern-gap-ensemble-risk-ranked-review-low-friction-import-responsive-worker-guided-color-centerline-multicurve-core" },
   };
   const saved = await downloadBlob(`${JSON.stringify(project, null, 2)}\n`, "application/json", `${baseName()}-project.json`);
   if (saved) showToast("项目文件已保存，可恢复标定、参数和路径");

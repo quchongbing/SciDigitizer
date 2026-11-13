@@ -1,10 +1,10 @@
-import { skeletonizeMask as skeletonize, buildMaskGraph as buildSkeletonGraph } from "./mask-geometry.js?v=0.20.0-preview.3.23";
+import { skeletonizeMask as skeletonize, buildMaskGraph as buildSkeletonGraph } from "./mask-geometry.js?v=0.20.0-preview.3.25";
 import {
   clamp,
   compositedColorDistance,
   inclusionMaskAllows,
   normalizeRect,
-} from "./core.js?v=0.20.0-preview.3.23";
+} from "./core.js?v=0.20.0-preview.3.25";
 
 const neighborOffsets = [
   [0, -1], [1, -1], [1, 0], [1, 1],

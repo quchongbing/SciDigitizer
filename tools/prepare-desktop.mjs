@@ -1,15 +1,23 @@
 import { cp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
 
 const projectRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const outputRoot = join(projectRoot, "build", "desktop-web");
+const config = JSON.parse(await readFile(join(projectRoot, "neutralino.config.json"), "utf8"));
+const client = await readFile(join(projectRoot, "desktop", "vendor", "neutralino.js"));
+if (config.cli.clientVersion !== "6.9.0" || config.cli.clientLibrary !== "/build/desktop-web/neutralino.js"
+  || createHash("sha256").update(client).digest("hex") !== "7e9d355ee2e0a0284e4f726b09ed5d7e602b657eacd488b011a6eb390f2a7923") {
+  throw new Error("Neutralino client version, path or checksum mismatch. Update the pinned client and its license together.");
+}
 
 const runtimeItems = [
   ["styles.css", "styles.css"],
   ["src", "src"],
   ["images/fig1.png", "images/fig1.png"],
   ["desktop/bridge.js", "desktop-bridge.js"],
+  ["desktop/vendor/neutralino.js", "neutralino.js"],
 ];
 
 async function copyItem(source, destination) {

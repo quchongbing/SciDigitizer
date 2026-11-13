@@ -31,6 +31,9 @@ test("static interface labels translate to concise English", () => {
     "A repeated marker series was recognized from one click. Review the centers; add guides only if another same-color marker series is nearby.",
   );
   assert.equal(translateMessage("智能消歧", "en"), "Smart disambiguation");
+  assert.equal(translateMessage("改用局部辅助", "en"), "Use local assistance");
+  assert.equal(translateMessage("局部辅助（默认，沿两端延伸）", "en"), "Local assistance (default, extend from stroke ends)");
+  assert.equal(translateMessage("仅在涂画区域提取（完整路径）", "en"), "Painted area only (full route)");
   assert.equal(translateMessage("应用当前标定", "en"), "Apply current calibration");
   assert.equal(translateMessage("全部已存曲线", "en"), "All saved curves");
   assert.equal(translateMessage("已更新 2 条曲线的标定；无需重新提取，可撤销", "en"),
@@ -38,6 +41,9 @@ test("static interface labels translate to concise English", () => {
   assert.equal(translateMessage("散点 / marker 中心", "en"), "Scatter / marker centers");
   assert.doesNotMatch(translateMessage("点击一个清晰散点即可提取同色标记。用 Pen 或屏蔽区排除图例和其他点列；引导点为可选辅助，不默认压缩点云。", "en"), /\p{Script=Han}/u);
   assert.equal(translateMessage("同色竞争已自动局部增强", "en"), "same-color guidance strengthened locally");
+  assert.match(translateMessage("目标点不在 Pen 涂画区域内；请补涂目标点，或切换为局部辅助后重试", "en"), /target click is outside the painted Pen area/);
+  assert.equal(translateMessage("pixel (400, 275) · Pen 路径估计 · 已涂路径，非原图观测", "en"),
+    "pixel (400, 275) · Pen path estimate · painted route, not observed image data");
   const noPenFailure = translateMessage("无法连续连接全部引导点；请检查引导点位置，并在转弯或交叉两侧补充引导点", "en");
   assert.match(noPenFailure, /Cannot connect all guide points/);
   assert.doesNotMatch(noPenFailure, /Pen|\p{Script=Han}/u);

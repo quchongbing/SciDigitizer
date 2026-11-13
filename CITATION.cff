@@ -5,6 +5,5 @@ title: "SciDigitizer"
 authors:
   - family-names: "Qu (瞿)"
     given-names: "Chongbing (崇兵)"
-version: 0.20.0-preview.3.24
-date-released: 2026-10-13
+version: 0.20.0-preview.3.25
 license: MIT

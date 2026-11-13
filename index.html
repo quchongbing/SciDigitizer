@@ -8,7 +8,7 @@
       content="SciDigitizer — 面向科学论文曲线的本地半自动数值提取工具"
     />
     <title>SciDigitizer</title>
-    <link rel="stylesheet" href="styles.css?v=0.20.0-preview.3.24" />
+    <link rel="stylesheet" href="styles.css?v=0.20.0-preview.3.25" />
   </head>
   <body>
     <header class="topbar">
@@ -334,10 +334,10 @@
               </div>
               <label class="field-label" for="trace-corridor-mode">Pen 范围</label>
               <select id="trace-corridor-mode" class="select-control">
-                <option value="strict" selected>仅在涂画区域提取（默认）</option>
-                <option value="local">局部辅助（沿两端延伸）</option>
+                <option value="local" selected>局部辅助（默认，沿两端延伸）</option>
+                <option value="strict">仅在涂画区域提取（完整路径）</option>
               </select>
-              <p id="trace-corridor-help">默认只提取涂画区域。局部辅助会锁定已涂区段，只允许沿笔迹两端接续，不会从侧面绕到其它曲线。虚线表示入口和出口边界；转弯处请顺着曲线涂画。引导点保持固定。</p>
+              <p id="trace-corridor-help">默认局部辅助：只涂需要修正的区段，并与可见曲线稍有重叠。已涂区段只在 Pen 内搜索，其余部分沿两端接续。若选“仅在涂画区域提取”，请涂完整路径并覆盖原选点。引导点保持固定；完全遮挡处的橙色点是估计，不是观测。</p>
               <div class="button-row compact-row trace-corridor-actions">
                 <button id="draw-trace-corridor" class="button button-ghost" type="button" disabled>画走廊</button>
                 <button id="erase-trace-corridor" class="button button-ghost" type="button" disabled>擦除</button>
@@ -530,6 +530,7 @@
             <p id="trace-error-message"></p>
             <small id="trace-error-history">灰色虚线圆点为上次结果，仅供对照，暂不可编辑或导出；请调整引导点或撤销后重试。</small>
           </div>
+          <button id="use-local-pen" type="button" class="button button-secondary" hidden>改用局部辅助</button>
           <button id="retry-trace" type="button" class="button button-secondary">重新追踪</button>
         </div>
         <div id="canvas-scroller" class="canvas-scroller">
@@ -618,10 +619,10 @@
       (() => {
         const appScript = document.createElement("script");
         if (window.location.protocol === "file:") {
-          appScript.src = "dist/app-file.js?v=0.20.0-preview.3.24";
+          appScript.src = "dist/app-file.js?v=0.20.0-preview.3.25";
         } else {
           appScript.type = "module";
-          appScript.src = "src/app.js?v=0.20.0-preview.3.24";
+          appScript.src = "src/app.js?v=0.20.0-preview.3.25";
         }
         document.body.appendChild(appScript);
       })();

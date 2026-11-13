@@ -1,17 +1,18 @@
-import { chmod, copyFile, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { spawn } from "node:child_process";
+import { chmod, copyFile, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import zipLib from "zip-lib";
+import { hostPackageSuffixes, inspectMachO, localPackageRoot, packageBudget, run, signMacBundle } from "./desktop-platform.mjs";
 
 const projectRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const config = JSON.parse(await readFile(join(projectRoot, "neutralino.config.json"), "utf8"));
 const packageMetadata = JSON.parse(await readFile(join(projectRoot, "package.json"), "utf8"));
 const packageRoot = join(projectRoot, "dist-desktop", config.cli.binaryName);
-const stagingRoot = join(projectRoot, "dist-desktop", "package-staging");
-const releaseRoot = join(projectRoot, "dist-desktop", "releases");
-const sizeBudget = 8 * 1024 * 1024;
+const targets = hostPackageSuffixes();
+const releaseRoot = process.argv[2] ?? localPackageRoot(projectRoot);
+const sizeBudget = packageBudget;
 const version = packageMetadata.version;
 const baseVersion = config.version;
 const previewMatch = version.match(/^(\d+)\.(\d+)\.(\d+)-preview\.(\d+)(?:\.(\d+))?$/);
@@ -28,10 +29,9 @@ const macBundleVersion = previewMatch
     : Number(previewMatch[4]) * 100 + previewPatch}`
   : baseVersion;
 
-await rm(stagingRoot, { recursive: true, force: true });
-await rm(releaseRoot, { recursive: true, force: true });
-await mkdir(stagingRoot, { recursive: true });
 await mkdir(releaseRoot, { recursive: true });
+if ((await readdir(releaseRoot)).length) throw new Error(`Output directory is not empty: ${releaseRoot}. Choose a new directory; existing packages will not be overwritten.`);
+const stagingRoot = await mkdtemp(join(tmpdir(), "scidigitizer-package-"));
 
 async function copyExecutable(source, destination) {
   await mkdir(dirname(destination), { recursive: true });
@@ -41,6 +41,9 @@ async function copyExecutable(source, destination) {
 
 async function addCommonFiles(directory, instructions) {
   await copyFile(join(projectRoot, "LICENSE"), join(directory, "LICENSE.txt"));
+  for (const name of ["neutralino-client.LICENSE.txt", "neutralino-runtime.LICENSE.txt"]) {
+    await copyFile(join(projectRoot, "desktop", "vendor", name), join(directory, name));
+  }
   await writeFile(join(directory, "README.txt"), `${instructions.trim()}\n\nSciDigitizer ${version}\nCopyright © 2026 Chongbing Qu (瞿崇兵)\nMIT License\n`);
 }
 
@@ -67,6 +70,8 @@ async function packageMac(architecture, sourceName) {
   const appRoot = join(directory, "SciDigitizer.app", "Contents");
   const executable = join(appRoot, "MacOS", "SciDigitizer");
   await copyExecutable(join(packageRoot, sourceName), executable);
+  const native = inspectMachO(await readFile(executable));
+  if (native.arch !== architecture) throw new Error(`Wrong Mac architecture: expected ${architecture}, got ${native.arch}.`);
   await mkdir(join(appRoot, "Resources"), { recursive: true });
   const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -79,22 +84,15 @@ async function packageMac(architecture, sourceName) {
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>${baseVersion}</string>
   <key>CFBundleVersion</key><string>${macBundleVersion}</string>
-  <key>LSMinimumSystemVersion</key><string>10.13</string>
+  <key>LSMinimumSystemVersion</key><string>${native.minimumOS}</string>
   <key>NSHighResolutionCapable</key><true/>
 </dict>
 </plist>
 `;
   await writeFile(join(appRoot, "Info.plist"), plist);
-  await addCommonFiles(directory, "Open SciDigitizer.app from Finder. This unsigned prototype may require Control-click → Open on first launch.");
+  await signMacBundle(join(directory, "SciDigitizer.app"));
+  await addCommonFiles(directory, "Requires macOS " + native.minimumOS + " or later. Move SciDigitizer.app to Applications. This preview is ad-hoc signed, not Developer ID signed or notarized. After verifying the official download, try opening it, then use System Settings > Privacy & Security > Open Anyway if Gatekeeper blocks it. Do not disable Gatekeeper globally. See https://github.com/quchongbing/SciDigitizer/blob/main/docs/installation.md");
   return zipRelease(directory, `SciDigitizer-${version}-macos-${architecture}.zip`);
-}
-
-function run(command, args) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { stdio: "inherit" });
-    child.on("error", reject);
-    child.on("exit", (code) => code === 0 ? resolve() : reject(new Error(`${command} exited with code ${code}`)));
-  });
 }
 
 async function packageDebianX64() {
@@ -106,6 +104,9 @@ async function packageDebianX64() {
   await mkdir(join(root, "usr", "share", "applications"), { recursive: true });
   await mkdir(join(root, "usr", "share", "doc", "scidigitizer"), { recursive: true });
   await copyFile(join(projectRoot, "LICENSE"), join(root, "usr", "share", "doc", "scidigitizer", "copyright"));
+  for (const name of ["neutralino-client.LICENSE.txt", "neutralino-runtime.LICENSE.txt"]) {
+    await copyFile(join(projectRoot, "desktop", "vendor", name), join(root, "usr", "share", "doc", "scidigitizer", name));
+  }
   await writeFile(join(root, "DEBIAN", "control"), `Package: scidigitizer
 Version: ${debianVersion}
 Section: science
@@ -134,32 +135,41 @@ Keywords=plot;curve;digitizer;science;
 }
 
 const releases = [];
-releases.push(await packagePortable("windows", "x64", "scidigitizer-win_x64.exe", "SciDigitizer.exe", "Double-click SciDigitizer.exe. Windows 10/11 normally includes the required WebView2 runtime."));
-releases.push(await packagePortable("linux", "x64", "scidigitizer-linux_x64", "SciDigitizer", "Double-click SciDigitizer in a file manager. WebKitGTK 4.1 or 4.0 is required."));
-releases.push(await packagePortable("linux", "arm64", "scidigitizer-linux_arm64", "SciDigitizer", "Double-click SciDigitizer in a file manager. WebKitGTK 4.1 or 4.0 is required."));
-releases.push(await packageMac("x64", "scidigitizer-mac_x64"));
-releases.push(await packageMac("arm64", "scidigitizer-mac_arm64"));
-const debian = await packageDebianX64();
-if (debian) releases.push(debian);
+try {
+  if (targets.includes("windows-x64.zip")) {
+    releases.push(await packagePortable("windows", "x64", "scidigitizer-win_x64.exe", "SciDigitizer.exe", "Extract the entire ZIP to a local folder, then open SciDigitizer.exe. Windows 10/11 x64 and Microsoft Edge WebView2 Runtime are required. If the runtime is missing, install the Evergreen Runtime from https://developer.microsoft.com/microsoft-edge/webview2/ . This preview has no Authenticode publisher signature; verify the official download before allowing a SmartScreen exception. Do not disable security software. See https://github.com/quchongbing/SciDigitizer/blob/main/docs/installation.md"));
+  }
+  if (targets.includes("linux-x64.zip")) {
+    releases.push(await packagePortable("linux", "x64", "scidigitizer-linux_x64", "SciDigitizer", "Double-click SciDigitizer in a file manager. WebKitGTK 4.1 or 4.0 is required."));
+    releases.push(await packagePortable("linux", "arm64", "scidigitizer-linux_arm64", "SciDigitizer", "Double-click SciDigitizer in a file manager. WebKitGTK 4.1 or 4.0 is required."));
+    const debian = await packageDebianX64();
+    if (debian) releases.push(debian);
+  }
+  for (const architecture of ["x64", "arm64"]) {
+    if (targets.includes(`macos-${architecture}.zip`)) releases.push(await packageMac(architecture, `scidigitizer-mac_${architecture}`));
+  }
 
-const releaseManifest = [];
-for (const release of releases) {
-  const contents = await readFile(join(releaseRoot, release.file));
-  releaseManifest.push({
-    ...release,
-    sha256: createHash("sha256").update(contents).digest("hex"),
-  });
-}
+  const releaseManifest = [];
+  for (const release of releases) {
+    const contents = await readFile(join(releaseRoot, release.file));
+    releaseManifest.push({
+      ...release,
+      sha256: createHash("sha256").update(contents).digest("hex"),
+    });
+  }
 
-await writeFile(
-  join(releaseRoot, "sizes.json"),
-  `${JSON.stringify({ version, baseVersion, debianVersion, budgetBytes: sizeBudget, releases: releaseManifest }, null, 2)}\n`,
-);
-await writeFile(
-  join(releaseRoot, "SHA256SUMS.txt"),
-  `${releaseManifest.map((release) => `${release.sha256}  ${release.file}`).join("\n")}\n`,
-);
-for (const release of releaseManifest) {
-  console.log(`${release.file}: ${(release.bytes / 1024 / 1024).toFixed(2)} MiB`);
+  await writeFile(
+    join(releaseRoot, "sizes.json"),
+    `${JSON.stringify({ version, baseVersion, debianVersion, budgetBytes: sizeBudget, releases: releaseManifest }, null, 2)}\n`,
+  );
+  await writeFile(
+    join(releaseRoot, "SHA256SUMS.txt"),
+    `${releaseManifest.map((release) => `${release.sha256}  ${release.file}`).join("\n")}\n`,
+  );
+  for (const release of releaseManifest) {
+    console.log(`${release.file}: ${(release.bytes / 1024 / 1024).toFixed(2)} MiB`);
+  }
+  console.log("SHA-256 checksums: SHA256SUMS.txt");
+} finally {
+  await rm(stagingRoot, { recursive: true, force: true });
 }
-console.log("SHA-256 checksums: SHA256SUMS.txt");

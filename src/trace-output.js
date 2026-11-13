@@ -3,12 +3,13 @@ import {
   inclusionPathViolation,
   includeMandatoryParametricPoints,
   includeMandatoryPoints,
+  inclusionMaskAllows,
   resamplePixelPath,
   resamplePixelPathArcLength,
   resamplePixelPathAdaptive,
   resamplePixelPathGeometry,
   resamplePixelPathRoughness,
-} from "./core.js?v=0.20.0-preview.3.23";
+} from "./core.js?v=0.20.0-preview.3.25";
 
 function outputError(code, message) {
   const error = new Error(message);
@@ -77,12 +78,32 @@ export function prepareTraceOutput(path, {
   orientation = "horizontal",
   guides = [],
   markerData = false,
+  requireCurveSegment = false,
   geometryPath = null,
   ...corridor
 } = {}) {
   if (!path?.length) throw outputError("EMPTY_PATH", "未找到可用路径；请补充引导点或调整 Pen 后重新追踪");
   if ([...path, ...(geometryPath ?? [])].some((point) => !Number.isFinite(point?.x) || !Number.isFinite(point?.y))) {
     throw outputError("INVALID_PATH", "路径包含无效坐标；未替换上一次结果");
+  }
+  const geometry = geometryPath?.length ? geometryPath : path;
+  if (requireCurveSegment && !markerData && !geometry.some(point => Math.hypot(
+    point.x - geometry[0].x, point.y - geometry[0].y,
+  ) > 1e-7)) {
+    // An authoritative guide may be outside Pen, but the guide by itself is
+    // not an extracted curve. Accepting it also overwrites the user's output
+    // density with one point, so later successful retries appear empty.
+    if (corridor.inclusionMask?.mode === "strict"
+      && !inclusionMaskAllows(corridor.inclusionMask, corridor.width, geometry[0].x, geometry[0].y)) {
+      throw outputError("PEN_SEED_OUTSIDE", "目标点不在 Pen 涂画区域内；请补涂目标点，或切换为局部辅助后重试");
+    }
+    throw outputError("NO_CURVE_SEGMENT", "只找到目标点，未提取到曲线区段；请在清晰曲线处重选目标或调整 Pen");
+  }
+  if (requireCurveSegment && !markerData && corridor.inclusionMask?.mode === "local"
+    && !geometry.some(point => corridor.inclusionMask.data[Math.round(point.y) * corridor.width + Math.round(point.x)])) {
+    // A valid but truncated unpainted prefix is not a successful Pen repair.
+    // Keep the previous result rather than quietly ignoring the entire stroke.
+    throw outputError("PEN_NOT_REACHED", "未能接入 Pen 涂画区段；请将笔迹起点与可见曲线稍有重叠，必要时在遮挡两侧添加引导点");
   }
   // Marker guides identify a measured centre by ID; the click need not equal
   // that centre. Continuous-line guides instead require exact coordinates.

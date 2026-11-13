@@ -13,6 +13,8 @@
   "enableServer": true,
   "enableNativeAPI": true,
   "tokenSecurity": "one-time",
+  "dataLocation": "system",
+  "storageLocation": "system",
   "logging": {
     "enabled": false,
     "writeToLogFile": false
@@ -44,6 +46,8 @@
     "binaryName": "scidigitizer",
     "resourcesPath": "/build/desktop-web/",
     "distributionPath": "/dist-desktop/",
-    "binaryVersion": "6.9.0"
+    "binaryVersion": "6.9.0",
+    "clientLibrary": "/build/desktop-web/neutralino.js",
+    "clientVersion": "6.9.0"
   }
 }

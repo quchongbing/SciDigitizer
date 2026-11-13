@@ -7,9 +7,9 @@ SciDigitizer 提供轻量桌面版，也提供无需安装的在线版。两种�
 - [Releases / 桌面版下载](https://github.com/quchongbing/SciDigitizer/releases)
 - [Browser edition / 在线使用](https://quchongbing.github.io/SciDigitizer/)
 
-The desktop preview is not yet code-signed. Download it only from the official release page above. Windows SmartScreen or macOS Gatekeeper may therefore show a warning.
+Download only from the official release page above and check its version notes. Windows previews have no Authenticode publisher signature. New macOS builds use an ad-hoc signature for executable integrity, not a verified Developer ID or Apple notarization; Gatekeeper may still block their first launch. Older releases, including `0.20.0-preview.3.24`, do not contain the macOS signing fix.
 
-桌面预览版尚未进行代码签名。请只从上面的官方发布页下载；Windows SmartScreen 或 macOS Gatekeeper 因此可能显示安全提醒。
+请只从上面的官方发布页下载，并核对版本说明。Windows 预览版没有发布者签名。新打包流程为 macOS 加入临时签名（ad-hoc），用于校验可执行文件；它不是 Developer ID 签名，也未经过 Apple 公证，首次启动仍可能被 Gatekeeper 拦截。`0.20.0-preview.3.24` 等旧版本不包含本次 Mac 签名修复。
 
 ## Windows 10/11 x64
 
@@ -18,14 +18,22 @@ The desktop preview is not yet code-signed. Download it only from the official r
 3. Open the extracted folder and double-click `SciDigitizer.exe`.
 4. If SmartScreen appears, verify that the file came from this repository, then choose **More info → Run anyway**.
 
-No traditional installation is needed. Windows 10 and 11 normally include the required Microsoft Edge WebView2 runtime. The extracted folder can be moved anywhere; create a shortcut to `SciDigitizer.exe` if desired. To remove the program, delete that folder.
+No traditional installation is needed. Use a local folder in your user profile, such as Documents, and create a shortcut if desired. Windows 10 and 11 normally include the required Microsoft Edge WebView2 Runtime, but not every installation has it. An installed Edge browser is not a substitute for the Runtime.
+
+If the app reports a missing WebView2 Runtime or will not start, install **Evergreen Standalone Installer → x64** from [Microsoft's WebView2 download page](https://developer.microsoft.com/microsoft-edge/webview2/) and retry. The shared runtime is a separate dependency and is not included in SciDigitizer's small ZIP. A 32-bit Windows installation is not supported; Windows ARM64 has no native SciDigitizer package and is not verified.
+
+If Windows blocks the app without offering **Run anyway**, follow your organization's security policy or use the browser edition. Do not disable Defender/SmartScreen or run as administrator to work around it. To remove the app, delete its extracted folder; this does not delete previously exported data.
 
 1. 下载 `SciDigitizer-<版本>-windows-x64.zip`。
 2. 右键压缩包并选择**全部解压缩**，不要直接在压缩包预览窗口内运行程序。
 3. 进入解压后的目录，双击 `SciDigitizer.exe`。
 4. 如果 SmartScreen 出现提示，请先确认文件来自本仓库，再选择**更多信息 → 仍要运行**。
 
-Windows 版是便携程序，无需传统安装。Windows 10/11 通常已经带有所需的 Microsoft Edge WebView2。可以将解压目录移动到任意位置，也可以为 `SciDigitizer.exe` 创建快捷方式。卸载时删除该目录即可。
+Windows 版是便携程序，建议解压到当前用户的本地目录（如“文档”），再创建快捷方式。Windows 10/11 通常已安装 WebView2 Runtime，但并非每台电脑都有；安装了 Edge 浏览器不等于安装了该运行时。
+
+若提示缺少 WebView2 或无法启动，请从 [微软官方下载页](https://developer.microsoft.com/microsoft-edge/webview2/)安装 **Evergreen Standalone Installer → x64**，完成后重试。这个共享运行时不包含在 SciDigitizer 的小体积 ZIP 中。32 位 Windows 不受支持；Windows ARM64 暂无原生包，也未经验证。
+
+若系统不提供“仍要运行”，请遵循单位的安全策略，或使用在线版，不要关闭 Defender/SmartScreen 或以管理员身份强行运行。卸载时删除解压目录即可，不影响已导出的数据。
 
 ## Ubuntu and Debian x64
 
@@ -73,6 +81,10 @@ Linux 便携版并非包含所有系统库；为了把下载体积控制在约 1
 
 ## macOS
 
+The currently pinned runtime requires **macOS 14 or later** for both architectures. The build reads this requirement from the executable rather than assuming support for older systems.
+
+当前固定版本的运行时在两种架构上均要求 **macOS 14 或更新系统**。打包时会读取二进制文件的实际要求，不再错误标注为 10.13。
+
 Choose the package before downloading:
 
 - Apple Silicon (M1, M2, M3, M4, and later): `macos-arm64.zip`
@@ -82,7 +94,7 @@ Then:
 
 1. Extract the ZIP.
 2. Drag `SciDigitizer.app` into **Applications**.
-3. For the first launch, Control-click the application, choose **Open**, and confirm **Open** again.
+3. Try opening the app. If Gatekeeper blocks it, verify the official source and checksum, then open **System Settings → Privacy & Security → Open Anyway** and confirm the exception. From macOS 15 onward, Control-click → Open does not override this check.
 4. Later launches can use Finder, Launchpad, or Spotlight normally.
 
 下载前先选择对应版本：
@@ -90,7 +102,13 @@ Then:
 - Apple 芯片（M1、M2、M3、M4 及后续型号）：`macos-arm64.zip`
 - Intel 处理器：`macos-x64.zip`
 
-然后解压文件，将 `SciDigitizer.app` 拖入**应用程序**。首次启动时按住 Control 点击应用，选择**打开**并再次确认；以后可从 Finder、启动台或 Spotlight 正常打开。卸载时将应用移到废纸篓。
+然后解压文件，将 `SciDigitizer.app` 拖入**应用程序**，尝试打开。若被 Gatekeeper 拦截，先核对下载来源和校验值，再进入**系统设置 → 隐私与安全性 → 仍要打开**并确认。从 macOS 15 起，Control 点击“打开”不再绕过此检查。以后可从 Finder、启动台或 Spotlight 打开；卸载时将应用移到废纸篓。
+
+Do not disable Gatekeeper globally or remove quarantine attributes to hide a damaged-app warning. If the app is reported as damaged, crashes immediately, or has no **Open Anyway** option, use the browser edition and report the macOS version, Intel/Apple Silicon model, exact ZIP name/version, and full error message in an issue. An ad-hoc signature does not guarantee that every security policy will allow the app.
+
+不要全局关闭 Gatekeeper，也不要删除隔离属性来掩盖“应用已损坏”的提示。若提示损坏、启动即退出，或没有“仍要打开”选项，请暂用在线版，并在 issue 中提供系统版本、Intel/Apple 芯片型号、完整安装包名和版本，以及完整错误信息。临时签名不代表一定能通过所有安全策略。
+
+References: [Apple's Gatekeeper changes](https://developer.apple.com/news/?id=saqachfa), [opening trusted apps](https://support.apple.com/102445), [Microsoft's WebView2 distribution guide](https://learn.microsoft.com/microsoft-edge/webview2/concepts/distribution).
 
 ## Optional checksum verification / 可选的完整性校验
 

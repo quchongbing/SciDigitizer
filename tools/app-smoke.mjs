@@ -200,6 +200,242 @@ await command("Emulation.setDeviceMetricsOverride", {
   mobile: false,
 });
 await waitFor("document.querySelector('#source-meta').textContent.includes('578 × 450')");
+// One click, then a partial strict Pen that does not include that click.
+// A seed alone is not a successful curve and must not destroy the previous
+// result or reduce the requested sampling density for the next retry.
+await evaluate(`(() => {
+  document.querySelector('#x-value-1').value='0'; document.querySelector('#x-value-2').value='8';
+  document.querySelector('#y-value-1').value='7'; document.querySelector('#y-value-2').value='1';
+  document.querySelector('#calibration-snap').checked=false;
+  const scope=document.querySelector('#trace-corridor-mode'); scope.value='strict'; scope.dispatchEvent(new Event('change'));
+})()`);
+await clickAtNaturalPoint('#pick-x-1',75,324);
+await clickAtNaturalPoint('#pick-x-2',546,324);
+await clickAtNaturalPoint('#pick-y-1',75,31);
+await clickAtNaturalPoint('#pick-y-2',75,324);
+await clickAtNaturalPoint('#pick-seed',134,132);
+await waitForComputeIdle();
+const beforeBluePen = JSON.parse(await downloadText('#export-project')).activeCurve;
+await evaluate(`(() => {
+  document.querySelector('#trace-assist-tools').open=true;
+  document.querySelector('#draw-trace-corridor').click();
+})()`);
+await paintNaturalRoute([[240,193],[276,211],[310,229],[340,247]]);
+await waitForComputeIdle();
+const afterPartialBluePen = JSON.parse(await downloadText('#export-project')).activeCurve;
+console.log('Blue partial strict Pen retry:',JSON.stringify({
+  stale:afterPartialBluePen.traceStale,points:afterPartialBluePen.path.length,
+  requested:await evaluate("document.querySelector('#trace-point-count').value"),
+  error:await evaluate("document.querySelector('#trace-error-message').textContent"),
+}));
+assert.equal(afterPartialBluePen.traceStale,true,'a lone outside seed was accepted as a curve');
+assert.deepEqual(afterPartialBluePen.path,beforeBluePen.path,'failed Pen retrace replaced the previous result');
+assert.equal(await evaluate("document.querySelector('#trace-point-count').value"),'100');
+assert.match(await evaluate("document.querySelector('#trace-error-message').textContent"),/outside the Pen.*Local assistance/i);
+assert.equal(await evaluate("document.querySelector('#use-local-pen').hidden"),false);
+await evaluate("document.querySelector('#use-local-pen').click()");
+await waitForComputeIdle();
+const localRecovery = JSON.parse(await downloadText('#export-project')).activeCurve;
+assert.equal(localRecovery.parameters.corridorMode,'local');
+assert.equal(localRecovery.traceStale,false);
+assert.equal(localRecovery.path.length,100);
+assert.deepEqual(localRecovery.anchors,beforeBluePen.anchors,'scope recovery moved the target click');
+assert.equal(await evaluate("document.querySelector('#use-local-pen').hidden"),true);
+// Explicit strict choice still requires the complete route.
+await evaluate("document.querySelector('#trace-corridor-mode').value='strict'; document.querySelector('#trace-corridor-mode').dispatchEvent(new Event('change'))");
+await waitForComputeIdle();
+// Finish painting the same route, without touching the original guide/count.
+await paintNaturalRoute([[78,110],[100,115],[134,132],[180,160],[240,193],[276,211],
+  [310,229],[340,247],[370,259],[430,282],[500,301],[548,313]]);
+await waitForComputeIdle();
+const recoveredBluePen = JSON.parse(await downloadText('#export-project')).activeCurve;
+assert.equal(recoveredBluePen.traceStale,false);
+assert.equal(recoveredBluePen.path.length,100,'retry inherited an accidental 1–2 point density');
+assert.ok(recoveredBluePen.rawPath.at(-1).x>=540);
+console.log('Blue full Pen recovered:',JSON.stringify({points:recoveredBluePen.path.length,
+  end:recoveredBluePen.rawPath.at(-1).x,stale:recoveredBluePen.traceStale}));
+// Reported partial-repair workflow: the left target click is deliberately NOT
+// painted. The default must repair only the hidden right tail, not reject A1
+// or follow the exposed dashed branch. Real Canvas brushes have round caps.
+const lateBluePenResults = [];
+for (const penWidth of [12,24,40]) {
+  await command('Page.navigate',{url:appUrl});
+  await waitFor("document.querySelector('#source-meta')?.textContent.includes('578 × 450')");
+  assert.equal(await evaluate("document.querySelector('#trace-corridor-mode').value"),'local');
+  await evaluate(`(() => {
+    document.querySelector('#x-value-1').value='0'; document.querySelector('#x-value-2').value='8';
+    document.querySelector('#y-value-1').value='7'; document.querySelector('#y-value-2').value='1';
+    document.querySelector('#calibration-snap').checked=false;
+  })()`);
+  await clickAtNaturalPoint('#pick-x-1',75,324);
+  await clickAtNaturalPoint('#pick-x-2',546,324);
+  await clickAtNaturalPoint('#pick-y-1',75,31);
+  await clickAtNaturalPoint('#pick-y-2',75,324);
+  await clickAtNaturalPoint('#pick-seed',134,132);
+  await waitForComputeIdle();
+  const before = JSON.parse(await downloadText('#export-project')).activeCurve;
+  await evaluate(`(() => {
+    document.querySelector('#trace-assist-tools').open=true;
+    const brush=document.querySelector('#trace-corridor-width'); brush.value=${penWidth}; brush.dispatchEvent(new Event('input'));
+    document.querySelector('#draw-trace-corridor').click();
+  })()`);
+  await paintNaturalRoute([[380,268],[420,282],[470,299],[510,310],[548,313]]);
+  await waitForComputeIdle();
+  const curve = JSON.parse(await downloadText('#export-project')).activeCurve;
+  const diagnostic = {penWidth,scope:curve.parameters.corridorMode,stale:curve.traceStale,
+    points:curve.path.length,end:curve.rawPath.at(-1)?.x,
+    error:await evaluate("document.querySelector('#trace-error-message').textContent")};
+  console.log('Late blue Pen repair:',JSON.stringify(diagnostic));
+  assert.equal(curve.traceStale,false,JSON.stringify(diagnostic));
+  assert.equal(curve.parameters.corridorMode,'local');
+  assert.equal(curve.path.length,100);
+  assert.deepEqual(curve.anchors,before.anchors);
+  assert.ok(curve.rawPath.at(-1).x>=540,JSON.stringify(diagnostic));
+  for (const [x,y] of [[100,115],[180,160],[276,211],[340,243],[430,285.5],[530,311.5]]) {
+    const nearest=curve.rawPath.reduce((a,b)=>Math.abs(a.x-x)<Math.abs(b.x-x)?a:b);
+    assert.ok(Math.abs(nearest.y-y)<=3,`late blue ${penWidth}px at ${x}: ${nearest.y}`);
+    if(x>400) assert.ok(nearest.penInferred && !nearest.observed,'hidden paint must not be labelled observed');
+  }
+  assert.equal(await evaluate("document.querySelector('#export-csv').disabled"),false);
+  lateBluePenResults.push(diagnostic);
+}
+// Too narrow and offset to reach the ink: do not present the surviving left
+// prefix as a successful repair or erase its previous points. Repainting with
+// overlap must recover using the same click and output budget.
+await command('Page.navigate',{url:appUrl});
+await waitFor("document.querySelector('#source-meta')?.textContent.includes('578 × 450')");
+await clickAtNaturalPoint('#pick-seed',134,132);
+await waitForComputeIdle();
+const beforeMissedPen = JSON.parse(await downloadText('#export-project')).activeCurve;
+await evaluate(`(() => {
+  document.querySelector('#trace-assist-tools').open=true;
+  const brush=document.querySelector('#trace-corridor-width'); brush.value=12; brush.dispatchEvent(new Event('input'));
+  document.querySelector('#draw-trace-corridor').click();
+})()`);
+await paintNaturalRoute([[380,276],[420,290],[470,307],[510,318],[548,321]]);
+await waitForComputeIdle();
+const missedPen = JSON.parse(await downloadText('#export-project')).activeCurve;
+assert.equal(missedPen.traceStale,true,'a missed painted section was silently ignored');
+assert.deepEqual(missedPen.path,beforeMissedPen.path);
+assert.deepEqual(missedPen.anchors,beforeMissedPen.anchors);
+assert.equal(await evaluate("document.querySelector('#trace-point-count').value"),'100');
+assert.match(await evaluate("document.querySelector('#trace-error-message').textContent"),/could not reach the painted section/i);
+await evaluate("document.querySelector('#clear-trace-corridor').click()");
+await waitForComputeIdle();
+await evaluate("if(!document.querySelector('#draw-trace-corridor').classList.contains('active')) document.querySelector('#draw-trace-corridor').click()");
+await paintNaturalRoute([[360,253],[380,268],[420,282],[470,299],[510,310],[548,313]]);
+await waitForComputeIdle();
+const correctedMissedPen = JSON.parse(await downloadText('#export-project')).activeCurve;
+assert.equal(correctedMissedPen.traceStale,false);
+assert.equal(correctedMissedPen.path.length,100);
+assert.deepEqual(correctedMissedPen.anchors,beforeMissedPen.anchors);
+assert.ok(correctedMissedPen.rawPath.at(-1).x>=540);
+console.log('Missed local Pen: rejected, previous data retained, overlapping repaint recovered');
+const bluePenResults = [];
+const bluePenFixtures = [
+  { name:'solid', seed:[134,132],
+    route:[[78,110],[100,115],[134,132],[180,160],[240,193],[276,211],
+      [310,229],[340,247],[370,259],[430,282],[500,301],[548,313]],
+    checks:[[100,115],[180,160],[276,211],[340,243],[430,282],[530,309]],
+  },
+  { name:'dashed', seed:[140,153.5],
+    route:[[78,140],[95,147],[130,151],[160,166],[200,185],[240,209],
+      [260,225],[280,238],[320,265],[354,284],[430,321],[500,343],[548,354]],
+    checks:[[100,143],[170,169],[240,209],[280,238],[340,277],[430,321],[530,352]],
+  },
+];
+// No manual line-type override or endpoint guides. Exercise painting before
+// and after the first target pick, both scopes and actual Canvas brush widths.
+for (const fixture of bluePenFixtures) for (const scope of ['strict','local']) for (const penWidth of [12,24]) {
+  await command('Page.navigate',{url:appUrl});
+  await waitFor("document.querySelector('#source-meta')?.textContent.includes('578 × 450')");
+  await evaluate(`(() => {
+    document.querySelector('#x-value-1').value='0'; document.querySelector('#x-value-2').value='8';
+    document.querySelector('#y-value-1').value='7'; document.querySelector('#y-value-2').value='1';
+    document.querySelector('#calibration-snap').checked=false;
+  })()`);
+  await clickAtNaturalPoint('#pick-x-1',75,324);
+  await clickAtNaturalPoint('#pick-x-2',546,324);
+  await clickAtNaturalPoint('#pick-y-1',75,31);
+  await clickAtNaturalPoint('#pick-y-2',75,324);
+  const paintFirst=penWidth===12;
+  if (!paintFirst) { await clickAtNaturalPoint('#pick-seed',...fixture.seed); await waitForComputeIdle(); }
+  await evaluate(`(() => {
+    const section=document.querySelector('[data-panel-step="trace"]');
+    if(section.classList.contains('is-collapsed')) section.querySelector('.section-heading').click();
+    document.querySelector('#trace-assist-tools').open=true;
+    const scope=document.querySelector('#trace-corridor-mode'); scope.value=${JSON.stringify(scope)}; scope.dispatchEvent(new Event('change'));
+    const brush=document.querySelector('#trace-corridor-width'); brush.value=${penWidth}; brush.dispatchEvent(new Event('input'));
+    document.querySelector('#draw-trace-corridor').click();
+  })()`);
+  await paintNaturalRoute(fixture.route);
+  if (paintFirst) await clickAtNaturalPoint('#pick-seed',...fixture.seed);
+  await waitForComputeIdle();
+  const curve=JSON.parse(await downloadText('#export-project')).activeCurve;
+  const span=curve.rawPath.length ? Math.max(...curve.rawPath.map(p=>p.x))-Math.min(...curve.rawPath.map(p=>p.x)) : 0;
+  const diagnostic={name:fixture.name,scope,penWidth,paintFirst,points:curve.path.length,span,
+    stale:curve.traceStale,error:await evaluate("document.querySelector('#trace-error-message').textContent")};
+  console.log('Blue Pen mouse workflow:',JSON.stringify(diagnostic));
+  assert.equal(curve.traceStale,false,JSON.stringify(diagnostic));
+  assert.equal(curve.anchors.length,1);
+  assert.equal(curve.path.length,100);
+  assert.ok(span>=450,JSON.stringify(diagnostic));
+  for (const [x,y] of fixture.checks) {
+    const nearest=curve.rawPath.reduce((a,b)=>Math.abs(a.x-x)<Math.abs(b.x-x)?a:b);
+    assert.ok(Math.abs(nearest.y-y)<=3,`blue ${fixture.name}/${scope}/${penWidth}px branch error at ${x}: ${nearest.y}`);
+  }
+  assert.equal(await evaluate("document.querySelector('#export-csv').disabled"),false);
+  bluePenResults.push(diagnostic);
+}
+// Reported workflow: select the red solid curve, THEN paint the complete
+// corridor without adding endpoint guides. Use real Canvas mouse strokes.
+const fullRedPenResults = [];
+for (const scope of ['strict', 'local']) for (const penWidth of [12, 24, 40]) {
+  await command("Page.navigate", { url: appUrl });
+  await waitFor("document.querySelector('#source-meta')?.textContent.includes('578 × 450')");
+  await evaluate(`(() => {
+    document.querySelector('#x-value-1').value='0'; document.querySelector('#x-value-2').value='8';
+    document.querySelector('#y-value-1').value='7'; document.querySelector('#y-value-2').value='1';
+    document.querySelector('#calibration-snap').checked=false;
+  })()`);
+  await clickAtNaturalPoint('#pick-x-1',75,324);
+  await clickAtNaturalPoint('#pick-x-2',546,324);
+  await clickAtNaturalPoint('#pick-y-1',75,31);
+  await clickAtNaturalPoint('#pick-y-2',75,324);
+  await clickAtNaturalPoint('#pick-seed',170,204);
+  await waitForComputeIdle();
+  await evaluate(`(() => {
+    const section=document.querySelector('[data-panel-step="trace"]');
+    if(section.classList.contains('is-collapsed')) section.querySelector('.section-heading').click();
+    document.querySelector('#trace-assist-tools').open=true;
+    const scope=document.querySelector('#trace-corridor-mode'); scope.value=${JSON.stringify(scope)}; scope.dispatchEvent(new Event('change'));
+    const brush=document.querySelector('#trace-corridor-width'); brush.value=${penWidth}; brush.dispatchEvent(new Event('input'));
+    document.querySelector('#draw-trace-corridor').click();
+  })()`);
+  await paintNaturalRoute([[78,203],[100,203],[150,205],[170,204],[209,199],[250,197],
+    [280,208],[310,222],[340,239],[370,253],[430,275],[500,300],[548,313]]);
+  await waitForComputeIdle();
+  const project = JSON.parse(await downloadText('#export-project'));
+  const curve=project.activeCurve;
+  const span=curve.rawPath.length ? Math.max(...curve.rawPath.map(p=>p.x))-Math.min(...curve.rawPath.map(p=>p.x)) : 0;
+  const diagnostic={scope,penWidth,span,points:curve.path.length,stale:curve.traceStale,
+    error:await evaluate("document.querySelector('#trace-error-message').textContent")};
+  console.log('Full red Pen mouse workflow:',JSON.stringify(diagnostic));
+  assert.equal(curve.traceStale,false,JSON.stringify(diagnostic));
+  assert.equal(curve.anchors.length,1);
+  assert.equal(curve.path.length,100);
+  assert.ok(span>=450,`one-guide full Pen stopped at the occlusion: ${JSON.stringify(diagnostic)}`);
+  for (const [x,y] of [[100,203],[170,204],[250,197],[310,222],[340,239],[430,275],[540,312]]) {
+    const nearest=curve.rawPath.reduce((a,b)=>Math.abs(a.x-x)<Math.abs(b.x-x)?a:b);
+    assert.ok(Math.abs(nearest.y-y)<=3,`red Pen ${scope}/${penWidth}px switched branches at x=${x}: ${nearest.y}`);
+  }
+  assert.ok(curve.path.some(p=>p.penInferred && !p.observed && p.x>400),
+    'the hidden red tail must be an estimate, not a measured pixel');
+  assert.equal(await evaluate("document.querySelector('#export-csv').disabled"),false);
+  fullRedPenResults.push(diagnostic);
+}
+await command("Page.navigate", { url: appUrl });
+await waitFor("document.querySelector('#source-meta').textContent.includes('578 × 450')");
 const canvasLayers = await evaluate(`(() => {
   const imageCanvas = document.querySelector('#plot-image-canvas');
   const overlayCanvas = document.querySelector('#plot-canvas');
@@ -675,7 +911,7 @@ assert.ok(Math.abs(pointAfterFineArrow.y - pointBeforeArrow.y + 0.1) < 1e-8);
 await pressArrow("ArrowLeft");
 await pressArrow("ArrowDown", { shift: true });
 
-assert.equal(await evaluate("document.querySelector('#trace-corridor-mode').value"),'strict');
+assert.equal(await evaluate("document.querySelector('#trace-corridor-mode').value"),'local');
 await evaluate("document.querySelector('#trace-corridor-mode').value='local'; document.querySelector('#trace-corridor-mode').dispatchEvent(new Event('change'))");
 await waitForComputeIdle();
 await evaluate("document.querySelector('#draw-trace-corridor').click()");
@@ -812,7 +1048,7 @@ const exportedProject = await evaluate(`(async () => {
 })()`);
 const parsedProject = JSON.parse(exportedProject);
 assert.equal(parsedProject.schemaVersion, 8);
-assert.equal(parsedProject.extractor.version, "0.20.0-preview.3.23");
+assert.equal(parsedProject.extractor.version, "0.20.0-preview.3.25");
 assert.equal("calibrationSuggestion" in parsedProject, false);
 assert.deepEqual(parsedProject.calibrationReferenceCounts, { x: 2, y: 2 });
 assert.equal(parsedProject.calibrationSnapEnabled, true);
@@ -1427,7 +1663,7 @@ await clickAtNaturalPoint('#pick-seed',140,50);
 await waitForComputeIdle();
 assert.equal(await evaluate("document.querySelector('#clear-trace-corridor').disabled"),false,
   "the first target pick must preserve a deliberately prepared Pen corridor");
-assert.equal(await evaluate("document.querySelector('#trace-corridor-status').textContent"),'Painted area only');
+assert.equal(await evaluate("document.querySelector('#trace-corridor-status').textContent"),'Painted sections constrained · extension at stroke ends');
 await clickAtNaturalPoint('#add-guide',140,180);
 await waitForComputeIdle();
 await clickAtNaturalPoint('#add-guide',140,240);
@@ -1864,7 +2100,7 @@ if (process.env.SCIDIGITIZER_XRD_IMAGE) {
   assert.deepEqual(consoleErrors, []);
 }
 
-process.stdout.write(`${JSON.stringify({ beforeSave, afterSave, localPenResults, automaticGuidance: {
+process.stdout.write(`${JSON.stringify({ beforeSave, afterSave, localPenResults, bluePenResults, lateBluePenResults, fullRedPenResults, automaticGuidance: {
   points: automaticCurve.path.length, guides: automaticCurve.anchors.length,
   enhancedRawPoints: automaticCurve.rawPath.filter(p=>p.automaticGuidance).length,
   manualConstraint: automaticCurve.parameters.strictGuidance,

@@ -1,4 +1,4 @@
-import { skeletonizeMask, buildMaskGraph } from "./mask-geometry.js?v=0.20.0-preview.3.23";
+import { skeletonizeMask, buildMaskGraph } from "./mask-geometry.js?v=0.20.0-preview.3.25";
 
 export function clamp(value, minimum, maximum) {
   return Math.max(minimum, Math.min(maximum, value));
@@ -1936,6 +1936,179 @@ export function traceCurve({
   return [...left, safeSeed, ...right];
 }
 
+/** Continue a truncated solid-line tail through a connected painted tube.
+ * Pen is explicit spatial evidence, not target-colour evidence. Missing ink
+ * stays inferred; manual guides are never replaced. Do not continue
+ * beyond the painted tail, a disconnected stroke, a wide 2D blob, or
+ * patterned/scatter data whose endpoints cannot be inferred this way.
+ */
+export function completePaintedTraceTails({
+  path, rgba, width, height, rect, target, threshold = 42, exclusions = [],
+  inclusionMask, targetStyle = "line", maxJump = 14, maxGap = 24,
+}) {
+  if (!path?.length || !inclusionMask?.data || !["auto", "line", "noisy"].includes(targetStyle)) return path;
+  const painted = { ...inclusionMask, allowed: inclusionMask.data };
+  const runsAt = (x) => inclusionRunsAt(painted, width, x, Math.ceil(rect.top), Math.floor(rect.bottom));
+  const guides = path.filter(point => point.anchor || point.userGuided);
+  const seed = guides[0];
+  const seedRun = seed ? runsAt(Math.round(seed.x)).find(run => seed.y >= run.start && seed.y <= run.end) : null;
+  const seedOffset = seedRun ? seed.y - seedRun.center : 0;
+  // A partial repair can start just beyond the final visible pixel. Connect
+  // only a nearby end aperture aligned with the observed tangent. The local
+  // mask remains authoritative: this cannot enter through a side or erasure.
+  const localEntry = (support, direction) => {
+    if (inclusionMask.mode !== "local") return null;
+    const endpoint = support.at(-1);
+    // An observed endpoint can sit at the very edge of a round cap. Starting
+    // the join a few pixels earlier avoids a sideways jump across its wall.
+    // Any replaced ink becomes estimated geometry, never a moved observation.
+    for (let trim = 0; trim < Math.min(13, support.length); trim++) {
+      if (trim && (support.at(-trim).anchor || support.at(-trim).userGuided)) break;
+      const end = support.at(-1 - trim);
+      if (Math.abs(end.x - endpoint.x) > 12) break;
+      const reference = [...support.slice(0, support.length - trim).slice(-32)].reverse().find(point => point.observed
+        && Math.abs(point.x - end.x) >= 6);
+      if (!reference) continue;
+      const dx = end.x - reference.x, dy = end.y - reference.y;
+      const length = Math.hypot(dx, dy);
+      const gates = (inclusionMask.gates ?? []).filter(gate => (
+        -(dx * gate.nx + dy * gate.ny) / length >= 0.85
+        && gate.nx * (end.x - gate.x) + gate.ny * (end.y - gate.y) >= -gate.halfWidth
+        && Math.hypot(end.x - gate.x, end.y - gate.y) <= gate.halfWidth * 2 + 12
+      ));
+      if (!gates.length) continue;
+      const slope = dy / dx;
+      for (let distance = 1; distance <= Math.min(12, maxGap); distance++) {
+        const x = Math.round(end.x) + direction * distance;
+        if (x < rect.left || x > rect.right) break;
+        const runs = runsAt(x);
+        if (runs.length !== 1 || runs[0].end - runs[0].start > 80) continue;
+        const run = runs[0], prediction = end.y + (x - end.x) * slope;
+        const y = clamp(prediction, run.start, run.end);
+        if (Math.hypot(x - end.x, y - end.y) > 12) continue;
+        const entry = { x, y };
+        if (inclusionPathViolation([end, entry], {
+          inclusionMask, width, height, rect, maximumCorrection: 0,
+        })) continue;
+        return { run, entry, trim, start: end };
+      }
+    }
+    return null;
+  };
+  const complete = (support, direction) => {
+    const tail = [];
+    let trim = 0;
+    let previous = support.at(-1);
+    let run = runsAt(Math.round(previous.x)).find(candidate => previous.y >= candidate.start - 0.5 && previous.y <= candidate.end + 0.5);
+    // Require some real curve support, not just a lone clicked pixel or guide.
+    if (support.slice(-32).filter(point => point.observed && !point.anchor).length < 6) return { tail, trim };
+    if (!run) {
+      const connection = localEntry(support, direction);
+      if (!connection) return { tail, trim };
+      const start = connection.start, span = Math.abs(connection.entry.x - Math.round(start.x));
+      trim = connection.trim;
+      for (let step = 1; step <= span; step++) {
+        tail.push({
+          x: Math.round(start.x) + direction * step,
+          y: start.y + (connection.entry.y - start.y) * step / span,
+          observed: false, confidence: 0.2, candidateCount: 0, thickness: 0,
+          penInferred: true, occlusionInferred: true, origin: "pen-estimate",
+          inferenceMethod: "painted-corridor", inferenceModel: "local-entry",
+          inferenceUncertainty: Math.max(1, (connection.run.end - connection.run.start) / 2),
+        });
+      }
+      previous = tail.at(-1);
+      run = connection.run;
+    }
+    const endpointOffset = previous.y - run.center;
+    const initialOffset = guides.length === 1 && Math.abs(endpointOffset - seedOffset) > Math.max(4, (run.end - run.start) * 0.225)
+      ? seedOffset : endpointOffset;
+    const limit = direction > 0 ? Math.floor(rect.right) : Math.ceil(rect.left);
+    for (let x = Math.round(previous.x) + direction; direction > 0 ? x <= limit : x >= limit; x += direction) {
+      // One connected narrow run is a tube. At a split or a near-vertical
+      // section the scan-line model has no unambiguous continuation; defer to
+      // the existing guided 2D tracer rather than invent a branch.
+      const connected = runsAt(x).filter(candidate => candidate.start <= run.end + 1 && candidate.end >= run.start - 1);
+      if (connected.length !== 1) break;
+      const nextRun = connected[0];
+      if (nextRun.end - nextRun.start > 80) break;
+      const halfWidth = (nextRun.end - nextRun.start) / 2;
+      // Fade the observed stroke's offset from the brush centre over a short
+      // distance, instead of extrapolating a raster tangent out of the tube.
+      const offset = initialOffset * Math.max(0, 1 - (tail.length + 1) / 12);
+      const predictedY = clamp(nextRun.center + offset, nextRun.start, nextRun.end);
+      const candidates = clusterColumnCandidates(rgba, width, x, rect.top, rect.bottom,
+        target, threshold, exclusions, inclusionMask)
+        .filter(candidate => candidate.y >= nextRun.start && candidate.y <= nextRun.end
+          && candidate.thickness <= 9
+          && Math.abs(candidate.y - predictedY) <= Math.max(2, halfWidth * 0.65)
+          && Math.abs(candidate.y - previous.y) <= maxJump)
+        .sort((a, b) => Math.abs(a.y - predictedY) - Math.abs(b.y - predictedY) || a.distance - b.distance);
+      let point;
+      if (candidates.length) {
+        point = { ...candidateToPoint(candidates[0], x, threshold, candidates.length, targetStyle), penContinuation: true };
+        attachCandidateAmbiguity(point, candidates, candidates[0], Math.max(8, maxJump * 2.5));
+      } else {
+        point = {
+          x, y: predictedY, observed: false, confidence: 0.2,
+          candidateCount: 0, thickness: 0, penInferred: true,
+          occlusionInferred: true, origin: "pen-estimate",
+          inferenceMethod: "painted-corridor", inferenceModel: "brush-centre",
+          // Brush width limits the spatial estimate, but cannot establish the
+          // true subpixel location of a completely hidden curve.
+          inferenceUncertainty: Math.max(1, halfWidth),
+          unsupportedDistance: (previous.unsupportedDistance ?? 0) + 1,
+        };
+      }
+      // Check actual painted cells, not the local-mode entrance/exit allowance.
+      // This also forbids crossing an eraser cut or an unpainted diagonal gap.
+      if (inclusionPathViolation([previous, point], {
+        inclusionMask: painted, width, height, rect, maximumCorrection: 0,
+      })) break;
+      tail.push(point);
+      previous = point;
+      run = nextRun;
+    }
+    // Round caps commonly extend a few pixels beyond a healthy observed
+    // endpoint. Those are not a long occlusion and must not create estimates
+    // on an otherwise completely observed curve.
+    return tail.filter(point => !point.observed).length >= Math.max(8, maxGap + 1)
+      ? { tail, trim } : { tail: [], trim: 0 };
+  };
+  const left = complete([...path].reverse(), -1);
+  const right = complete(path, 1);
+  if (!left.tail.length && !right.tail.length) return path;
+  const retained = path.slice(left.trim, path.length - right.trim);
+  // A surviving same-colour branch can occupy a wide brush's edge while the
+  // intended curve is hidden near its centre. Only in this long-gap assisted
+  // case reconsider remote non-guide points. Preserve matching central ink;
+  // otherwise explicitly estimate the painted trajectory, not that other ink.
+  // Multiple user guides already define the hidden route and its bends; do
+  // not substitute a global brush-centre model for that stronger evidence.
+  if (guides.length !== 1) return [...left.tail.reverse(), ...retained, ...right.tail];
+  const corrected = retained.map(point => {
+    if (point.anchor || point.userGuided) return point;
+    const x = Math.round(point.x), runs = runsAt(x);
+    if (runs.length !== 1 || runs[0].end - runs[0].start > 80) return point;
+    const run = runs[0], halfWidth = (run.end - run.start) / 2;
+    const prediction = clamp(run.center + seedOffset, run.start, run.end);
+    const tolerance = Math.max(4, halfWidth * 0.45);
+    if (Math.abs(point.y - prediction) <= tolerance) return point;
+    const candidates = clusterColumnCandidates(rgba, width, x, rect.top, rect.bottom,
+      target, threshold, exclusions, inclusionMask)
+      .filter(candidate => candidate.thickness <= 9 && Math.abs(candidate.y - prediction) <= tolerance)
+      .sort((a, b) => Math.abs(a.y - prediction) - Math.abs(b.y - prediction));
+    if (candidates.length) return { ...candidateToPoint(candidates[0], x, threshold, candidates.length, targetStyle), penContinuation: true };
+    return {
+      x: point.x, y: prediction, observed: false, confidence: 0.2,
+      candidateCount: 0, thickness: 0, penInferred: true, occlusionInferred: true,
+      origin: "pen-estimate", inferenceMethod: "painted-corridor", inferenceModel: "brush-centre",
+      inferenceUncertainty: Math.max(1, halfWidth),
+    };
+  });
+  return [...left.tail.reverse(), ...corrected, ...right.tail];
+}
+
 function fillPathGaps(points) {
   if (points.length < 2) return points;
   const sorted = [...points].sort((a, b) => a.x - b.x);
@@ -3197,6 +3370,9 @@ function scoreGapModel(model, support, {
 export function fitInferredPathGaps(path, {
   rect = null,
   minimumSupport = 4,
+  inclusionMask = null,
+  width = null,
+  height = null,
 } = {}) {
   if (!Array.isArray(path) || path.length < 3) return (path ?? []).map((point) => ({ ...point }));
   const refined = path.map((point) => ({ ...point }));
@@ -3315,6 +3491,17 @@ export function fitInferredPathGaps(path, {
       blend *= allowedDeviation / (maximumCurveDeviation * blend);
     }
     if (blend < 0.12) continue;
+
+    // A fit is optional; a painted/erased boundary is not. If smoothing would
+    // leave the valid underlying route, retain that route instead of making
+    // the final Pen validator reject the entire extraction.
+    if (inclusionMask?.data && Number.isFinite(width) && rect) {
+      const proposed = [leftBoundary, ...predictions.map(prediction => ({
+        ...refined[prediction.cursor],
+        y: clamp(prediction.linearY + (prediction.ensembleY - prediction.linearY) * blend, rect.top, rect.bottom),
+      })), rightBoundary];
+      if (inclusionPathViolation(proposed, { inclusionMask, width, height, rect })) continue;
+    }
 
     for (const prediction of predictions) {
       const point = refined[prediction.cursor];
@@ -4960,11 +5147,15 @@ export function suggestInterferenceMasks({
 export function pathToData(path, xCalibration, yCalibration) {
   if (!validateCalibration(xCalibration) || !validateCalibration(yCalibration)) return [];
   return path.map((point) => {
-    const xUncertainty = calibrationUncertaintyAtPixel(point.x, xCalibration);
+    // A brush-centre estimate in a transposed scan is uncertain in X, not Y.
+    // Keep the established uncertainty convention for every other point.
+    const verticalPenEstimate = point.penInferred && point.traceOrientation === "vertical";
+    const xUncertainty = calibrationUncertaintyAtPixel(point.x, xCalibration,
+      verticalPenEstimate ? point.inferenceUncertainty ?? 0 : 0);
     const yUncertainty = calibrationUncertaintyAtPixel(
       point.y,
       yCalibration,
-      point.inferenceUncertainty ?? 0,
+      verticalPenEstimate ? 0 : point.inferenceUncertainty ?? 0,
     );
     return {
       ...point,
@@ -5013,6 +5204,10 @@ function interpolateOrderedPathPoint(left, right, fraction, parametricOrder) {
   point.anchor = false;
   point.userGuided = false;
   if (left.automaticGuidance || right.automaticGuidance) point.automaticGuidance = true;
+  if (left.penInferred || right.penInferred) {
+    point.penInferred = true;
+    point.origin = "pen-estimate";
+  }
   const occlusionInferred = Boolean(left.occlusionInferred || right.occlusionInferred);
   const patternInferred = Boolean(left.patternInferred || right.patternInferred);
   if (occlusionInferred || patternInferred) {
@@ -5264,6 +5459,10 @@ function interpolatePixelPath(sortedPath, sampleXs) {
       thickness: (left.thickness ?? 0) + localFraction * ((right.thickness ?? 0) - (left.thickness ?? 0)),
     };
     if (left.automaticGuidance || right.automaticGuidance) sampledPoint.automaticGuidance = true;
+    if (left.penInferred || right.penInferred) {
+      sampledPoint.penInferred = true;
+      sampledPoint.origin = "pen-estimate";
+    }
     const ambiguitySource = localFraction <= 0.5 ? left : right;
     if (Array.isArray(ambiguitySource.ambiguityAlternatives)) {
       sampledPoint.ambiguityAlternatives = [...ambiguitySource.ambiguityAlternatives];

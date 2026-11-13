@@ -23,6 +23,8 @@ import {
   inferMarkerSeries,
   normalizeRect,
   pathToData,
+  prepareInclusionMask,
+  inclusionPathViolation,
   pixelAt,
   pixelToValue,
   preferOrdinaryTraceFallback,
@@ -815,6 +817,37 @@ test("adaptive gap fitting reconstructs a peak hidden entirely by a long occlusi
   assert.ok(Math.abs(middle.y - trueY(50)) < linearError * 0.45);
   assert.equal(middle.inferenceMethod, "adaptive-local-ensemble");
   assert.ok((middle.inferenceModelWeights.quadratic ?? 0) > 0);
+});
+
+test("gap fitting retains a valid Pen route when its smooth model would leave the paint", () => {
+  const width = 101, height = 81;
+  const trueY = x => 60 - 0.03 * (x - 50) ** 2;
+  const path = Array.from({ length: 81 }, (_, index) => {
+    const x = index + 10, hidden = x > 35 && x < 65;
+    return { x, y: hidden ? trueY(35) : trueY(x), observed: !hidden,
+      confidence: hidden ? 0.2 : 0.96, thickness: hidden ? 0 : 2.5 };
+  });
+  const data = new Uint8Array(width * height);
+  for (const p of path) for (let y = Math.floor(p.y); y <= Math.ceil(p.y); y++) data[y * width + p.x] = 1;
+  const contract = { width, height, rect: { left: 10, top: 0, right: 90, bottom: 80 },
+    inclusionMask: prepareInclusionMask(data, width, height, "strict") };
+  const ordinary = fitInferredPathGaps(path, { rect: contract.rect });
+  assert.ok(ordinary.find(p => p.x === 50).y > 57, "fixture must exercise a real curved model");
+  assert.ok(inclusionPathViolation(ordinary, contract), "the unconstrained fit must actually violate Pen");
+  const bounded = fitInferredPathGaps(path, contract);
+  assert.equal(inclusionPathViolation(bounded, contract), null);
+  assert.deepEqual(bounded, path, "reject the optional fit, not the valid extraction or boundary contract");
+});
+
+test("Pen estimate uncertainty follows the scan's uncertain coordinate", () => {
+  const calibration = { scale: "linear", point1: 0, point2: 100, value1: 0, value2: 10 };
+  for (const traceOrientation of ["horizontal", "vertical"]) {
+    const [data] = pathToData([{ x: 50, y: 40, observed: false, penInferred: true,
+      inferenceUncertainty: 8, traceOrientation }], calibration, calibration);
+    const uncertain = traceOrientation === "vertical" ? data.calibrationXPixelUncertainty : data.calibrationYPixelUncertainty;
+    const measured = traceOrientation === "vertical" ? data.calibrationYPixelUncertainty : data.calibrationXPixelUncertainty;
+    assert.ok(uncertain >= 8 && measured < 1);
+  }
 });
 
 test("a guide inside an occlusion remains exact and splits model recovery", () => {

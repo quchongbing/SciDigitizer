@@ -1,6 +1,7 @@
 import {
   discoverColoredSeries,
   compositedColorDistance,
+  completePaintedTraceTails,
   extractMarkerCenters,
   fitInferredPathGaps,
   inferLineStyle,
@@ -8,10 +9,10 @@ import {
   preferOrdinaryTraceFallback,
   refinePathCenterline,
   traceCurveThroughAnchors,
-} from "./core.js?v=0.20.0-preview.3.23";
+} from "./core.js?v=0.20.0-preview.3.25";
 
-import { traceParametricCurve } from "./parametric-trace.js?v=0.20.0-preview.3.23";
-import { prepareTraceOutput } from "./trace-output.js?v=0.20.0-preview.3.23";
+import { traceParametricCurve } from "./parametric-trace.js?v=0.20.0-preview.3.25";
+import { prepareTraceOutput } from "./trace-output.js?v=0.20.0-preview.3.25";
 
 function requireImage(image) {
   if (
@@ -120,7 +121,13 @@ function traceLineInFrame(image, payload) {
   if (refinementMode !== "off") {
     path = refinePathCenterline({ ...options, path, iterations: 2 });
   }
-  if (refinementMode === "full") path = fitInferredPathGaps(path, { rect: options.rect });
+  if (refinementMode === "full") path = fitInferredPathGaps(path, {
+    rect: options.rect, inclusionMask: options.inclusionMask, width: image.width, height: image.height,
+  });
+  // A painted solid-line tube may continue far beyond the last visible target
+  // pixel. Continue through that tube or its short permitted local entrance,
+  // labelling missing ink as estimated. No endpoint inference without a Pen.
+  path = completePaintedTraceTails({ ...options, path, height: image.height, targetStyle });
   // Scan columns remain integral, but user guide coordinates do not. Restore
   // only an actually retained anchor, never manufacture a missing branch.
   path = path.map((point) => {
@@ -186,7 +193,8 @@ function transposeInclusionMask(mask, width, height) {
     }
     columns[y] = rowPainted ? 1 : 0;
   }
-  return { data, columns, allowed, erased, mode: mask.mode };
+  return { data, columns, allowed, erased, mode: mask.mode,
+    gates: (mask.gates ?? []).map(gate => ({ ...gate, x: gate.y, y: gate.x, nx: gate.ny, ny: gate.nx })) };
 }
 
 function transposeTracePayload(payload, width, height) {
@@ -385,12 +393,14 @@ function traceLine(image, payload) {
   delete tracePayload.orientationMode;
   let penFailure = null;
   const validateCandidate = (result) => {
-    if (!tracePayload.inclusionMask?.data || !result.path?.length) return result;
+    if (!result.path?.length) return result;
+    if (!tracePayload.inclusionMask?.data && result.path.length > 1) return result;
     try {
       const prepared = prepareTraceOutput(result.path, {
         inclusionMask: tracePayload.inclusionMask, width: image.width, height: image.height,
         rect: tracePayload.rect, orientation: result.orientation ?? "horizontal",
         guides: tracePayload.anchors,
+        requireCurveSegment: true,
       });
       return { ...result, path: prepared.rawPath };
     } catch (error) {

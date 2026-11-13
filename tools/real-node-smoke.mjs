@@ -127,7 +127,33 @@ cases.push({
   ...cases[6], name: "fig1 red solid with partial local Pen and automatic guidance",
   penStrokes: [[[280, 208], [310, 222], [340, 239]]], penWidth: 20,
 });
-function localPenMask(strokes, width, height, diameter = 20) {
+// A single target click plus a full Pen stroke must also cover the hidden
+// red tail. This is deliberately not rescued by several endpoint guides.
+for (const penMode of ["local", "strict"]) for (const penWidth of [12, 24, 40]) {
+  cases.push({
+    image: "fig1.png", name: `fig1 red solid one guide full ${penMode} Pen ${penWidth}px`,
+    anchors: [[170, 204]], targetStyle: "line", maxJump: 14, maxGap: 24,
+    penStrokes: [[[78,203],[100,203],[150,205],[170,204],[209,199],[250,197],
+      [280,208],[310,222],[340,239],[370,253],[430,275],[500,300],[548,313]]],
+    penMode, penWidth, minimumSpan: 450,
+    expected: [[100,203],[170,204],[250,197],[310,222],[340,239],[430,275],[540,312]],
+    expectPenInference: true,
+  });
+}
+// The original click is on the left, outside these strokes. These fixtures
+// repair a genuinely hidden solid tail; the orange estimates follow paint,
+// not the exposed blue dashed curve. They do not certify hidden-pixel truth.
+for (const penWidth of [12, 24, 40]) {
+  cases.push({
+    image: "fig1.png", name: `fig1 blue solid late local repair ${penWidth}px`,
+    anchors: [[134,132]], maxJump: 14, maxGap: 24,
+    penStrokes: [[[380,268],[420,282],[470,299],[510,310],[548,313]]],
+    penMode: "local", penWidth, minimumSpan: 450,
+    expected: [[100,115],[180,160],[276,211],[340,243],[530,311.5]],
+    expectPenInference: true,
+  });
+}
+function localPenMask(strokes, width, height, diameter = 20, mode = "local") {
   if (!strokes) return null;
   const data = new Uint8Array(width * height);
   const radius = diameter / 2;
@@ -143,7 +169,7 @@ function localPenMask(strokes, width, height, diameter = 20) {
       }
     }
   }
-  return prepareInclusionMask(data, width, height, "local");
+  return prepareInclusionMask(data, width, height, mode);
 }
 
 // Ordinary target selection must tolerate a near click without requiring Pen,
@@ -202,7 +228,7 @@ const results = [];
 for (const config of cases) {
   if (!cache.has(config.image)) cache.set(config.image, decodePng(join(images, config.image)));
   const image = cache.get(config.image);
-  const inclusionMask = localPenMask(config.penStrokes, image.width, image.height, config.penWidth);
+  const inclusionMask = localPenMask(config.penStrokes, image.width, image.height, config.penWidth, config.penMode);
   const rect = detectPlotRect(image.rgba, image.width, image.height);
   const anchors = config.anchors.map(([x, y], index) => ({ x, y, anchorId: `guide-${index + 1}`, userGuided: true }));
   const target = sampleRepresentativeColor(image.rgba, image.width, image.height, anchors[0]);
@@ -242,6 +268,12 @@ for (const config of cases) {
   const path = result.path;
   const rawMetrics = assertGeometry(path, config, "raw trace");
   assertGuides(path, anchors, `${config.name} / raw trace`);
+  if (config.expectPenInference) {
+    assert.ok(path.some(point => point.penInferred && !point.observed && point.x > 400),
+      `${config.name}: the hidden painted tail must be labelled estimated, not observed`);
+    assert.ok(path.every(point => !point.penInferred || (!point.anchor && !point.userGuided)),
+      `${config.name}: Pen estimates must not become manual guides`);
+  }
   if (config.expectAutomaticGuidance) {
     assert.ok(path.some(point => point.automaticGuidance), `${config.name}: automatic guidance did not activate`);
     assert.ok(path.some(point => point.automaticGuidance && !point.observed), `${config.name}: hidden tail was not labelled inferred`);

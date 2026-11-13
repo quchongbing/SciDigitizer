@@ -24,23 +24,23 @@ import {
   validateCalibration,
   valueStepForPixelNudge,
   valueToPixel,
-} from "./core.js?v=0.20.0-preview.3.23";
+} from "./core.js?v=0.20.0-preview.3.25";
 
 import {
   isDuplicateGuidePoint,
   prepareRestoredTrace,
   prepareTraceOutput,
   selectExistingDataPoints,
-} from "./trace-output.js?v=0.20.0-preview.3.23";
+} from "./trace-output.js?v=0.20.0-preview.3.25";
 
-import { runComputeOperation } from "./compute-engine.js?v=0.20.0-preview.3.23";
-import { createComputeClient } from "./compute-client.js?v=0.20.0-preview.3.23";
+import { runComputeOperation } from "./compute-engine.js?v=0.20.0-preview.3.25";
+import { createComputeClient } from "./compute-client.js?v=0.20.0-preview.3.25";
 
 import {
   pickRasterImageFile,
   rasterImageDisplayName,
   validateRasterImageFile,
-} from "./image-import.js?v=0.20.0-preview.3.23";
+} from "./image-import.js?v=0.20.0-preview.3.25";
 
 import {
   alignmentCorrectionDegrees,
@@ -48,27 +48,27 @@ import {
   normalizeRotationDegrees,
   renderRotatedImage,
   splitRotationDegrees,
-} from "./image-transform.js?v=0.20.0-preview.3.23";
+} from "./image-transform.js?v=0.20.0-preview.3.25";
 
 import {
   cloneSerializable,
   createEditSession,
   fingerprintImageData,
-} from "./edit-session.js?v=0.20.0-preview.3.23";
+} from "./edit-session.js?v=0.20.0-preview.3.25";
 
 import {
   detectFrameQuadrilateral,
   detectPerspectiveFrame,
   estimateAxisSkew,
   warpPerspectiveRgba,
-} from "./image-geometry.js?v=0.20.0-preview.3.23";
+} from "./image-geometry.js?v=0.20.0-preview.3.25";
 
 import {
   initializeI18n,
   refreshTranslations,
   setLanguage,
   translateMessage,
-} from "./i18n.js?v=0.20.0-preview.3.23";
+} from "./i18n.js?v=0.20.0-preview.3.25";
 
 initializeI18n();
 
@@ -175,7 +175,7 @@ let targetSelectionSequence = 0;
 let traceTaskSequence = 0;
 
 const computeClient = createComputeClient({
-  workerUrl: new URL("src/trace-worker.js?v=0.20.0-preview.3.23", document.baseURI).href,
+  workerUrl: new URL("src/trace-worker.js?v=0.20.0-preview.3.25", document.baseURI).href,
 });
 
 function currentComputeImage() {
@@ -786,7 +786,7 @@ function resetExtraction({ keepCalibrationValues = true } = {}) {
   plotDetectionSequence += 1;
   state.traceStale = false;
   state.traceError = null;
-  $("#trace-corridor-mode").value = "strict";
+  $("#trace-corridor-mode").value = "local";
   interferenceScanSequence += 1;
   colorDiscoverySequence += 1;
   targetSelectionSequence += 1;
@@ -2286,11 +2286,12 @@ function updatePointListRow(point) {
   yInput.step = pointCoordinateInputStep(point, "y");
   const originLabel = point.anchor
     ? "引导基准点"
-    : point.origin === "manual" ? "用户新增" : point.observed === false ? "遮挡推断" : "自动追踪";
+    : point.origin === "manual" ? "用户新增" : point.penInferred ? "Pen 路径估计" : point.observed === false ? "遮挡推断" : "自动追踪";
   const uncertainty = Number.isFinite(point.inferenceUncertainty)
     ? ` · 估计不确定度 ±${formatNumber(point.inferenceUncertainty, 3)} px`
     : "";
-  const inferenceModel = point.inferenceModel ? ` · 遮挡恢复 ${point.inferenceModel}` : "";
+  const inferenceModel = point.penInferred ? " · 已涂路径，非原图观测"
+    : point.inferenceModel ? ` · 遮挡恢复 ${point.inferenceModel}` : "";
   const corridorLabel = point.corridorConstrained ? " · Pen 边界修正" : "";
   const coordinateUncertainty = pointCoordinateUncertaintyText(point);
   row.title = `pixel (${formatNumber(point.x, 8)}, ${formatNumber(point.y, 8)}) · ${originLabel}${inferenceModel}${uncertainty}${coordinateUncertainty}${corridorLabel}`;
@@ -2330,11 +2331,11 @@ function renderPointList() {
     const yStep = pointCoordinateInputStep(point, "y");
     const originLabel = point.anchor
       ? "引导基准点"
-      : point.origin === "manual" ? "用户新增" : point.observed === false ? "遮挡推断" : "自动追踪";
+      : point.origin === "manual" ? "用户新增" : point.penInferred ? "Pen 路径估计" : point.observed === false ? "遮挡推断" : "自动追踪";
     const uncertainty = Number.isFinite(point.inferenceUncertainty)
       ? ` · 估计不确定度 ±${formatNumber(point.inferenceUncertainty, 3)} px`
       : "";
-    const inferenceModel = point.inferenceModel
+    const inferenceModel = point.penInferred ? " · 已涂路径，非原图观测" : point.inferenceModel
       ? ` · 遮挡恢复 ${point.inferenceModel}`
       : "";
     const reviewLabel = reviewPointIndices.has(index) ? " · 当前智能复核区" : "";
@@ -2658,6 +2659,8 @@ function updateUi() {
   $("#trace-curve").disabled = Boolean(state.computeBusy)
     || !(state.imageData && state.plotRect && state.seedColor && state.anchors.length >= minimumAnchors);
   $("#retry-trace").disabled = $("#trace-curve").disabled;
+  $("#use-local-pen").hidden = true;
+  $("#use-local-pen").disabled = $("#trace-curve").disabled;
   $("#trace-error").hidden = !state.traceStale;
   $("#trace-error-title").textContent = state.computeBusy ? "正在重新追踪…" : "追踪未完成";
   $("#trace-error-history").hidden = !state.path.length;
@@ -2668,7 +2671,10 @@ function updateUi() {
     const mask = traceCorridorMask();
     if (mask?.mode === "strict") {
       const outside = state.anchors.flatMap((point, index) => inclusionMaskAllows(mask, canvas.width, point.x, point.y) ? [] : [`A${index + 1}`]);
-      if (outside.length) $("#trace-error-message").textContent = `${outside.join(", ")} · ${translateMessage("引导点在 Pen 外；请补涂完整路径，或选择局部辅助。引导点不会被移动或删除。")}`;
+      if (outside.length) {
+        $("#trace-error-message").textContent = `${outside.join(", ")} · ${translateMessage("引导点在 Pen 外；请补涂完整路径，或选择局部辅助。引导点不会被移动或删除。")}`;
+        $("#use-local-pen").hidden = false;
+      }
     }
   }
   $("#add-guide").disabled = Boolean(state.computeBusy) || !(state.plotRect && state.seedColor);
@@ -3355,6 +3361,7 @@ async function traceCurrentCurve({ silent = false, refreshHistory = true } = {})
     const outputOptions = {
       inclusionMask, width: canvas.width, height: canvas.height, rect: state.plotRect,
       parameters: activeSamplingParameters(), count: activeTracePointCount(),
+      requireCurveSegment: true,
     };
     const inputGuides = state.anchors.map((point) => ({ ...point }));
     const requestedParameters = { ...activeTraceParameters() };
@@ -3540,7 +3547,7 @@ function updateCursorReadout(point) {
 function clearActiveCurve({ keepLabel = false, keepTargetStyle = false } = {}) {
   state.traceStale = false;
   state.traceError = null;
-  $("#trace-corridor-mode").value = "strict";
+  $("#trace-corridor-mode").value = "local";
   targetSelectionSequence += 1;
   traceTaskSequence += 1;
   state.computeBusy = null;
@@ -5131,6 +5138,10 @@ $("#trace-curve").addEventListener("click", async () => {
   if (await traceCurrentCurve({ refreshHistory: false })) commitHistory("重新自动追踪");
 });
 $("#retry-trace").addEventListener("click", () => $("#trace-curve").click());
+$("#use-local-pen").addEventListener("click", () => {
+  $("#trace-corridor-mode").value = "local";
+  $("#trace-corridor-mode").dispatchEvent(new Event("change"));
+});
 $("#clear-curve").addEventListener("click", () => {
   clearActiveCurve({ keepTargetStyle: true });
   commitHistory("重置当前曲线");
@@ -5487,7 +5498,7 @@ $("#export-project").addEventListener("click", async () => {
       calibration: currentCalibrationSnapshot(),
       calibrationBeforeSeriesEdit: state.calibrationBeforeSeriesEdit,
     },
-    extractor: { name: "SciDigitizer", version: "0.20.0-preview.3.23", engine: "parametric-orientation-adaptive-bilingual-occlusion-pattern-gap-ensemble-risk-ranked-review-low-friction-import-responsive-worker-guided-color-centerline-multicurve-core" },
+    extractor: { name: "SciDigitizer", version: "0.20.0-preview.3.25", engine: "parametric-orientation-adaptive-bilingual-occlusion-pattern-gap-ensemble-risk-ranked-review-low-friction-import-responsive-worker-guided-color-centerline-multicurve-core" },
   };
   const saved = await downloadBlob(`${JSON.stringify(project, null, 2)}\n`, "application/json", `${baseName()}-project.json`);
   if (saved) showToast("项目文件已保存，可恢复标定、参数和路径");
