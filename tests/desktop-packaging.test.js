@@ -166,7 +166,7 @@ test("native client is present, pinned and configured for injection", async () =
   }
 });
 
-test("ZIP extraction accepts a symlinked temporary directory without disabling containment checks", async (t) => {
+test("ZIP extraction resolves path aliases and refuses nonempty destinations", async (t) => {
   const root = await scratch(t);
   const source = join(root, "source"), actual = join(root, "actual"), alias = join(root, "alias");
   await mkdir(source); await mkdir(actual);
@@ -186,7 +186,7 @@ test("ZIP extraction accepts a symlinked temporary directory without disabling c
   await symlink(outside, join(actual, "unpacked", "escape"), "junction");
   const unsafeArchive = join(root, "escape.zip");
   await zipLib.archiveFolder(source, unsafeArchive);
-  await assert.rejects(extractArchive(unsafeArchive, join(alias, "unpacked")), /outside|Dangerous/);
+  await assert.rejects(extractArchive(unsafeArchive, join(alias, "unpacked")), /not empty/);
   assert.equal(await readFile(join(outside, "proof.txt"), "utf8"), "keep");
 });
 

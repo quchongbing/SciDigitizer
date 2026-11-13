@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { mkdir, realpath } from "node:fs/promises";
+import { mkdir, readdir, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import zipLib from "zip-lib";
 
@@ -8,7 +8,11 @@ export async function extractArchive(archive, directory) {
   await mkdir(directory, { recursive: true });
   // macOS aliases /var to /private/var. zip-lib compares paths when checking
   // archive containment, so supply a canonical root without weakening checks.
-  return zipLib.extract(archive, await realpath(directory), { safeSymlinksOnly: true });
+  const canonical = await realpath(directory);
+  // Every caller uses fresh staging. Refuse existing entries, including Windows
+  // directory junctions that an unzip library may otherwise follow or replace.
+  if ((await readdir(canonical)).length) throw new Error(`Extraction directory is not empty: ${directory}`);
+  return zipLib.extract(archive, canonical, { safeSymlinksOnly: true });
 }
 
 export const packageBudget = 8 * 1024 * 1024;
