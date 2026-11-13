@@ -1,7 +1,7 @@
 import { chmod, copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import zipLib from "zip-lib";
+import { extractArchive } from "./desktop-platform.mjs";
 
 const projectRoot = fileURLToPath(new URL("..", import.meta.url));
 const config = JSON.parse(await readFile(join(projectRoot, "neutralino.config.json"), "utf8"));
@@ -39,7 +39,7 @@ if (localArchive) {
   if (archive.length < 1024) throw new Error("Downloaded Neutralinojs runtime archive is unexpectedly small.");
   await writeFile(archivePath, archive);
 }
-await zipLib.extract(archivePath, extractRoot);
+await extractArchive(archivePath, extractRoot);
 
 await mkdir(binaryRoot, { recursive: true });
 for (const binaryName of binaryNames) {

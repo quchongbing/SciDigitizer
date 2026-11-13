@@ -5,8 +5,7 @@ import { mkdtemp, mkdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import zipLib from "zip-lib";
-import { hostPackageSuffixes, localPackageRoot } from "./desktop-platform.mjs";
+import { extractArchive, hostPackageSuffixes, localPackageRoot } from "./desktop-platform.mjs";
 import { verifyPackageContents } from "./verify-release.mjs";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
@@ -104,7 +103,7 @@ try {
   const appPort = appPortReservation.address().port;
   await new Promise((resolve) => appPortReservation.close(resolve));
   origin = `http://127.0.0.1:${appPort}`;
-  await zipLib.extract(join(packages, `SciDigitizer-${metadata.version}-${suffix}`), extracted);
+  await extractArchive(join(packages, `SciDigitizer-${metadata.version}-${suffix}`), extracted);
   await verifyPackageContents(extracted, suffix);
   const executable = process.platform === "darwin"
     ? join(extracted, "SciDigitizer.app", "Contents", "MacOS", "SciDigitizer")

@@ -5,9 +5,8 @@ import { mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import zipLib from "zip-lib";
 import {
-  allPackageSuffixes, hostPackageSuffixes, inspectMachO, inspectWindows,
+  allPackageSuffixes, extractArchive, hostPackageSuffixes, inspectMachO, inspectWindows,
   packageBudget, run, verifyMachOSignature,
 } from "./desktop-platform.mjs";
 
@@ -67,7 +66,7 @@ export async function verifyRelease(releaseRoot, { suffixes = allPackageSuffixes
       if (actualHash !== checksumEntries.get(release.file)) fail(`${release.file} hash does not match SHA256SUMS.txt`);
       if (release.file.endsWith(".zip")) {
         const directory = join(scratch, release.file);
-        await zipLib.extract(path, directory);
+        await extractArchive(path, directory);
         await verifyPackageContents(directory, release.file.slice(`SciDigitizer-${version}-`.length), { runner });
       }
     }

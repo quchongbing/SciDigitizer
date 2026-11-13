@@ -9,7 +9,7 @@
 
 ![Version](https://img.shields.io/badge/version-0.20.0--preview.3.25-1666d8)
 ![Local](https://img.shields.io/badge/data-local--only-00a9a5)
-![Tests](https://img.shields.io/badge/tests-289%20passing-2f8f5b)
+![Tests](https://img.shields.io/badge/tests-290%20passing-2f8f5b)
 ![License](https://img.shields.io/badge/license-MIT-f0c040)
 
 SciDigitizer 从 PNG、JPEG 或 WebP 图像中提取曲线数据。通常只需选择曲线颜色；遇到同色分支、交叉或遮挡时，再添加少量引导点。图像和数据始终保留在浏览器本地。

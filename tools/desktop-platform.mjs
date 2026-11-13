@@ -1,6 +1,15 @@
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
+import { mkdir, realpath } from "node:fs/promises";
 import { join } from "node:path";
+import zipLib from "zip-lib";
+
+export async function extractArchive(archive, directory) {
+  await mkdir(directory, { recursive: true });
+  // macOS aliases /var to /private/var. zip-lib compares paths when checking
+  // archive containment, so supply a canonical root without weakening checks.
+  return zipLib.extract(archive, await realpath(directory), { safeSymlinksOnly: true });
+}
 
 export const packageBudget = 8 * 1024 * 1024;
 export const allPackageSuffixes = [

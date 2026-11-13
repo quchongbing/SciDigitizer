@@ -2,13 +2,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import zipLib from "zip-lib";
 import {
-  allPackageSuffixes, hostPackageSuffixes, inspectMachO, inspectWindows,
+  allPackageSuffixes, extractArchive, hostPackageSuffixes, inspectMachO, inspectWindows,
   packageBudget, signMacBundle, verifyMachOSignature,
 } from "../tools/desktop-platform.mjs";
 import { verifyPackageContents, verifyRelease } from "../tools/verify-release.mjs";
@@ -159,9 +159,35 @@ test("native client is present, pinned and configured for injection", async () =
   assert.equal(config.cli.clientLibrary, "/build/desktop-web/neutralino.js");
   assert.equal(config.modes.window.injectClientLibrary, true);
   assert.equal(createHash("sha256").update(client).digest("hex"), "7e9d355ee2e0a0284e4f726b09ed5d7e602b657eacd488b011a6eb390f2a7923");
+  const attributes = await readFile(new URL("../.gitattributes", import.meta.url), "utf8");
+  assert.match(attributes, /^desktop\/vendor\/neutralino\.js -text$/m);
   for (const name of ["neutralino-client.LICENSE.txt", "neutralino-runtime.LICENSE.txt"]) {
     assert.match(await readFile(new URL("../desktop/vendor/" + name, import.meta.url), "utf8"), /Copyright/);
   }
+});
+
+test("ZIP extraction accepts a symlinked temporary directory without disabling containment checks", async (t) => {
+  const root = await scratch(t);
+  const source = join(root, "source"), actual = join(root, "actual"), alias = join(root, "alias");
+  await mkdir(source); await mkdir(actual);
+  // Junctions work on Windows CI without symlink privileges.
+  await symlink(actual, alias, "junction");
+  await writeFile(join(source, "proof.txt"), "valid archive");
+  const archive = join(root, "proof.zip");
+  await zipLib.archiveFolder(source, archive);
+  await extractArchive(archive, join(alias, "unpacked"));
+  assert.equal(await readFile(join(actual, "unpacked", "proof.txt"), "utf8"), "valid archive");
+  // Canonicalizing the parent must not allow a nested link to escape the root.
+  const outside = join(root, "outside");
+  await mkdir(outside);
+  await writeFile(join(outside, "proof.txt"), "keep");
+  await mkdir(join(source, "escape"));
+  await writeFile(join(source, "escape", "proof.txt"), "must not escape");
+  await symlink(outside, join(actual, "unpacked", "escape"), "junction");
+  const unsafeArchive = join(root, "escape.zip");
+  await zipLib.archiveFolder(source, unsafeArchive);
+  await assert.rejects(extractArchive(unsafeArchive, join(alias, "unpacked")), /outside|Dangerous/);
+  assert.equal(await readFile(join(outside, "proof.txt"), "utf8"), "keep");
 });
 
 test("release verifier checks archive contents, hashes, duplicate checksums and size budgets", async (t) => {
